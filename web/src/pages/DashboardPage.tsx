@@ -6,7 +6,7 @@ import { EmptyState } from '../components/EmptyState';
 import { RangeSelect } from '../components/RangeSelect';
 import { StatCard } from '../components/StatCard';
 import { useApiClient } from '../api-context';
-import { formatBytes, peerRoleLabel, rangeLabel, safeText } from '../utils';
+import { displayExecutableName, formatBytes, peerRoleLabel, rangeLabel, safeText } from '../utils';
 import type { RangeKey } from '../types';
 
 const defaultRange = '24h' satisfies RangeKey;
@@ -65,7 +65,10 @@ export function DashboardPage() {
       <header className="page-head hero-head">
         <div className="hero-copy">
           <h2>流量总览</h2>
-          <p>按时间窗口检查真实采集数据，快速定位进程、入口来源 IP、出口目标 IP 与端口热点。</p>
+          <p>
+            这是默认的全局视图：先看总上/下行、活跃连接与活跃进程，再结合趋势图判断是否存在突发峰值。若发现异常，
+            可直接从下方 Top 列表进入进程、对端或明细页面继续排查。
+          </p>
           <section className="status-row">
             <div className="status-pill">
               <strong>时间范围</strong>
@@ -104,7 +107,7 @@ export function DashboardPage() {
                 </div>
                 <div className="top-value">
                   <strong>{formatBytes(row.totalBytes)}</strong>
-                  <span>{row.exe ? row.exe : '未归因 / EXE 不可用'}</span>
+                  <span>{row.exe ? displayExecutableName(row.exe) : '未归因 / EXE 不可用'}</span>
                 </div>
               </li>
             ))}

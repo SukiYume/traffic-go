@@ -14,11 +14,12 @@ import {
   attributionDescription,
   clampText,
   directionLabel,
+  displayExecutableName,
+  executableName,
   formatBytes,
   formatDateTime,
   formatNumber,
   isLongRange,
-  peerRoleLabel,
   rangeLabel,
   safeText,
   serviceNameForPort,
@@ -64,13 +65,49 @@ function useUsageFilters() {
   return { range, filters, setRange, setFilters };
 }
 
+function processAnalysis(row: UsageRow) {
+  if (row.comm === 'nginx' || row.comm === 'caddy' || row.comm === 'apache2' || row.comm === 'httpd') {
+    const isOut = row.direction === 'out';
+    const desc = isOut ? `(出站) 这表示 ${row.comm} 正在作为反向代理，向对端目标 (${row.remoteIp}) 发起请求。` : `(入站) 客户端 (${row.remoteIp}) 正在访问服务器端。`;
+    return `💡 Nginx/Web 服务：${desc} 
+因 HTTPS 或 L7 封装，底层探针只记录双向字节流，无法直接抓取 HTTP 层域名或 URI。可结合对端 IP 检索网站存取日志 (Access Log) 进一步溯源。`;
+  }
+  if (row.comm && row.comm.includes('ss-')) {
+    const isOut = row.direction === 'out';
+    const desc = isOut ? `作为出站代理隧道，向对端 (${row.remoteIp}) 发送并请求数据。` : `作为服务端接收了来自对端 (${row.remoteIp}) 的加密代理请求。`;
+    return `💡 Shadowsocks 代理隧道：${desc}
+由于载荷完全加密，且内核级探针无法进行应用层穿透，若需审计翻墙/代理的具体目标网站，需要在 SS 宿主层面注入日志或者开启详细记录日志。`;
+  }
+  if (row.comm === 'sshd') {
+    return `💡 SSH 服务：对端 (${row.remoteIp}) 正在与主机通过 22 端口 (或改写端口) 通信。如流量巨大请关注是否在进行 SFTP 大文件传输或构建 SSH 隐藏隧道。`;
+  }
+  if (!row.comm && row.remotePort === 443) {
+    return `💡 HTTPS 流：通用加密网页流量。在 Linux 内核层只能获取加密握手后的四层载荷数据。对端IP可通过 ping 或 curl 测试以获取对应的主机/公司信息。`;
+  }
+  if (row.comm === 'docker-proxy') {
+    return `💡 Docker 容器映射：此流量由 docker-proxy 桥接。由于主机端口被容器占用，真实流量往往转发到了容器内部进程。`;
+  }
+  return null;
+}
+
+function explainConfidenceLabel(confidence: 'low' | 'medium' | 'high') {
+  return {
+    low: '低',
+    medium: '中',
+    high: '高',
+  }[confidence];
+}
+
 function UsageExpandPanel({
   row,
   onFilterByIp,
+  allowDeepAnalysis,
 }: {
   row: UsageRow;
   onFilterByIp: (ip: string) => void;
+  allowDeepAnalysis: boolean;
 }): ReactNode {
+  const api = useApiClient();
   const serviceName = serviceNameForPort(row.remotePort, row.proto);
   const portLabel =
     row.remotePort != null
@@ -80,9 +117,24 @@ function UsageExpandPanel({
       : '未知';
   const rateUp = Math.round(row.bytesUp / 60);
   const rateDown = Math.round(row.bytesDown / 60);
+  const analysisHint = processAnalysis(row);
+  const explainQuery = useQuery({
+    queryKey: ['usage-explain', row.minuteTs, row.proto, row.direction, row.pid, row.comm, row.exe, row.localPort, row.remoteIp, row.remotePort],
+    queryFn: () => api.getUsageExplain(row),
+    enabled: allowDeepAnalysis,
+    staleTime: 30_000,
+  });
+  const explain = explainQuery.data;
 
   return (
     <div className="row-expand">
+      {analysisHint && (
+        <div className="row-expand-alert">
+          {analysisHint.split('\n').map((line, i) => (
+            <div key={i}>{line}</div>
+          ))}
+        </div>
+      )}
       <div className="row-expand-grid">
         <div>
           <span>对端端口</span>
@@ -109,6 +161,70 @@ function UsageExpandPanel({
           </strong>
         </div>
       </div>
+      {allowDeepAnalysis ? (
+        <section className="row-expand-analysis">
+          <div className="row-expand-analysis-head">
+            <span>关联分析</span>
+            <strong>{explain ? `置信度 ${explainConfidenceLabel(explain.confidence)}` : explainQuery.isPending ? '分析中…' : '未命中'}</strong>
+          </div>
+          {explainQuery.isError ? <div className="row-expand-analysis-note">分析失败，请稍后重试。</div> : null}
+          {explain ? (
+            <>
+              <div className="row-expand-grid row-expand-grid-analysis">
+                <div>
+                  <span>来源 IP 候选</span>
+                  <strong>{explain.sourceIps.length ? explain.sourceIps.join(' · ') : '暂无'}</strong>
+                </div>
+                <div>
+                  <span>目标 IP 候选</span>
+                  <strong>{explain.targetIps.length ? explain.targetIps.join(' · ') : '暂无'}</strong>
+                </div>
+                <div>
+                  <span>关联样本</span>
+                  <strong>{explain.relatedPeers.length} 条</strong>
+                </div>
+              </div>
+
+              {explain.sourceIps.length > 0 || explain.targetIps.length > 0 ? (
+                <div className="row-expand-actions">
+                  {explain.sourceIps.slice(0, 3).map((ip) => (
+                    <button key={`src-${ip}`} type="button" className="chip" onClick={() => onFilterByIp(ip)}>
+                      来源 IP：{ip}
+                    </button>
+                  ))}
+                  {explain.targetIps.slice(0, 3).map((ip) => (
+                    <button key={`dst-${ip}`} type="button" className="chip" onClick={() => onFilterByIp(ip)}>
+                      目标 IP：{ip}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+
+              {explain.nginxRequests.length > 0 ? (
+                <div className="row-expand-analysis-list">
+                  <span>网页访问线索（聚合）</span>
+                  {explain.nginxRequests.slice(0, 5).map((request, index) => (
+                    <div key={`${request.time}-${request.path}-${index}`} className="row-expand-analysis-note">
+                      {formatDateTime(request.time)} · {request.method} {request.host ? `${request.host}` : ''}
+                      {request.path} · {request.status} · {request.count} 次
+                      {request.bot ? ` · ${request.bot}` : request.userAgent ? ` · ${clampText(request.userAgent, 64)}` : ''}
+                      {request.referer ? ` · 来路 ${clampText(request.referer, 64)}` : ''}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              {explain.notes.slice(0, 3).map((note) => (
+                <div key={note} className="row-expand-analysis-note">
+                  {note}
+                </div>
+              ))}
+            </>
+          ) : null}
+        </section>
+      ) : (
+        <div className="row-expand-analysis-note">当前是小时聚合数据，不支持细粒度关联分析。</div>
+      )}
       {row.remoteIp && (
         <div className="row-expand-actions">
           <button
@@ -184,22 +300,19 @@ export function UsagePage() {
       columnHelper.accessor('minuteTs', {
         id: 'minuteTs',
         header: '时间',
+        meta: { className: 'col-time', nowrap: true },
         cell: (info) => formatDateTime(info.getValue()),
       }),
       columnHelper.accessor('direction', {
         id: 'direction',
         header: '方向',
+        meta: { className: 'col-direction', align: 'center', nowrap: true },
         cell: (info) => directionLabel(info.getValue()),
-      }),
-      columnHelper.display({
-        id: 'peerRole',
-        header: '对端角色',
-        enableSorting: false,
-        cell: (info) => peerRoleLabel(info.row.original.direction),
       }),
       columnHelper.accessor('remoteIp', {
         id: 'remoteIp',
         header: '对端 IP',
+        meta: { className: 'col-remote-ip', nowrap: true },
         cell: (info) => {
           const ip = info.getValue();
           if (!ip) return '未知';
@@ -220,15 +333,18 @@ export function UsagePage() {
       columnHelper.accessor('localPort', {
         id: 'localPort',
         header: '本地端口',
+        meta: { className: 'col-local-port', align: 'center', nowrap: true },
         cell: (info) => info.getValue() ?? '未知',
       }),
       columnHelper.accessor('proto', {
         id: 'proto',
         header: '协议',
+        meta: { className: 'col-proto', align: 'center', nowrap: true },
       }),
       columnHelper.accessor('comm', {
         id: 'comm',
         header: '进程',
+        meta: { className: 'col-comm', nowrap: true },
         cell: (info) => safeText(info.getValue()),
       }),
     ];
@@ -239,20 +355,25 @@ export function UsagePage() {
           columnHelper.accessor('pid', {
             id: 'pid',
             header: 'PID',
+            meta: { className: 'col-pid', align: 'right', nowrap: true },
             cell: (info) => info.getValue() ?? '未知',
           }),
           columnHelper.accessor('exe', {
             id: 'exe',
             header: 'EXE',
             enableSorting: false,
-            cell: (info) => (
-              <span title={info.getValue() ?? undefined}>{clampText(safeText(info.getValue()), 28)}</span>
-            ),
+            meta: { className: 'col-exe', nowrap: true },
+            cell: (info) => {
+              const raw = info.getValue();
+              const cmd = executableName(raw);
+              return <span title={cmd ?? undefined}>{clampText(displayExecutableName(raw), 28)}</span>;
+            },
           }),
           columnHelper.accessor('remotePort', {
             id: 'remotePort',
             header: '对端端口',
             enableSorting: false,
+            meta: { className: 'col-remote-port', align: 'center', nowrap: true },
             cell: (info) => {
               const port = info.getValue();
               if (port == null) return '—';
@@ -262,12 +383,9 @@ export function UsagePage() {
           }),
           columnHelper.accessor('attribution', {
             id: 'attribution',
-            header: () => (
-              <span title="exact: 精确匹配(端口+IP+协议全匹配)&#10;unknown: 只看到流量，无法稳定映射到进程">
-                归因 ⓘ
-              </span>
-            ),
+            header: '归因',
             enableSorting: false,
+            meta: { className: 'col-attribution', nowrap: true },
             cell: (info) => safeText(info.getValue()),
           }),
         ];
@@ -276,22 +394,29 @@ export function UsagePage() {
       columnHelper.accessor('bytesUp', {
         id: 'bytesUp',
         header: '上行',
+        meta: { className: 'col-bytes', align: 'right', nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
       columnHelper.accessor('bytesDown', {
         id: 'bytesDown',
         header: '下行',
+        meta: { className: 'col-bytes', align: 'right', nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
       columnHelper.display({
         id: 'bytesTotal',
         header: '总流量',
+        meta: { className: 'col-bytes col-bytes-total', align: 'right', nowrap: true },
         cell: (info) => formatBytes(info.row.original.bytesUp + info.row.original.bytesDown),
       }),
     ];
 
     return [...baseColumns, ...detailedColumns, ...tailColumns];
   }, [query.data?.dataSource, onFilterByIp]);
+
+  const usageTableClassName = query.data?.dataSource === 'usage_1h'
+    ? 'usage-table usage-table-hourly table-dense'
+    : 'usage-table table-dense';
 
   return (
     <div className="page">
@@ -300,7 +425,11 @@ export function UsagePage() {
           <p className="eyebrow">Usage</p>
           <h2>流量明细</h2>
           <p>
-            逐条流量明细，深挖具体连接行为。点击任意行展开详情，点击对端 IP 快速过滤。排序、分页和时间窗口实时同步到后端。
+            这里展示逐条连接记录，适合做精细排查：建议先按时间和方向收敛范围，再按进程、PID、EXE 或对端 IP 过滤，
+            点击任意行可展开查看速率、归因与日志关联线索。<br/>
+            <strong style={{ color: '#94a3b8' }}>归因状态说明：</strong>
+            {' '}
+            exact(精确命中 PID)、heuristic(短时端口复用推测)、guess(系统尝试猜测)、unknown(未能获取关联)。
           </p>
           <section className="status-row">
             <div className="status-pill">
@@ -319,13 +448,14 @@ export function UsagePage() {
         <DataTable
           columns={columns}
           data={query.data.rows}
+          tableClassName={usageTableClassName}
           sorting={sorting}
           onSortingChange={setSorting}
           manualSorting
           expandedRowIndex={expandedRowIndex}
           onExpandRow={setExpandedRowIndex}
           renderExpandedRow={(row) => (
-            <UsageExpandPanel row={row} onFilterByIp={onFilterByIp} />
+            <UsageExpandPanel row={row} onFilterByIp={onFilterByIp} allowDeepAnalysis={query.data?.dataSource === 'usage_1m'} />
           )}
           pagination={{
             page: query.data.page,

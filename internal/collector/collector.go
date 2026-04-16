@@ -32,6 +32,7 @@ type Service struct {
 	forwardBuckets map[model.ForwardUsageKey]*bucketState
 	runtimeMu      sync.RWMutex
 	snapshots      map[uint64]model.FlowSnapshot
+	processHints   map[string]processHint
 	localIPs       map[string]struct{}
 	lastIPRefresh  time.Time
 	warnedNoAcct   bool
@@ -43,6 +44,13 @@ type bucketState struct {
 	pktsUp    int64
 	pktsDown  int64
 	flows     map[uint64]struct{}
+}
+
+const defaultProcessHintTTL = 90 * time.Second
+
+type processHint struct {
+	process model.ProcessInfo
+	expires time.Time
 }
 
 func New(cfg config.Config, trafficStore *store.Store, logger *log.Logger) Runner {
@@ -66,6 +74,7 @@ func New(cfg config.Config, trafficStore *store.Store, logger *log.Logger) Runne
 		buckets:        make(map[model.UsageKey]*bucketState),
 		forwardBuckets: make(map[model.ForwardUsageKey]*bucketState),
 		snapshots:      make(map[uint64]model.FlowSnapshot),
+		processHints:   make(map[string]processHint),
 	}
 }
 
@@ -136,16 +145,25 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	s.pruneProcessHints(now)
 
 	inodesNeeded := make(map[uint64]struct{})
 	flowMeta := make(map[uint64]classifiedFlow)
 	for _, flow := range flows {
 		classified := classifyFlow(flow, s.localIPs)
 		if classified.Direction != model.DirectionForward && classified.Tuple.valid() {
-			if sock, ok := socketIndex[classified.Tuple.key()]; ok {
+			if sock, ok := socketIndex.ByTuple[classified.Tuple.key()]; ok {
 				classified.Inode = sock.Inode
 				classified.Connected = sock.Connected
 				inodesNeeded[sock.Inode] = struct{}{}
+			} else if flow.Proto == "udp" {
+				localKey := localTupleKey(classified.Proto, classified.LocalIP, classified.LocalPort)
+				if sock, ok := socketIndex.ByLocal[localKey]; ok && sock.Inode > 0 {
+					classified.Inode = sock.Inode
+					classified.Connected = sock.Connected
+					classified.MatchedByLocal = true
+					inodesNeeded[sock.Inode] = struct{}{}
+				}
 			}
 		}
 		flowMeta[flow.CTID] = classified
@@ -157,9 +175,20 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 
 	for _, flow := range flows {
 		classified := flowMeta[flow.CTID]
+		process := processes[classified.Inode]
+		if process.PID <= 0 {
+			if hinted, ok := s.lookupProcessHint(classified, now); ok {
+				process = hinted
+				classified.MatchedByHint = true
+			}
+		}
+
 		prev, exists := prevSnapshots[flow.CTID]
-		snapshot, delta, forwardDelta := s.updateSnapshot(now, flow, classified, processes[classified.Inode], prev, exists)
+		snapshot, delta, forwardDelta := s.updateSnapshot(now, flow, classified, process, prev, exists)
 		nextSnapshots[flow.CTID] = snapshot
+		if snapshot.Direction != model.DirectionForward && snapshot.PID > 0 {
+			s.rememberProcessHint(snapshot, now)
+		}
 
 		if classified.Direction == model.DirectionForward {
 			if forwardDelta != nil {
@@ -197,13 +226,31 @@ func (s *Service) updateSnapshot(
 	comm := ""
 	exe := ""
 	if classified.Direction != model.DirectionForward {
-		if flow.Proto == "udp" && !classified.Connected {
-			attribution = model.AttributionUnknown
-		} else if process.PID > 0 {
-			attribution = model.AttributionExact
+		if process.PID > 0 {
+			switch {
+			case classified.MatchedByHint:
+				attribution = model.AttributionGuess
+			case flow.Proto == "udp" && (!classified.Connected || classified.MatchedByLocal):
+				attribution = model.AttributionHeuristic
+			default:
+				attribution = model.AttributionExact
+			}
 			pid = process.PID
 			comm = process.Comm
 			exe = process.Exe
+		} else if exists && prev.PID > 0 {
+			sameTuple := prev.Proto == flow.Proto &&
+				prev.Direction == classified.Direction &&
+				prev.LocalIP == classified.LocalIP &&
+				prev.LocalPort == classified.LocalPort &&
+				prev.RemoteIP == classified.RemoteIP &&
+				prev.RemotePort == classified.RemotePort
+			if sameTuple {
+				attribution = model.AttributionGuess
+				pid = prev.PID
+				comm = prev.Comm
+				exe = prev.Exe
+			}
 		}
 	}
 
@@ -471,4 +518,43 @@ func (s *Service) replaceSnapshots(next map[uint64]model.FlowSnapshot) {
 	s.runtimeMu.Lock()
 	defer s.runtimeMu.Unlock()
 	s.snapshots = next
+}
+
+func hintKey(proto string, direction model.Direction, localIP string, localPort int) string {
+	return fmt.Sprintf("%s|%s|%s|%d", proto, direction, localIP, localPort)
+}
+
+func (s *Service) lookupProcessHint(classified classifiedFlow, now time.Time) (model.ProcessInfo, bool) {
+	if classified.Direction == model.DirectionForward || classified.LocalPort <= 0 || classified.LocalIP == "" {
+		return model.ProcessInfo{}, false
+	}
+	key := hintKey(classified.Proto, classified.Direction, classified.LocalIP, classified.LocalPort)
+	hint, ok := s.processHints[key]
+	if !ok {
+		return model.ProcessInfo{}, false
+	}
+	if !hint.expires.After(now) {
+		delete(s.processHints, key)
+		return model.ProcessInfo{}, false
+	}
+	return hint.process, true
+}
+
+func (s *Service) rememberProcessHint(snapshot model.FlowSnapshot, now time.Time) {
+	if snapshot.LocalPort <= 0 || snapshot.LocalIP == "" || snapshot.PID <= 0 {
+		return
+	}
+	key := hintKey(snapshot.Proto, snapshot.Direction, snapshot.LocalIP, snapshot.LocalPort)
+	s.processHints[key] = processHint{
+		process: model.ProcessInfo{PID: snapshot.PID, Comm: snapshot.Comm, Exe: snapshot.Exe},
+		expires: now.Add(defaultProcessHintTTL),
+	}
+}
+
+func (s *Service) pruneProcessHints(now time.Time) {
+	for key, hint := range s.processHints {
+		if !hint.expires.After(now) {
+			delete(s.processHints, key)
+		}
+	}
 }

@@ -73,7 +73,10 @@ export function ForwardPage() {
         <div className="hero-copy">
           <p className="eyebrow">Forward</p>
           <h2>转发流量</h2>
-          <p>独立查看 NAT / 转发流量的来源 IP、目标 IP 与双向字节数，不与进程明细混算。</p>
+          <p>
+            用于单独观察 NAT/转发路径上的通信关系，重点关注来源 IP、目标 IP 与原向/回包字节差异。
+            该视图不与本机进程流量混算，适合排查网关、旁路或代理场景中的异常转发。
+          </p>
           <section className="status-row">
             <div className="status-pill">
               <strong>时间范围</strong>

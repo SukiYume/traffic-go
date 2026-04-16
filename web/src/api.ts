@@ -16,6 +16,7 @@ import type {
   TimeSeriesResponse,
   TopResponse,
   TrafficApiClient,
+  UsageExplain,
   UsageQuery,
   UsageResponse,
   UsageRow,
@@ -73,6 +74,35 @@ type RawUsageResponse = {
     pkts_down: number;
     flow_count: number;
   }>;
+};
+
+type RawUsageExplainResponse = {
+  data: {
+    process: string;
+    confidence: UsageExplain['confidence'];
+    source_ips: string[];
+    target_ips: string[];
+    related_peers: Array<{
+      direction: UsageRow['direction'];
+      remote_ip: string;
+      remote_port?: number | null;
+      local_port?: number | null;
+      bytes_total: number;
+      flow_count: number;
+    }>;
+    nginx_requests: Array<{
+      time: number;
+      method: string;
+      host?: string;
+      path: string;
+      status: number;
+      count?: number;
+      referer?: string;
+      user_agent?: string;
+      bot?: string;
+    }>;
+    notes: string[];
+  };
 };
 
 type RawTopResponse = {
@@ -234,6 +264,20 @@ function buildForwardQuery(query: UsageQuery) {
   ]);
 }
 
+function buildUsageExplainQuery(row: UsageRow) {
+  return buildQuery([
+    ['ts', row.minuteTs],
+    ['proto', row.proto],
+    ['direction', row.direction],
+    ['pid', row.pid ?? undefined],
+    ['comm', row.comm],
+    ['exe', row.exe],
+    ['local_port', row.localPort],
+    ['remote_ip', row.remoteIp],
+    ['remote_port', row.remotePort],
+  ]);
+}
+
 function buildTopProcessesQuery(
   range: RangeKey,
   options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder },
@@ -363,6 +407,36 @@ function decodeUsage(raw: unknown): UsageResponse {
   };
 }
 
+function decodeUsageExplain(raw: unknown): UsageExplain {
+  const payload = raw as RawUsageExplainResponse;
+  return {
+    process: payload.data.process,
+    confidence: payload.data.confidence,
+    sourceIps: payload.data.source_ips ?? [],
+    targetIps: payload.data.target_ips ?? [],
+    relatedPeers: (payload.data.related_peers ?? []).map((peer) => ({
+      direction: peer.direction,
+      remoteIp: peer.remote_ip,
+      remotePort: peer.remote_port ?? null,
+      localPort: peer.local_port ?? null,
+      bytesTotal: peer.bytes_total,
+      flowCount: peer.flow_count,
+    })),
+    nginxRequests: (payload.data.nginx_requests ?? []).map((request) => ({
+      time: request.time,
+      method: request.method,
+      host: request.host ?? null,
+      path: request.path,
+      status: request.status,
+      count: request.count ?? 1,
+      referer: request.referer ?? null,
+      userAgent: request.user_agent ?? null,
+      bot: request.bot ?? null,
+    })),
+    notes: payload.data.notes ?? [],
+  };
+}
+
 function decodeTop(raw: unknown): TopResponse {
   const payload = raw as RawTopResponse;
   return {
@@ -463,6 +537,9 @@ export function createHttpClient(): TrafficApiClient {
     },
     getUsage(query: UsageQuery) {
       return requestJson(withAppBase(`/api/v1/usage${buildUsageQuery(query)}`), decodeUsage);
+    },
+    getUsageExplain(row: UsageRow) {
+      return requestJson(withAppBase(`/api/v1/usage/explain${buildUsageExplainQuery(row)}`), decodeUsageExplain);
     },
     getTopProcesses(range, options) {
       return requestJson(withAppBase(`/api/v1/top/processes${buildTopProcessesQuery(range, options)}`), decodeProcessSummary);

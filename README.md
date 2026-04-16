@@ -252,6 +252,8 @@ location /ops/traffic/ {
 - `tick_interval`: 采集周期，默认 `2s`
 - `proc_fs`: `procfs` 根目录，默认 `/proc`
 - `conntrack_path`: conntrack 文件路径，默认 `/proc/net/nf_conntrack`
+- `nginx_log_dir`: Nginx 日志目录，默认 `/var/log/nginx`，`/api/v1/usage/explain` 会扫描该目录下匹配 `*log` 的文件
+- `ss_log_dir`: Shadowsocks / 代理日志目录，默认 `/var/log`，`/api/v1/usage/explain` 会优先扫描包含 `ss/shadowsocks` 关键词的日志文件
 - `mock_data`: 强制 mock collector
 - `retention.flows_days`: 分钟数据保留天数，也是 PID/EXE 过滤可用的最长窗口
 - `retention.hourly_days`: 小时数据保留天数
@@ -260,6 +262,7 @@ location /ops/traffic/ {
 
 - `flows_days` 或 `hourly_days` 设为 `0` 时，当前实现会回退到默认值 `30` 和 `180`。
 - `log_level` 字段会被解析，但当前后端仍使用基础 stdout logger，没有真正的按级别过滤。
+- Usage 详情日志关联采用“缓存优先、文件补扫、再写回缓存”的流程，支持 `.log` / `.log-*` / `.gz` 日志轮转文件。
 
 ## API 概览
 
@@ -270,6 +273,7 @@ location /ops/traffic/ {
 - `GET /api/v1/stats/overview`
 - `GET /api/v1/stats/timeseries`
 - `GET /api/v1/usage`
+- `GET /api/v1/usage/explain`
 - `GET /api/v1/top/processes`
 - `GET /api/v1/top/remotes`
 - `GET /api/v1/top/ports`
@@ -319,6 +323,12 @@ curl "http://${LISTEN_ADDR}/api/v1/stats/overview?range=1h"
 
 ```bash
 curl "http://${LISTEN_ADDR}/api/v1/usage?range=6h&comm=ss-server&limit=50"
+```
+
+分析 Usage 某一条连接的来源/目标关联（给展开详情用）：
+
+```bash
+curl "http://${LISTEN_ADDR}/api/v1/usage/explain?ts=1710000000&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443"
 ```
 
 按方向看趋势：

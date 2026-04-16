@@ -83,4 +83,21 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS log_evidence (
+    source TEXT NOT NULL,
+    event_ts INTEGER NOT NULL,
+    client_ip TEXT NOT NULL,
+    target_ip TEXT NOT NULL,
+    host TEXT NOT NULL,
+    path TEXT NOT NULL,
+    method TEXT NOT NULL,
+    status INTEGER,
+    message TEXT NOT NULL,
+    fingerprint TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_evidence_lookup ON log_evidence (source, event_ts, client_ip, target_ip);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_created_at ON log_evidence (created_at);
 `

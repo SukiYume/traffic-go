@@ -111,6 +111,21 @@ export function safeText(value?: string | null) {
   return value && value.trim() ? value : '未知';
 }
 
+export function executableName(value?: string | null): string | null {
+  if (!value || !value.trim()) return null;
+  const trimmed = value.trim().replace(/^['"]+|['"]+$/g, '');
+  const token = trimmed.split(/\s+/)[0] ?? '';
+  const normalized = token.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!normalized) return null;
+  const last = normalized.split('/').pop();
+  if (!last || !last.trim()) return normalized;
+  return last.trim();
+}
+
+export function displayExecutableName(value?: string | null) {
+  return executableName(value) ?? '未知';
+}
+
 export function clampText(value: string, max = 32) {
   if (value.length <= max) return value;
   return `${value.slice(0, max - 1)}…`;
@@ -118,6 +133,8 @@ export function clampText(value: string, max = 32) {
 
 export function attributionLabel(value: string | null | undefined) {
   if (value === 'exact') return 'exact';
+  if (value === 'heuristic') return 'heuristic';
+  if (value === 'guess') return 'guess';
   if (value === 'unknown') return 'unknown';
   return '未标记';
 }
@@ -125,6 +142,12 @@ export function attributionLabel(value: string | null | undefined) {
 export function attributionDescription(value: string | null | undefined) {
   if (value === 'exact') {
     return '通过 conntrack 与 socket / 进程映射成功命中，当前流量可以明确归到这个进程。';
+  }
+  if (value === 'heuristic') {
+    return '通过本地端口、协议等规则推断到进程，准确度通常较高，但不如 exact 严格。';
+  }
+  if (value === 'guess') {
+    return '基于短时间窗口内的历史命中做延续猜测，适合排查参考，不建议单独作为审计结论。';
   }
   if (value === 'unknown') {
     return '只看到了流量，但无法稳定映射到具体进程，常见于短连接、UDP 无连接场景或 /proc 信息缺失。';

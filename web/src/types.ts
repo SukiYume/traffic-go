@@ -2,7 +2,7 @@ export type RangeKey = '1h' | '24h' | '7d' | '30d' | '90d';
 export type BucketKey = '1m' | '5m' | '1h' | '6h' | '1d';
 export type GroupBy = 'direction' | 'comm' | 'remote_ip';
 export type Direction = 'in' | 'out' | 'forward';
-export type Attribution = 'exact' | 'unknown';
+export type Attribution = 'exact' | 'heuristic' | 'guess' | 'unknown';
 export type DataSource = 'usage_1m' | 'usage_1h' | 'usage_1m_forward' | 'usage_1h_forward';
 export type SortOrder = 'asc' | 'desc';
 export type UsageSortKey = 'minuteTs' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount' | 'remoteIp' | 'direction' | 'localPort' | 'comm' | 'pid';
@@ -123,6 +123,39 @@ export interface UsageResponse {
   totalRows: number;
 }
 
+export type ExplainConfidence = 'low' | 'medium' | 'high';
+
+export interface UsageExplainPeer {
+  direction: Exclude<Direction, 'forward'>;
+  remoteIp: string;
+  remotePort: number | null;
+  localPort: number | null;
+  bytesTotal: number;
+  flowCount: number;
+}
+
+export interface UsageExplainNginxRequest {
+  time: number;
+  method: string;
+  host: string | null;
+  path: string;
+  status: number;
+  count: number;
+  referer: string | null;
+  userAgent: string | null;
+  bot: string | null;
+}
+
+export interface UsageExplain {
+  process: string;
+  confidence: ExplainConfidence;
+  sourceIps: string[];
+  targetIps: string[];
+  relatedPeers: UsageExplainPeer[];
+  nginxRequests: UsageExplainNginxRequest[];
+  notes: string[];
+}
+
 export interface ForwardUsageResponse {
   dataSource: DataSource;
   rows: ForwardUsageRow[];
@@ -174,6 +207,7 @@ export interface TrafficApiClient {
   getOverview(range: RangeKey): Promise<OverviewStats>;
   getTimeSeries(range: RangeKey, groupBy?: GroupBy, filters?: TimeSeriesFilters): Promise<TimeSeriesResponse>;
   getUsage(query: UsageQuery): Promise<UsageResponse>;
+  getUsageExplain(row: UsageRow): Promise<UsageExplain>;
   getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder }): Promise<ProcessSummaryResponse>;
   getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean }): Promise<RemoteSummaryResponse>;
   getTopPorts(range: RangeKey): Promise<TopResponse>;

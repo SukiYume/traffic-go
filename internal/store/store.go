@@ -240,6 +240,7 @@ func (s *Store) Cleanup(ctx context.Context) error {
 		{`DELETE FROM usage_1h WHERE hour_ts < ?`, hourCutoff},
 		{`DELETE FROM usage_1m_forward WHERE minute_ts < ?`, minuteCutoff},
 		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, hourCutoff},
+		{`DELETE FROM log_evidence WHERE created_at < ?`, minuteCutoff},
 	}
 
 	for _, stmt := range statements {

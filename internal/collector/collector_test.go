@@ -2,6 +2,7 @@ package collector
 
 import (
 	"testing"
+	"time"
 
 	"traffic-go/internal/model"
 )
@@ -62,5 +63,124 @@ func TestClassifyFlow(t *testing.T) {
 	classified := classifyFlow(flow, localIPs)
 	if classified.Direction != model.DirectionOut {
 		t.Fatalf("unexpected direction: %s", classified.Direction)
+	}
+}
+
+func TestUpdateSnapshotUsesHeuristicAttributionForUDPFallback(t *testing.T) {
+	service := &Service{}
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+
+	snapshot, _, _ := service.updateSnapshot(
+		now,
+		model.ConntrackFlow{Proto: "udp", OrigBytes: 10, ReplyBytes: 20, OrigPkts: 1, ReplyPkts: 2},
+		classifiedFlow{
+			Proto:          "udp",
+			Direction:      model.DirectionOut,
+			LocalIP:        "10.0.0.2",
+			LocalPort:      53000,
+			RemoteIP:       "8.8.8.8",
+			RemotePort:     53,
+			Connected:      false,
+			MatchedByLocal: true,
+		},
+		model.ProcessInfo{PID: 1888, Comm: "dnsproxy", Exe: "/usr/bin/dnsproxy"},
+		model.FlowSnapshot{},
+		false,
+	)
+
+	if snapshot.Attribution != model.AttributionHeuristic {
+		t.Fatalf("expected heuristic attribution, got %s", snapshot.Attribution)
+	}
+	if snapshot.PID != 1888 {
+		t.Fatalf("expected pid 1888, got %d", snapshot.PID)
+	}
+}
+
+func TestUpdateSnapshotFallsBackToGuessFromPreviousSnapshot(t *testing.T) {
+	service := &Service{}
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+
+	prev := model.FlowSnapshot{
+		Proto:         "tcp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     41002,
+		RemoteIP:      "142.250.72.14",
+		RemotePort:    443,
+		PID:           2451,
+		Comm:          "curl",
+		Exe:           "/usr/bin/curl",
+		Attribution:   model.AttributionExact,
+		StartedAt:     now.Add(-time.Minute),
+		BaselineOrig:  100,
+		BaselineReply: 220,
+		LastOrig:      150,
+		LastReply:     300,
+		BaselineOPkts: 10,
+		BaselineRPkts: 14,
+		LastOPkts:     20,
+		LastRPkts:     26,
+	}
+
+	snapshot, delta, _ := service.updateSnapshot(
+		now,
+		model.ConntrackFlow{Proto: "tcp", OrigBytes: 190, ReplyBytes: 360, OrigPkts: 24, ReplyPkts: 32},
+		classifiedFlow{
+			Proto:      "tcp",
+			Direction:  model.DirectionOut,
+			LocalIP:    "10.0.0.2",
+			LocalPort:  41002,
+			RemoteIP:   "142.250.72.14",
+			RemotePort: 443,
+			Connected:  true,
+		},
+		model.ProcessInfo{},
+		prev,
+		true,
+	)
+
+	if snapshot.Attribution != model.AttributionGuess {
+		t.Fatalf("expected guess attribution, got %s", snapshot.Attribution)
+	}
+	if snapshot.PID != 2451 || snapshot.Comm != "curl" {
+		t.Fatalf("expected previous process to be reused, got %+v", snapshot)
+	}
+	if delta == nil || delta.upBytes <= 0 || delta.downBytes <= 0 {
+		t.Fatalf("expected non-zero delta from previous snapshot, got %+v", delta)
+	}
+}
+
+func TestProcessHintCacheLookupAndExpiry(t *testing.T) {
+	service := &Service{processHints: make(map[string]processHint)}
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+
+	service.rememberProcessHint(model.FlowSnapshot{
+		Proto:     "tcp",
+		Direction: model.DirectionOut,
+		LocalIP:   "10.0.0.2",
+		LocalPort: 8443,
+		PID:       3312,
+		Comm:      "nginx",
+		Exe:       "/usr/sbin/nginx",
+	}, now)
+
+	resolved, ok := service.lookupProcessHint(classifiedFlow{
+		Proto:     "tcp",
+		Direction: model.DirectionOut,
+		LocalIP:   "10.0.0.2",
+		LocalPort: 8443,
+	}, now.Add(30*time.Second))
+	if !ok || resolved.PID != 3312 {
+		t.Fatalf("expected active process hint, got %+v, ok=%v", resolved, ok)
+	}
+
+	_, expired := service.lookupProcessHint(classifiedFlow{
+		Proto:     "tcp",
+		Direction: model.DirectionOut,
+		LocalIP:   "10.0.0.2",
+		LocalPort: 8443,
+	}, now.Add(2*time.Minute))
+	if expired {
+		t.Fatalf("expected hint to expire")
 	}
 }

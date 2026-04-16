@@ -18,9 +18,29 @@ type PaginationState = {
   onPageChange: (page: number) => void;
 };
 
+type TableColumnMeta = {
+  className?: string;
+  headerClassName?: string;
+  cellClassName?: string;
+  align?: 'left' | 'center' | 'right';
+  nowrap?: boolean;
+};
+
+function columnMetaToClassName(meta: TableColumnMeta | undefined, target: 'header' | 'cell') {
+  if (!meta) return undefined;
+  const classes = [meta.className];
+  if (target === 'header' && meta.headerClassName) classes.push(meta.headerClassName);
+  if (target === 'cell' && meta.cellClassName) classes.push(meta.cellClassName);
+  if (meta.align) classes.push(`align-${meta.align}`);
+  if (meta.nowrap) classes.push('cell-nowrap');
+  const filtered = classes.filter(Boolean);
+  return filtered.length ? filtered.join(' ') : undefined;
+}
+
 export function DataTable<TData>({
   columns,
   data,
+  tableClassName,
   emptyText = '暂无数据',
   sorting,
   onSortingChange,
@@ -34,6 +54,7 @@ export function DataTable<TData>({
 }: {
   columns: ColumnDef<TData, any>[];
   data: TData[];
+  tableClassName?: string;
   emptyText?: string;
   sorting?: SortingState;
   onSortingChange?: OnChangeFn<SortingState>;
@@ -60,15 +81,16 @@ export function DataTable<TData>({
   return (
     <div className="table-card">
       <div className="table-wrap">
-        <table className="table">
+        <table className={tableClassName ? `table ${tableClassName}` : 'table'}>
           <thead>
             {table.getHeaderGroups().map((group) => (
               <tr key={group.id}>
                 {group.headers.map((header) => {
+                  const meta = (header.column.columnDef.meta as TableColumnMeta | undefined) ?? undefined;
                   const canSort = header.column.getCanSort();
                   const sortState = header.column.getIsSorted();
                   return (
-                    <th key={header.id}>
+                    <th key={header.id} className={columnMetaToClassName(meta, 'header')}>
                       {header.isPlaceholder ? null : canSort ? (
                         <button
                           type="button"
@@ -95,9 +117,15 @@ export function DataTable<TData>({
                 const rowIndex = Number(row.id);
                 const isExpanded = expandedRowIndex === rowIndex && renderExpandedRow != null;
                 const handleClick = renderExpandedRow && onExpandRow
-                  ? () => onExpandRow(isExpanded ? null : rowIndex)
+                  ? () => {
+                      if (window.getSelection()?.toString()) return;
+                      onExpandRow(isExpanded ? null : rowIndex);
+                    }
                   : onRowClick
-                    ? () => onRowClick(row.original)
+                    ? () => {
+                        if (window.getSelection()?.toString()) return;
+                        onRowClick(row.original);
+                      }
                     : undefined;
 
                 return (
@@ -107,9 +135,14 @@ export function DataTable<TData>({
                       onClick={handleClick}
                       style={handleClick ? { cursor: 'pointer' } : undefined}
                     >
-                      {row.getVisibleCells().map((cell) => (
-                        <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
-                      ))}
+                      {row.getVisibleCells().map((cell) => {
+                        const meta = (cell.column.columnDef.meta as TableColumnMeta | undefined) ?? undefined;
+                        return (
+                          <td key={cell.id} className={columnMetaToClassName(meta, 'cell')}>
+                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                          </td>
+                        );
+                      })}
                     </tr>
                     {isExpanded && (
                       <tr>

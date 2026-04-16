@@ -15,6 +15,8 @@ const (
 	defaultDBPath       = "traffic.db"
 	defaultTickInterval = 2 * time.Second
 	defaultProcFS       = "/proc"
+	defaultNginxLogDir  = "/var/log/nginx"
+	defaultSSLogDir     = "/var/log"
 )
 
 type Retention struct {
@@ -28,6 +30,8 @@ type Config struct {
 	TickInterval  time.Duration `yaml:"tick_interval"`
 	ProcFS        string        `yaml:"proc_fs"`
 	ConntrackPath string        `yaml:"conntrack_path"`
+	NginxLogDir   string        `yaml:"nginx_log_dir"`
+	SSLogDir      string        `yaml:"ss_log_dir"`
 	MockData      bool          `yaml:"mock_data"`
 	LogLevel      string        `yaml:"log_level"`
 	Retention     Retention     `yaml:"retention"`
@@ -39,6 +43,8 @@ func Default() Config {
 		DBPath:       defaultDBPath,
 		TickInterval: defaultTickInterval,
 		ProcFS:       defaultProcFS,
+		NginxLogDir:  defaultNginxLogDir,
+		SSLogDir:     defaultSSLogDir,
 		LogLevel:     "info",
 		Retention: Retention{
 			MinuteDays: 30,
@@ -83,6 +89,12 @@ func withDerivedDefaults(cfg Config) Config {
 	}
 	if cfg.ConntrackPath == "" {
 		cfg.ConntrackPath = filepath.Join(cfg.ProcFS, "net", "nf_conntrack")
+	}
+	if cfg.NginxLogDir == "" {
+		cfg.NginxLogDir = defaultNginxLogDir
+	}
+	if cfg.SSLogDir == "" {
+		cfg.SSLogDir = defaultSSLogDir
 	}
 	if cfg.Retention.MinuteDays <= 0 {
 		cfg.Retention.MinuteDays = 30

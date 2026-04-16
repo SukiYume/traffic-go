@@ -32,7 +32,16 @@ type socketEntry struct {
 	Connected bool
 }
 
-func ReadSocketIndex(procFS string) (map[string]socketEntry, error) {
+type socketIndex struct {
+	ByTuple map[string]socketEntry
+	ByLocal map[string]socketEntry
+}
+
+func localTupleKey(proto string, localIP string, localPort int) string {
+	return fmt.Sprintf("%s|%s|%d", proto, localIP, localPort)
+}
+
+func ReadSocketIndex(procFS string) (socketIndex, error) {
 	files := []struct {
 		name  string
 		proto string
@@ -43,19 +52,37 @@ func ReadSocketIndex(procFS string) (map[string]socketEntry, error) {
 		{"udp6", "udp"},
 	}
 
-	index := make(map[string]socketEntry)
+	index := socketIndex{
+		ByTuple: make(map[string]socketEntry),
+		ByLocal: make(map[string]socketEntry),
+	}
 	for _, item := range files {
 		entries, err := readSocketFile(filepath.Join(procFS, "net", item.name), item.proto)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return nil, err
+			return socketIndex{}, err
 		}
 		for _, entry := range entries {
-			index[entry.Tuple.key()] = socketEntry{
+			index.ByTuple[entry.Tuple.key()] = socketEntry{
 				Inode:     entry.Inode,
 				Connected: entry.Connected,
+			}
+			if entry.Connected {
+				continue
+			}
+			key := localTupleKey(entry.Tuple.Proto, entry.Tuple.LocalIP, entry.Tuple.LocalPort)
+			existing, ok := index.ByLocal[key]
+			switch {
+			case !ok:
+				index.ByLocal[key] = socketEntry{Inode: entry.Inode, Connected: false}
+			case existing.Inode == 0:
+				// Already known ambiguous, keep it unresolved.
+			case existing.Inode != entry.Inode:
+				// Multiple sockets share same local endpoint (e.g. SO_REUSEPORT),
+				// mark as ambiguous to avoid false process attribution.
+				index.ByLocal[key] = socketEntry{Inode: 0, Connected: false}
 			}
 		}
 	}

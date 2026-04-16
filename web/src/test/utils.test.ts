@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { serviceNameForPort } from '../utils';
+import { displayExecutableName, executableName, serviceNameForPort } from '../utils';
 
 describe('serviceNameForPort', () => {
   it('returns null for null port', () => {
@@ -36,5 +36,29 @@ describe('serviceNameForPort', () => {
 
   it('returns null for port 443 with unknown proto', () => {
     expect(serviceNameForPort(443, 'sctp')).toBeNull();
+  });
+});
+
+describe('executableName', () => {
+  it('extracts basename from unix path', () => {
+    expect(executableName('/usr/local/bin/obfs-server')).toBe('obfs-server');
+  });
+
+  it('extracts basename from windows-style path', () => {
+    expect(executableName('C:\\tools\\bin\\ss-server.exe')).toBe('ss-server.exe');
+  });
+
+  it('returns token basename when command includes args', () => {
+    expect(executableName('/usr/bin/python3 -m http.server')).toBe('python3');
+  });
+
+  it('returns null for empty input', () => {
+    expect(executableName('')).toBeNull();
+  });
+});
+
+describe('displayExecutableName', () => {
+  it('returns fallback for empty input', () => {
+    expect(displayExecutableName(undefined)).toBe('未知');
   });
 });

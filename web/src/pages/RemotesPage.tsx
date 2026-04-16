@@ -104,10 +104,9 @@ export function RemotesPage() {
           <p className="eyebrow">Remotes</p>
           <h2>对端 IP 聚合</h2>
           <p>
-  按对端 IP 聚合流量总量，快速找出谁占用了最多带宽。这里是 IP 级排行，看不到进程和端口细节。
-  <br />
-  点击任意 IP 行可跳转到「流量明细」页面，查看该 IP 的逐条连接记录和进程归因。
-</p>
+            按对端 IP 聚合展示流量总量，适合先识别高频来源或高流量目标。这里是 IP 级排行，不直接展示进程与端口细节；
+            点击任意行会跳转到「流量明细」并自动带入筛选条件，继续查看逐条连接和进程归因。
+          </p>
           <section className="status-row">
             <div className="status-pill">
               <strong>时间范围</strong>

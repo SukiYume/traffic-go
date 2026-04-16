@@ -14,6 +14,7 @@ import type {
   UsageRow,
   ForwardUsageRow,
   ProcessOption,
+  UsageExplain,
 } from '../types';
 import { RANGE_TO_BUCKET } from '../ranges';
 
@@ -133,6 +134,124 @@ function createFilteredForward(query: UsageQuery) {
   return filterForward(query, FORWARD_ROWS).sort((a, b) => b.minuteTs - a.minuteTs);
 }
 
+function createRelatedRowsForExplain(row: UsageRow) {
+  const byIdentity = USAGE_ROWS.filter((candidate) => {
+    if (candidate.proto !== row.proto) return false;
+    if (Math.abs(candidate.minuteTs - row.minuteTs) > 120) return false;
+    if (row.pid != null && row.pid > 0) return candidate.pid === row.pid;
+    if (row.comm) return candidate.comm === row.comm;
+    if (row.exe) return candidate.exe === row.exe;
+    return candidate.direction === row.direction && candidate.remoteIp === row.remoteIp;
+  });
+  if (byIdentity.length) {
+    return byIdentity;
+  }
+  return USAGE_ROWS.filter((candidate) => candidate.proto === row.proto && candidate.direction === row.direction && candidate.remoteIp === row.remoteIp);
+}
+
+function sortIpsByWeight(weights: Map<string, number>) {
+  return [...weights.entries()]
+    .sort((left, right) => {
+      if (left[1] === right[1]) return left[0].localeCompare(right[0]);
+      return right[1] - left[1];
+    })
+    .map(([ip]) => ip)
+    .slice(0, 6);
+}
+
+function inferExplainConfidence(payload: Omit<UsageExplain, 'confidence' | 'process'>): UsageExplain['confidence'] {
+  if (payload.nginxRequests.length) return 'high';
+  if (payload.sourceIps.length && payload.targetIps.length) return 'high';
+  if (payload.sourceIps.length || payload.targetIps.length) return 'medium';
+  return 'low';
+}
+
+function isShadowsocksRow(row: UsageRow) {
+  const text = `${row.comm ?? ''} ${row.exe ?? ''}`.toLowerCase();
+  return text.includes('ss-') || text.includes('shadowsocks');
+}
+
+function isNginxRow(row: UsageRow) {
+  const text = `${row.comm ?? ''} ${row.exe ?? ''}`.toLowerCase();
+  return text.includes('nginx') || text.includes('openresty') || text.includes('apache') || text.includes('caddy');
+}
+
+function buildMockUsageExplain(row: UsageRow): UsageExplain {
+  const relatedRows = createRelatedRowsForExplain(row);
+  const sourceWeights = new Map<string, number>();
+  const targetWeights = new Map<string, number>();
+  const relatedPeersMap = new Map<string, { direction: UsageRow['direction']; remoteIp: string; remotePort: number | null; localPort: number | null; bytesTotal: number; flowCount: number }>();
+
+  for (const related of relatedRows) {
+    if (!related.remoteIp) continue;
+    const bytesTotal = related.bytesUp + related.bytesDown;
+    if (related.direction === 'in') {
+      sourceWeights.set(related.remoteIp, (sourceWeights.get(related.remoteIp) ?? 0) + bytesTotal);
+    } else {
+      targetWeights.set(related.remoteIp, (targetWeights.get(related.remoteIp) ?? 0) + bytesTotal);
+    }
+    const key = `${related.direction}:${related.remoteIp}:${related.localPort ?? 0}:${related.remotePort ?? 0}`;
+    const current = relatedPeersMap.get(key) ?? {
+      direction: related.direction,
+      remoteIp: related.remoteIp,
+      remotePort: related.remotePort,
+      localPort: related.localPort,
+      bytesTotal: 0,
+      flowCount: 0,
+    };
+    current.bytesTotal += bytesTotal;
+    current.flowCount += related.flowCount;
+    relatedPeersMap.set(key, current);
+  }
+
+  const nginxRequests =
+    isNginxRow(row) && row.direction === 'in' && row.remoteIp
+      ? [
+          {
+            time: row.minuteTs + 12,
+            method: 'GET',
+            host: 'example.com',
+            path: '/traffic/usage',
+            status: 200,
+            count: 3,
+            referer: 'https://example.com/sitemap.xml',
+            userAgent: 'Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)',
+            bot: 'GPTBot',
+          },
+        ]
+      : [];
+
+  const notes: string[] = [];
+  if (isShadowsocksRow(row)) {
+    notes.push('Shadowsocks 只能做同进程同时间窗关联，无法保证来源 IP 与目标 IP 一一对应。');
+  }
+  if (isNginxRow(row)) {
+    notes.push('网页路径依赖 access.log 关联，conntrack 本身无法直接给出 URI。');
+  }
+  if (!sourceWeights.size && !targetWeights.size) {
+    notes.push('未找到可用的关联流量样本。');
+  }
+
+  const basePayload = {
+    sourceIps: sortIpsByWeight(sourceWeights),
+    targetIps: sortIpsByWeight(targetWeights),
+    relatedPeers: [...relatedPeersMap.values()]
+      .sort((left, right) => {
+        if (left.bytesTotal === right.bytesTotal) return right.flowCount - left.flowCount;
+        return right.bytesTotal - left.bytesTotal;
+      })
+      .slice(0, 8),
+    nginxRequests,
+    notes,
+  };
+
+  return {
+    process: row.comm ? (row.exe ? `${row.comm} (${row.exe})` : row.comm) : 'unknown',
+    confidence: inferExplainConfidence(basePayload),
+    ...basePayload,
+  };
+}
+
 function processSummaries(range: RangeKey, query?: { page?: number; pageSize?: number }): ProcessSummaryResponse {
   const rows = PROCESSES.map((process) => ({
     pid: range === '90d' ? null : process.pid,
@@ -238,6 +357,9 @@ export function createMockApiClient(): TrafficApiClient {
         pageSize: page.pageSize,
         totalRows: page.totalRows,
       };
+    },
+    async getUsageExplain(row) {
+      return buildMockUsageExplain(row);
     },
     async getTopProcesses(range, options) {
       return processSummaries(range, options);

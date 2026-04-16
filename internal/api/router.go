@@ -16,18 +16,22 @@ type runtimeProvider interface {
 }
 
 type Server struct {
-	store   *store.Store
-	runtime runtimeProvider
-	logger  *log.Logger
-	static  fs.FS
+	store       *store.Store
+	runtime     runtimeProvider
+	logger      *log.Logger
+	static      fs.FS
+	nginxLogDir string
+	ssLogDir    string
 }
 
-func NewServer(trafficStore *store.Store, runtime runtimeProvider, logger *log.Logger, static fs.FS) *Server {
+func NewServer(trafficStore *store.Store, runtime runtimeProvider, logger *log.Logger, static fs.FS, nginxLogDir string, ssLogDir string) *Server {
 	return &Server{
-		store:   trafficStore,
-		runtime: runtime,
-		logger:  logger,
-		static:  static,
+		store:       trafficStore,
+		runtime:     runtime,
+		logger:      logger,
+		static:      static,
+		nginxLogDir: nginxLogDir,
+		ssLogDir:    ssLogDir,
 	}
 }
 
@@ -38,6 +42,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/stats/overview", s.handleOverview)
 	mux.HandleFunc("/api/v1/stats/timeseries", s.handleTimeseries)
 	mux.HandleFunc("/api/v1/usage", s.handleUsage)
+	mux.HandleFunc("/api/v1/usage/explain", s.handleUsageExplain)
 	mux.HandleFunc("/api/v1/top/processes", s.handleTopProcesses)
 	mux.HandleFunc("/api/v1/top/remotes", s.handleTopRemotes)
 	mux.HandleFunc("/api/v1/top/ports", s.handleTopPorts)

@@ -13,8 +13,10 @@ const (
 type Attribution string
 
 const (
-	AttributionExact   Attribution = "exact"
-	AttributionUnknown Attribution = "unknown"
+	AttributionExact     Attribution = "exact"
+	AttributionHeuristic Attribution = "heuristic"
+	AttributionGuess     Attribution = "guess"
+	AttributionUnknown   Attribution = "unknown"
 )
 
 type ConntrackFlow struct {
@@ -188,6 +190,19 @@ type ProcessListItem struct {
 type ActiveStats struct {
 	Connections int64
 	Processes   int64
+}
+
+type LogEvidence struct {
+	Source      string
+	EventTS     int64
+	ClientIP    string
+	TargetIP    string
+	Host        string
+	Path        string
+	Method      string
+	Status      *int
+	Message     string
+	Fingerprint string
 }
 
 type UsageQuery struct {

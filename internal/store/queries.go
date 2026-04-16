@@ -147,8 +147,7 @@ WHERE %[1]s >= ? AND %[1]s < ?
 	args := []any{bucketSeconds, bucketSeconds, query.Start.Unix(), query.End.Unix()}
 	appendUsageFilters(&builder, &args, query.Comm, query.RemoteIP, query.Direction, query.Proto)
 	if source != DataSourceHour && query.Exe != "" {
-		builder.WriteString(" AND exe = ?")
-		args = append(args, query.Exe)
+		appendExeFilter(&builder, &args, query.Exe)
 	}
 	if source != DataSourceHour && query.PID != nil {
 		builder.WriteString(" AND pid = ?")
@@ -676,8 +675,7 @@ func appendUsageFilters(builder *strings.Builder, args *[]any, comm, remoteIP st
 func appendUsageFiltersDetailed(builder *strings.Builder, args *[]any, query model.UsageQuery, hourSource bool) {
 	appendUsageFilters(builder, args, query.Comm, query.RemoteIP, query.Direction, query.Proto)
 	if !hourSource && query.Exe != "" {
-		builder.WriteString(" AND exe = ?")
-		*args = append(*args, query.Exe)
+		appendExeFilter(builder, args, query.Exe)
 	}
 	if !hourSource && query.PID != nil {
 		builder.WriteString(" AND pid = ?")
@@ -691,6 +689,15 @@ func appendUsageFiltersDetailed(builder *strings.Builder, args *[]any, query mod
 		builder.WriteString(" AND attribution = ?")
 		*args = append(*args, query.Attribution)
 	}
+}
+
+func appendExeFilter(builder *strings.Builder, args *[]any, exe string) {
+	trimmed := strings.TrimSpace(exe)
+	if trimmed == "" {
+		return
+	}
+	builder.WriteString(" AND (exe = ? OR exe LIKE ? OR exe LIKE ?)")
+	*args = append(*args, trimmed, "%/"+trimmed, "%\\"+trimmed)
 }
 
 func nullableInt(value sql.NullInt64) *int {

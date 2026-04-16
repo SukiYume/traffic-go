@@ -218,6 +218,126 @@ describe('http api client', () => {
     expect(remotes.rows[0]).toMatchObject({ direction: 'in', remoteIp: '203.0.113.24', totalBytes: 480 });
   });
 
+  it('requests usage explain endpoint and decodes nested fields', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            process: 'ss-server (/usr/bin/ss-server)',
+            confidence: 'medium',
+            source_ips: ['203.0.113.24'],
+            target_ips: ['142.250.72.14'],
+            related_peers: [
+              {
+                direction: 'out',
+                remote_ip: '142.250.72.14',
+                remote_port: 443,
+                local_port: 47920,
+                bytes_total: 8062000,
+                flow_count: 4,
+              },
+            ],
+            nginx_requests: [],
+            notes: ['Shadowsocks 只能做同进程同时间窗关联。'],
+          },
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    const result = await client.getUsageExplain({
+      minuteTs: 1710000000,
+      proto: 'tcp',
+      direction: 'out',
+      pid: 1088,
+      comm: 'ss-server',
+      exe: '/usr/bin/ss-server',
+      localPort: 47920,
+      remoteIp: '142.250.72.14',
+      remotePort: 443,
+      attribution: 'exact',
+      bytesUp: 100,
+      bytesDown: 200,
+      pktsUp: 1,
+      pktsDown: 2,
+      flowCount: 1,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/usage/explain?ts=1710000000&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443',
+      expect.any(Object),
+    );
+    expect(result).toMatchObject({
+      process: 'ss-server (/usr/bin/ss-server)',
+      confidence: 'medium',
+      sourceIps: ['203.0.113.24'],
+      targetIps: ['142.250.72.14'],
+      notes: ['Shadowsocks 只能做同进程同时间窗关联。'],
+    });
+    expect(result.relatedPeers[0]).toMatchObject({
+      direction: 'out',
+      remoteIp: '142.250.72.14',
+      remotePort: 443,
+      localPort: 47920,
+      bytesTotal: 8062000,
+      flowCount: 4,
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          data: {
+            process: 'nginx (/usr/sbin/nginx)',
+            confidence: 'high',
+            source_ips: ['74.7.227.153'],
+            target_ips: ['127.0.0.1'],
+            related_peers: [],
+            nginx_requests: [
+              {
+                time: 1710000000,
+                method: 'GET',
+                host: 'paris.escape.ac.cn',
+                path: '/apod/2023/12/AstroPH-2023-12',
+                status: 200,
+                count: 3,
+                referer: 'https://paris.escape.ac.cn/sitemap.xml',
+                user_agent: 'Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)',
+                bot: 'GPTBot',
+              },
+            ],
+            notes: ['访问端识别：GPTBot(3)'],
+          },
+        }),
+      ),
+    );
+
+    const nginxExplain = await client.getUsageExplain({
+      minuteTs: 1710000000,
+      proto: 'tcp',
+      direction: 'in',
+      pid: 32161,
+      comm: 'nginx',
+      exe: '/usr/sbin/nginx',
+      localPort: 443,
+      remoteIp: '74.7.227.153',
+      remotePort: 36892,
+      attribution: 'exact',
+      bytesUp: 10,
+      bytesDown: 20,
+      pktsUp: 1,
+      pktsDown: 1,
+      flowCount: 1,
+    });
+
+    expect(nginxExplain.nginxRequests[0]).toMatchObject({
+      path: '/apod/2023/12/AstroPH-2023-12',
+      count: 3,
+      bot: 'GPTBot',
+      referer: 'https://paris.escape.ac.cn/sitemap.xml',
+    });
+  });
+
   it('uses mock api only when explicitly enabled', () => {
     expect(shouldUseMockApi(undefined)).toBe(false);
     expect(shouldUseMockApi('0')).toBe(false);

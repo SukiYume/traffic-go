@@ -29,7 +29,7 @@ func New(cfg config.Config, logger *log.Logger) (*App, error) {
 	}
 
 	trafficCollector := collector.New(cfg, trafficStore, logger)
-	apiServer := api.NewServer(trafficStore, trafficCollector, logger, embedfs.StaticFS())
+	apiServer := api.NewServer(trafficStore, trafficCollector, logger, embedfs.StaticFS(), cfg.NginxLogDir, cfg.SSLogDir)
 	return &App{
 		cfg:       cfg,
 		logger:    logger,

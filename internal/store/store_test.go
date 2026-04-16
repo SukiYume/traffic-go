@@ -215,6 +215,98 @@ func TestQueryUsageHourlyReturnsNullForMinuteOnlyDimensions(t *testing.T) {
 	}
 }
 
+func TestQueryUsageSupportsExeBasenameFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	minute := time.Date(2026, 4, 16, 1, 8, 0, 0, time.UTC).Unix()
+	err := store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "obfs-server",
+			Exe:         "/usr/local/bin/obfs-server",
+			LocalPort:   12345,
+			RemoteIP:    "142.250.72.14",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   100,
+			BytesDown: 200,
+			PktsUp:    1,
+			PktsDown:  1,
+			FlowCount: 1,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("flush minute: %v", err)
+	}
+
+	rows, _, _, err := store.QueryUsage(ctx, model.UsageQuery{
+		Start: time.Unix(minute, 0).Add(-time.Minute),
+		End:   time.Unix(minute, 0).Add(time.Minute),
+		Exe:   "obfs-server",
+		Limit: 10,
+	}, DataSourceMinute)
+	if err != nil {
+		t.Fatalf("query usage with basename exe: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if rows[0].Exe == nil || *rows[0].Exe != "/usr/local/bin/obfs-server" {
+		t.Fatalf("unexpected exe value: %+v", rows[0].Exe)
+	}
+}
+
+func TestQueryTimeseriesSupportsExeBasenameFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	minute := time.Date(2026, 4, 16, 2, 2, 0, 0, time.UTC)
+	err := store.FlushMinute(ctx, minute.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "obfs-server",
+			Exe:         "/usr/local/bin/obfs-server",
+			LocalPort:   12345,
+			RemoteIP:    "104.26.8.78",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    4,
+			PktsDown:  6,
+			FlowCount: 1,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("flush minute: %v", err)
+	}
+
+	points, err := store.QueryTimeseries(ctx, model.TimeseriesQuery{
+		Start:  minute.Truncate(time.Hour),
+		End:    minute.Truncate(time.Hour).Add(time.Hour),
+		Bucket: time.Minute,
+		Exe:    "obfs-server",
+	}, DataSourceMinute)
+	if err != nil {
+		t.Fatalf("query timeseries with basename exe: %v", err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("expected 1 point, got %d", len(points))
+	}
+	if points[0].BytesUp != 1024 || points[0].BytesDown != 2048 {
+		t.Fatalf("unexpected point values: %+v", points[0])
+	}
+}
+
 func TestMigrateDropsLegacyFlowSnapshotTable(t *testing.T) {
 	cfg := config.Default()
 	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
@@ -454,5 +546,173 @@ func TestQueryOverviewRespectsRequestedWindow(t *testing.T) {
 	}
 	if fullStats.BytesUp != 400 || fullStats.BytesDown != 600 {
 		t.Fatalf("unexpected full stats: %+v", fullStats)
+	}
+}
+
+func TestUpsertAndQueryLogEvidence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	status := 200
+	rows := []model.LogEvidence{
+		{
+			Source:      "nginx",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 20, 0, time.UTC).Unix(),
+			ClientIP:    "74.7.227.153",
+			TargetIP:    "",
+			Host:        "paris.escape.ac.cn",
+			Path:        "/cloud/",
+			Method:      "GET",
+			Status:      &status,
+			Message:     "sample",
+			Fingerprint: "fp-1",
+		},
+	}
+
+	if err := store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert log evidence: %v", err)
+	}
+
+	updatedStatus := 401
+	rows[0].Status = &updatedStatus
+	if err := store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert log evidence update: %v", err)
+	}
+
+	fetched, err := store.QueryLogEvidence(ctx, LogEvidenceQuery{
+		Source:   "nginx",
+		StartTS:  time.Date(2026, 4, 16, 0, 50, 0, 0, time.UTC).Unix(),
+		EndTS:    time.Date(2026, 4, 16, 1, 10, 0, 0, time.UTC).Unix(),
+		ClientIP: "74.7.227.153",
+		Limit:    10,
+	})
+	if err != nil {
+		t.Fatalf("query log evidence: %v", err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("unexpected evidence count: %d", len(fetched))
+	}
+	if fetched[0].Status == nil || *fetched[0].Status != 401 {
+		t.Fatalf("unexpected evidence status: %+v", fetched[0])
+	}
+}
+
+func TestQueryLogEvidenceSupportsAnyIP(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	status := 200
+	rows := []model.LogEvidence{
+		{
+			Source:      "ss",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 20, 0, time.UTC).Unix(),
+			ClientIP:    "203.0.113.10",
+			TargetIP:    "142.250.72.14",
+			Host:        "chatgpt.com",
+			Path:        "443",
+			Method:      "connect",
+			Status:      &status,
+			Message:     "sample-1",
+			Fingerprint: "fp-any-1",
+		},
+		{
+			Source:      "ss",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 30, 0, time.UTC).Unix(),
+			ClientIP:    "198.51.100.22",
+			TargetIP:    "1.1.1.1",
+			Host:        "one.one.one.one",
+			Path:        "443",
+			Method:      "connect",
+			Status:      &status,
+			Message:     "sample-2",
+			Fingerprint: "fp-any-2",
+		},
+	}
+	if err := store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert evidence: %v", err)
+	}
+
+	fetched, err := store.QueryLogEvidence(ctx, LogEvidenceQuery{
+		Source:  "ss",
+		StartTS: time.Date(2026, 4, 16, 0, 59, 0, 0, time.UTC).Unix(),
+		EndTS:   time.Date(2026, 4, 16, 1, 2, 0, 0, time.UTC).Unix(),
+		AnyIP:   "142.250.72.14",
+		Limit:   50,
+	})
+	if err != nil {
+		t.Fatalf("query any ip evidence: %v", err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("expected one evidence row, got %d", len(fetched))
+	}
+	if fetched[0].TargetIP != "142.250.72.14" {
+		t.Fatalf("unexpected evidence row: %+v", fetched[0])
+	}
+}
+
+func TestCleanupRemovesExpiredLogEvidence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	status := 200
+	rows := []model.LogEvidence{
+		{
+			Source:      "nginx",
+			EventTS:     now.Add(-48 * time.Hour).Unix(),
+			ClientIP:    "74.7.227.153",
+			TargetIP:    "",
+			Host:        "paris.escape.ac.cn",
+			Path:        "/old",
+			Method:      "GET",
+			Status:      &status,
+			Message:     "old",
+			Fingerprint: "fp-clean-old",
+		},
+		{
+			Source:      "nginx",
+			EventTS:     now.Add(-2 * time.Hour).Unix(),
+			ClientIP:    "74.7.227.154",
+			TargetIP:    "",
+			Host:        "paris.escape.ac.cn",
+			Path:        "/new",
+			Method:      "GET",
+			Status:      &status,
+			Message:     "new",
+			Fingerprint: "fp-clean-new",
+		},
+	}
+	if err := store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert evidence: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE log_evidence SET created_at = ? WHERE fingerprint = ?`, now.Add(-48*time.Hour).Unix(), "fp-clean-old"); err != nil {
+		t.Fatalf("set created_at for old row: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE log_evidence SET created_at = ? WHERE fingerprint = ?`, now.Add(-2*time.Hour).Unix(), "fp-clean-new"); err != nil {
+		t.Fatalf("set created_at for new row: %v", err)
+	}
+
+	store.retention.MinuteDays = 1
+	store.retention.HourlyDays = 7
+	if err := store.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	fetched, err := store.QueryLogEvidence(ctx, LogEvidenceQuery{
+		Source:  "nginx",
+		StartTS: now.Add(-72 * time.Hour).Unix(),
+		EndTS:   now.Unix(),
+		Limit:   20,
+	})
+	if err != nil {
+		t.Fatalf("query evidence after cleanup: %v", err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("expected one recent evidence row after cleanup, got %d", len(fetched))
+	}
+	if fetched[0].Fingerprint != "fp-clean-new" {
+		t.Fatalf("unexpected remaining evidence row: %+v", fetched[0])
 	}
 }

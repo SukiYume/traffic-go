@@ -11,6 +11,8 @@ type classifiedFlow struct {
 	RemotePort  int
 	Inode       uint64
 	Connected   bool
+	MatchedByLocal bool
+	MatchedByHint  bool
 	Tuple       tuple
 	OrigSrcIP   string
 	OrigDstIP   string

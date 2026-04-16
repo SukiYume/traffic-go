@@ -11,6 +11,8 @@ listen: "127.0.0.1:18080"
 db_path: ./traffic.db
 tick_interval: 2s
 log_level: info
+nginx_log_dir: /var/log/nginx
+ss_log_dir: /var/log/shadowsocks
 
 retention:
   flows_days: 30

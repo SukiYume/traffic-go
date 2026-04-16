@@ -29,6 +29,8 @@ const protoOptions = [
 const attributionOptions = [
   { value: '', label: '全部归因' },
   { value: 'exact', label: 'exact — 精确匹配' },
+  { value: 'heuristic', label: 'heuristic — 规则推断' },
+  { value: 'guess', label: 'guess — 短时猜测' },
   { value: 'unknown', label: 'unknown — 无法归因' },
 ];
 
@@ -73,7 +75,7 @@ export function FiltersBar({
         <input
           value={filters.exe}
           onChange={(event) => update('exe', event.target.value)}
-          placeholder="/usr/bin/ss-server"
+          placeholder="ss-server"
           disabled={longRange}
           title={longRange ? '超过分钟明细保留窗口的数据按进程名聚合，无法按具体 EXE 筛选' : undefined}
         />
