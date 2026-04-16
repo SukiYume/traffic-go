@@ -1,0 +1,62 @@
+# Local tooling and editor state
+.claude/
+.codex/
+.tools/
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor temp files
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+*.bak
+
+# Local env files
+.env
+.env.*
+!.env.example
+*.local
+
+# Go build outputs
+/bin/
+/traffic-go
+/traffic-go.exe
+*.test
+coverage.out
+/coverage/
+/out/
+/tmp/
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.tmp
+
+# Release artifacts
+/release/
+
+# Internal working docs
+/docs/
+
+# Frontend build and dependencies
+/web/node_modules/
+/web/dist/
+/web/.vite/
+/web/coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Embedded frontend build output
+/internal/embed/dist/*
+!/internal/embed/dist/placeholder.txt

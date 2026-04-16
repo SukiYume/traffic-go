@@ -1,0 +1,20 @@
+# traffic-go example configuration
+#
+# Security warning:
+# This service exposes sensitive network metadata. Keep it bound to 127.0.0.1
+# unless you place it behind SSH port forwarding or an authenticated reverse
+# proxy.
+
+# Change the port here if the default local listen address conflicts with another service.
+listen: "127.0.0.1:18080"
+# install-centos7.sh rewrites this to ${INSTALL_ROOT}/traffic.db during install.
+db_path: ./traffic.db
+tick_interval: 2s
+log_level: info
+
+retention:
+  flows_days: 30
+  hourly_days: 180
+  # Queries longer than flows_days automatically fall back to hourly aggregates
+  # and lose pid/exe-level filtering.
+# Hourly cleanup and weekly vacuum are built in and are not configurable here.

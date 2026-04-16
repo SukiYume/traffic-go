@@ -1,0 +1,25 @@
+[Unit]
+Description=traffic-go network flow monitor
+Documentation=man:systemd.service(5)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=traffic-go
+Group=traffic-go
+WorkingDirectory=/var/lib/traffic-go
+ExecStart=/usr/local/bin/traffic-go -config /etc/traffic-go/config.yaml
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+LimitNOFILE=65536
+UMask=0027
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+StateDirectory=traffic-go
+RuntimeDirectory=traffic-go
+
+[Install]
+WantedBy=multi-user.target
