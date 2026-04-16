@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { App } from '../App';
 import { ApiProvider } from '../api-context';
@@ -52,5 +53,22 @@ describe('traffic-go web ui', () => {
     expect(screen.getByRole('link', { name: 'Dashboard' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Usage' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Forward' })).toBeInTheDocument();
+  });
+
+  it('expands a usage row to show detail panel on click', async () => {
+    const user = userEvent.setup();
+    renderWithProviders('/usage', <UsagePage />);
+    // Wait for table to load
+    expect(await screen.findByText('流量明细')).toBeInTheDocument();
+    // Find the first data row (not header) and click it
+    const rows = await screen.findAllByRole('row');
+    // rows[0] = thead row, rows[1] = first data row
+    await user.click(rows[1]);
+    // Expanded panel should show these labels
+    expect(screen.getByText('对端端口')).toBeInTheDocument();
+    expect(screen.getByText('数据包数')).toBeInTheDocument();
+    expect(screen.getByText('连接数')).toBeInTheDocument();
+    expect(screen.getByText('归因详情')).toBeInTheDocument();
+    expect(screen.getByText('平均速率')).toBeInTheDocument();
   });
 });
