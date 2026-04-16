@@ -40,6 +40,7 @@ function columnMetaToClassName(meta: TableColumnMeta | undefined, target: 'heade
 export function DataTable<TData>({
   columns,
   data,
+  cardClassName,
   tableClassName,
   emptyText = '暂无数据',
   sorting,
@@ -54,6 +55,7 @@ export function DataTable<TData>({
 }: {
   columns: ColumnDef<TData, any>[];
   data: TData[];
+  cardClassName?: string;
   tableClassName?: string;
   emptyText?: string;
   sorting?: SortingState;
@@ -79,7 +81,7 @@ export function DataTable<TData>({
   const totalPages = pagination ? Math.max(1, Math.ceil(pagination.totalRows / pagination.pageSize)) : 1;
 
   return (
-    <div className="table-card">
+    <div className={cardClassName ? `table-card ${cardClassName}` : 'table-card'}>
       <div className="table-wrap">
         <table className={tableClassName ? `table ${tableClassName}` : 'table'}>
           <thead>

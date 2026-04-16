@@ -128,7 +128,20 @@ export function Layout({ children }: { children: ReactNode }) {
       <aside className="sidebar">
         <div className="brand-lockup">
           <div className="brand-mark" aria-hidden="true">
-            <span className="brand-mark-core">TG</span>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="url(#paint0_linear)"/>
+              <path d="M2 17L12 22L22 17M2 12L12 17L22 12" stroke="url(#paint1_linear)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+              <defs>
+                <linearGradient id="paint0_linear" x1="12" y1="2" x2="12" y2="12" gradientUnits="userSpaceOnUse">
+                  <stop stopColor="#38BDF8"/>
+                  <stop offset="1" stopColor="#818CF8"/>
+                </linearGradient>
+                <linearGradient id="paint1_linear" x1="12" y1="12" x2="12" y2="22" gradientUnits="userSpaceOnUse">
+                  <stop stopColor="#38BDF8" stopOpacity="0.8"/>
+                  <stop offset="1" stopColor="#818CF8" stopOpacity="0.8"/>
+                </linearGradient>
+              </defs>
+            </svg>
           </div>
           <div>
             <h1>traffic-go</h1>

@@ -49,18 +49,30 @@ export function ForwardPage() {
       columnHelper.accessor('minuteTs', {
         id: 'minuteTs',
         header: '时间',
+        meta: { className: 'col-time', nowrap: true },
         cell: (info) => formatDateTime(info.getValue()),
       }),
-      columnHelper.accessor('origSrc', { id: 'origSrc', header: '来源 IP' }),
-      columnHelper.accessor('origDst', { id: 'origDst', header: '目标 IP' }),
-      columnHelper.accessor('origSport', { id: 'origSport', header: '来源端口', enableSorting: false }),
-      columnHelper.accessor('origDport', { id: 'origDport', header: '目标端口', enableSorting: false }),
-      columnHelper.accessor('bytesOrig', { id: 'bytesOrig', header: '原向流量', cell: (info) => formatBytes(info.getValue()) }),
-      columnHelper.accessor('bytesReply', { id: 'bytesReply', header: '回包流量', cell: (info) => formatBytes(info.getValue()) }),
-      columnHelper.accessor('flowCount', { id: 'flowCount', header: '流数' }),
+      columnHelper.accessor('origSrc', { id: 'origSrc', header: '来源 IP', meta: { className: 'col-fwd-ip', nowrap: false } }),
+      columnHelper.accessor('origDst', { id: 'origDst', header: '目标 IP', meta: { className: 'col-fwd-ip', nowrap: false } }),
+      columnHelper.accessor('origSport', { id: 'origSport', header: '来源端口', enableSorting: false, meta: { className: 'col-fwd-port', align: 'right', nowrap: true } }),
+      columnHelper.accessor('origDport', { id: 'origDport', header: '目标端口', enableSorting: false, meta: { className: 'col-fwd-port', align: 'right', nowrap: true } }),
+      columnHelper.accessor('bytesOrig', {
+        id: 'bytesOrig',
+        header: '原向流量',
+        meta: { className: 'col-bytes', align: 'right', nowrap: true },
+        cell: (info) => formatBytes(info.getValue()),
+      }),
+      columnHelper.accessor('bytesReply', {
+        id: 'bytesReply',
+        header: '回包流量',
+        meta: { className: 'col-bytes', align: 'right', nowrap: true },
+        cell: (info) => formatBytes(info.getValue()),
+      }),
+      columnHelper.accessor('flowCount', { id: 'flowCount', header: '流数', meta: { className: 'col-fwd-count', align: 'right', nowrap: true } }),
       columnHelper.display({
         id: 'bytesTotal',
         header: '总量',
+        meta: { className: 'col-bytes col-bytes-total', align: 'right', nowrap: true },
         cell: (info) => formatBytes(info.row.original.bytesOrig + info.row.original.bytesReply),
       }),
     ],
@@ -92,6 +104,7 @@ export function ForwardPage() {
         <DataTable
           columns={columns}
           data={query.data.rows}
+          tableClassName="forward-table table-dense"
           sorting={sorting}
           onSortingChange={setSorting}
           manualSorting

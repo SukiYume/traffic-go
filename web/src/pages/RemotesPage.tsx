@@ -61,36 +61,43 @@ export function RemotesPage() {
       columnHelper.accessor('direction', {
         id: 'direction',
         header: '方向',
+        meta: { className: 'col-direction', align: 'center', nowrap: true },
         cell: (info) => directionLabel(info.getValue()),
       }),
       columnHelper.display({
         id: 'peerRole',
         header: '对端角色',
         enableSorting: false,
+        meta: { className: 'col-peer-role' },
         cell: (info) => peerRoleLabel(info.row.original.direction),
       }),
       columnHelper.accessor('remoteIp', {
         id: 'remoteIp',
         header: '对端 IP',
+        meta: { className: 'col-remote-ip col-remote-ip-plain', nowrap: false },
         cell: (info) => safeText(info.getValue()),
       }),
       columnHelper.accessor('bytesUp', {
         id: 'bytesUp',
         header: '上行',
+        meta: { className: 'col-bytes', align: 'right', nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
       columnHelper.accessor('bytesDown', {
         id: 'bytesDown',
         header: '下行',
+        meta: { className: 'col-bytes', align: 'right', nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
       columnHelper.accessor('flowCount', {
         id: 'flowCount',
         header: '流数',
+        meta: { className: 'col-fwd-count', align: 'right', nowrap: true },
       }),
       columnHelper.accessor('totalBytes', {
         id: 'bytesTotal',
         header: '总量',
+        meta: { className: 'col-bytes col-bytes-total', align: 'right', nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
     ],
@@ -134,6 +141,7 @@ export function RemotesPage() {
         <DataTable
           columns={columns}
           data={query.data.rows}
+          tableClassName="remotes-table table-dense"
           sorting={sorting}
           onSortingChange={setSorting}
           manualSorting

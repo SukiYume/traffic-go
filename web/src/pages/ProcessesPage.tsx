@@ -34,6 +34,14 @@ export function ProcessesPage() {
   });
 
   const rawRows = query.data?.rows ?? [];
+  const showPIDColumn = groupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
+
+  useEffect(() => {
+    if (!showPIDColumn && sorting[0]?.id === 'pid') {
+      setSorting([{ id: 'totalBytes', desc: true }]);
+    }
+  }, [showPIDColumn, sorting]);
+
   const rows = useMemo(() => {
     if (groupBy === 'pid' || query.data?.dataSource === 'usage_1h') return rawRows;
     const map = new Map<string, ProcessSummaryRow>();
@@ -102,13 +110,17 @@ export function ProcessesPage() {
         meta: { className: 'col-process', nowrap: true },
         cell: (info) => safeText(info.getValue()),
       }),
-      columnHelper.accessor('pid', {
-        id: 'pid',
-        header: 'PID',
-        enableSorting: query.data?.dataSource !== 'usage_1h',
-        meta: { className: 'col-pid', align: 'right', nowrap: true },
-        cell: (info) => info.getValue() ?? '按进程名聚合',
-      }),
+      ...(showPIDColumn
+        ? [
+            columnHelper.accessor('pid', {
+              id: 'pid',
+              header: 'PID',
+              enableSorting: true,
+              meta: { className: 'col-pid', nowrap: true },
+              cell: (info) => info.getValue() ?? '未知',
+            }),
+          ]
+        : []),
       columnHelper.accessor('exe', {
         id: 'exe',
         header: 'EXE',
@@ -139,8 +151,12 @@ export function ProcessesPage() {
         cell: (info) => formatBytes(info.getValue()),
       }),
     ],
-    [query.data?.dataSource],
+    [showPIDColumn],
   );
+
+  const processesTableClassName = showPIDColumn
+    ? 'processes-table processes-table-pid table-dense'
+    : 'processes-table processes-table-comm table-dense';
 
   return (
     <div className="page">
@@ -178,7 +194,8 @@ export function ProcessesPage() {
         <DataTable
           columns={columns}
           data={rows}
-          tableClassName="processes-table table-dense"
+          cardClassName="table-card-auto"
+          tableClassName={processesTableClassName}
           sorting={sorting}
           onSortingChange={setSorting}
           onRowClick={(row) => setSelectedKey(`${row.pid ?? 'none'}-${row.comm ?? ''}-${row.exe ?? ''}`)}
