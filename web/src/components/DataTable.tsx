@@ -1,3 +1,4 @@
+import { Fragment } from 'react';
 import {
   flexRender,
   getCoreRowModel,
@@ -7,6 +8,7 @@ import {
   type OnChangeFn,
   type SortingState,
 } from '@tanstack/react-table';
+import type { ReactNode } from 'react';
 import { formatNumber } from '../utils';
 
 type PaginationState = {
@@ -26,6 +28,9 @@ export function DataTable<TData>({
   pagination,
   onRowClick,
   isRowSelected,
+  expandedRowIndex,
+  onExpandRow,
+  renderExpandedRow,
 }: {
   columns: ColumnDef<TData, any>[];
   data: TData[];
@@ -36,6 +41,9 @@ export function DataTable<TData>({
   pagination?: PaginationState;
   onRowClick?: (row: TData) => void;
   isRowSelected?: (row: TData) => boolean;
+  expandedRowIndex?: number | null;
+  onExpandRow?: (index: number | null) => void;
+  renderExpandedRow?: (row: TData) => ReactNode;
 }) {
   const table = useReactTable({
     columns,
@@ -83,17 +91,36 @@ export function DataTable<TData>({
           </thead>
           <tbody>
             {table.getRowModel().rows.length ? (
-              table.getRowModel().rows.map((row) => (
-                <tr
-                  key={row.id}
-                  className={isRowSelected?.(row.original) ? 'selected' : undefined}
-                  onClick={onRowClick ? () => onRowClick(row.original) : undefined}
-                >
-                  {row.getVisibleCells().map((cell) => (
-                    <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
-                  ))}
-                </tr>
-              ))
+              table.getRowModel().rows.map((row) => {
+                const rowIndex = Number(row.id);
+                const isExpanded = expandedRowIndex === rowIndex && renderExpandedRow != null;
+                const handleClick = renderExpandedRow && onExpandRow
+                  ? () => onExpandRow(isExpanded ? null : rowIndex)
+                  : onRowClick
+                    ? () => onRowClick(row.original)
+                    : undefined;
+
+                return (
+                  <Fragment key={row.id}>
+                    <tr
+                      className={isRowSelected?.(row.original) ? 'selected' : isExpanded ? 'selected' : undefined}
+                      onClick={handleClick}
+                      style={handleClick ? { cursor: 'pointer' } : undefined}
+                    >
+                      {row.getVisibleCells().map((cell) => (
+                        <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
+                      ))}
+                    </tr>
+                    {isExpanded && (
+                      <tr>
+                        <td colSpan={columns.length} onClick={(e) => e.stopPropagation()}>
+                          {renderExpandedRow(row.original)}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })
             ) : (
               <tr>
                 <td colSpan={columns.length}>
