@@ -1,5 +1,7 @@
-import type { ProcessOption, RangeKey } from '../types';
+import { CustomSelect } from './CustomSelect';
 import { DimensionHint } from './DimensionHint';
+import { attributionDescription } from '../utils';
+import type { ProcessOption, RangeKey } from '../types';
 
 type Filters = {
   comm: string;
@@ -26,8 +28,8 @@ const protoOptions = [
 
 const attributionOptions = [
   { value: '', label: '全部归因' },
-  { value: 'exact', label: '精确' },
-  { value: 'unknown', label: '未知' },
+  { value: 'exact', label: 'exact — 精确匹配' },
+  { value: 'unknown', label: 'unknown — 无法归因' },
 ];
 
 export function FiltersBar({
@@ -43,6 +45,7 @@ export function FiltersBar({
 }) {
   const longRange = range === '90d';
   const update = (key: keyof Filters, value: string) => onChange({ ...filters, [key]: value });
+  const attributionHint = attributionDescription(filters.attribution || null);
 
   return (
     <div className="filters">
@@ -85,34 +88,33 @@ export function FiltersBar({
       </label>
       <label>
         <span>方向</span>
-        <select value={filters.direction} onChange={(event) => update('direction', event.target.value)}>
-          {directionOptions.map((item) => (
-            <option key={item.value} value={item.value}>
-              {item.label}
-            </option>
-          ))}
-        </select>
+        <CustomSelect
+          value={filters.direction}
+          options={directionOptions}
+          onChange={(v) => update('direction', v)}
+        />
       </label>
       <label>
         <span>协议</span>
-        <select value={filters.proto} onChange={(event) => update('proto', event.target.value)}>
-          {protoOptions.map((item) => (
-            <option key={item.value} value={item.value}>
-              {item.label}
-            </option>
-          ))}
-        </select>
+        <CustomSelect
+          value={filters.proto}
+          options={protoOptions}
+          onChange={(v) => update('proto', v)}
+        />
       </label>
-      <label>
-        <span>归因</span>
-        <select value={filters.attribution} onChange={(event) => update('attribution', event.target.value)}>
-          {attributionOptions.map((item) => (
-            <option key={item.value} value={item.value}>
-              {item.label}
-            </option>
-          ))}
-        </select>
-      </label>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <span>归因</span>
+          <CustomSelect
+            value={filters.attribution}
+            options={attributionOptions}
+            onChange={(v) => update('attribution', v)}
+          />
+        </label>
+        {filters.attribution && (
+          <span className="filter-hint">{attributionHint}</span>
+        )}
+      </div>
       <datalist id="traffic-processes">
         {processes.map((process) => (
           <option key={`${process.pid}-${process.comm}`} value={process.comm} />
