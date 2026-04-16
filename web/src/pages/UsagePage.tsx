@@ -251,7 +251,7 @@ export function UsagePage() {
           }),
           columnHelper.accessor('remotePort', {
             id: 'remotePort',
-            header: '远端口',
+            header: '对端端口',
             enableSorting: false,
             cell: (info) => {
               const port = info.getValue();
