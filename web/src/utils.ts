@@ -77,6 +77,12 @@ export function dataSourceDescription(dataSource: DataSource) {
   }[dataSource];
 }
 
+export function dataSourceAutoNote(dataSource: DataSource) {
+  return dataSource.endsWith('_1h')
+    ? '当前页面正在读取小时聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。'
+    : '当前页面正在读取分钟明细。它不是一个手动筛选项，时间范围或维度变化后会自动切换。';
+}
+
 export function peerRoleLabel(direction: Exclude<Direction, 'forward'>) {
   return direction === 'in' ? '访问 VPS 的来源' : 'VPS 访问的目标';
 }
@@ -108,4 +114,53 @@ export function safeText(value?: string | null) {
 export function clampText(value: string, max = 32) {
   if (value.length <= max) return value;
   return `${value.slice(0, max - 1)}…`;
+}
+
+export function attributionLabel(value: string | null | undefined) {
+  if (value === 'exact') return 'exact';
+  if (value === 'unknown') return 'unknown';
+  return '未标记';
+}
+
+export function attributionDescription(value: string | null | undefined) {
+  if (value === 'exact') {
+    return '通过 conntrack 与 socket / 进程映射成功命中，当前流量可以明确归到这个进程。';
+  }
+  if (value === 'unknown') {
+    return '只看到了流量，但无法稳定映射到具体进程，常见于短连接、UDP 无连接场景或 /proc 信息缺失。';
+  }
+  return '当前数据源没有这列，或者该条记录没有归因信息。';
+}
+
+type PortEntry = string | Record<string, string>;
+
+const PORT_NAMES: Record<number, PortEntry> = {
+  21: 'FTP',
+  22: 'SSH',
+  25: 'SMTP',
+  53: 'DNS',
+  80: 'HTTP',
+  110: 'POP3',
+  143: 'IMAP',
+  443: { tcp: 'HTTPS', udp: 'QUIC' },
+  587: 'SMTP',
+  993: 'IMAPS',
+  995: 'POP3S',
+  1194: 'OpenVPN',
+  3306: 'MySQL',
+  3478: 'STUN',
+  5432: 'PostgreSQL',
+  6379: 'Redis',
+  8080: 'HTTP-alt',
+  8443: 'HTTPS-alt',
+  19302: 'STUN',
+  51820: 'WireGuard',
+};
+
+export function serviceNameForPort(port: number | null | undefined, proto?: string): string | null {
+  if (port == null) return null;
+  const entry = PORT_NAMES[port];
+  if (!entry) return null;
+  if (typeof entry === 'string') return entry;
+  return entry[proto ?? ''] ?? null;
 }
