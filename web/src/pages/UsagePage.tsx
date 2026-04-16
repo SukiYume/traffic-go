@@ -150,7 +150,11 @@ export function UsagePage() {
         : [
             columnHelper.accessor('attribution', {
               id: 'attribution',
-              header: '归因',
+              header: () => (
+                <span title="exact: 精确匹配(端口+IP+协议全匹配)&#10;heuristic: 启发式推断(短时端口重用)&#10;guess: 降级推断(按端口强行归属)">
+                  归因 ⓘ
+                </span>
+              ),
               enableSorting: false,
               cell: (info) => safeText(info.getValue()),
             }),
@@ -181,7 +185,9 @@ export function UsagePage() {
         <div className="hero-copy">
           <p className="eyebrow">Usage</p>
           <h2>流量明细</h2>
-          <p>逐条检查入站来源、出站目标、进程归因和端口明细。排序、分页和时间窗口会一起同步到后端查询。</p>
+          <p>
+  逐条流量明细，深挖具体连接行为。点击任意行展开详情，点击对端 IP 快速过滤。排序、分页和时间窗口实时同步到后端。
+</p>
           <section className="status-row">
             <div className="status-pill">
               <strong>时间范围</strong>

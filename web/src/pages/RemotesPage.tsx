@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { DataTable } from '../components/DataTable';
 import { EmptyState } from '../components/EmptyState';
@@ -16,6 +16,7 @@ const columnHelper = createColumnHelper<RemoteSummaryRow>();
 
 export function RemotesPage() {
   const api = useApiClient();
+  const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const range = (params.get('range') as RangeKey | null) ?? defaultRange;
   const direction = (params.get('direction') as 'in' | 'out' | null) ?? '';
@@ -102,7 +103,11 @@ export function RemotesPage() {
         <div className="hero-copy">
           <p className="eyebrow">Remotes</p>
           <h2>对端 IP 聚合</h2>
-          <p>把“谁在访问这台 VPS”和“这台 VPS 在访问谁”拆开看，默认隐藏 127.0.0.1 / ::1 这类回环地址。</p>
+          <p>
+  按对端 IP 聚合流量总量，快速找出谁占用了最多带宽。这里是 IP 级排行，看不到进程和端口细节。
+  <br />
+  点击任意 IP 行可跳转到「流量明细」页面，查看该 IP 的逐条连接记录和进程归因。
+</p>
           <section className="status-row">
             <div className="status-pill">
               <strong>时间范围</strong>
@@ -133,6 +138,13 @@ export function RemotesPage() {
           sorting={sorting}
           onSortingChange={setSorting}
           manualSorting
+          onRowClick={(row) => {
+            const nextParams = new URLSearchParams();
+            nextParams.set('range', range);
+            if (row.remoteIp) nextParams.set('remoteIp', row.remoteIp);
+            if (row.direction) nextParams.set('direction', row.direction);
+            navigate(`/usage?${nextParams.toString()}`);
+          }}
           pagination={{
             page: query.data.page,
             pageSize: query.data.pageSize,
