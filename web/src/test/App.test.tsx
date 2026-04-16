@@ -65,7 +65,8 @@ describe('traffic-go web ui', () => {
     // rows[0] = thead row, rows[1] = first data row
     await user.click(rows[1]);
     // Expanded panel should show these labels
-    expect(screen.getByText('对端端口')).toBeInTheDocument();
+    // '对端端口' also appears as a column header, so use getAllByText
+    expect(screen.getAllByText('对端端口').length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText('数据包数')).toBeInTheDocument();
     expect(screen.getByText('连接数')).toBeInTheDocument();
     expect(screen.getByText('归因详情')).toBeInTheDocument();
