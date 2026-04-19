@@ -1,7 +1,7 @@
 import { CustomSelect } from './CustomSelect';
 import { DimensionHint } from './DimensionHint';
-import { attributionDescription } from '../utils';
-import type { ProcessOption, RangeKey } from '../types';
+import { attributionDescription, minuteDimensionsUnavailable } from '../utils';
+import type { DataSource, ProcessOption } from '../types';
 
 type Filters = {
   comm: string;
@@ -34,20 +34,36 @@ const attributionOptions = [
   { value: 'unknown', label: 'unknown — 无法归因' },
 ];
 
+function distinctProcessNames(processes: ProcessOption[]) {
+  const suggestions: string[] = [];
+  const seen = new Set<string>();
+  for (const process of processes) {
+    const comm = process.comm.trim();
+    if (!comm || seen.has(comm)) {
+      continue;
+    }
+    seen.add(comm);
+    suggestions.push(comm);
+  }
+  return suggestions;
+}
+
 export function FiltersBar({
-  range,
+  dataSource,
   processes,
   filters,
   onChange,
 }: {
-  range: RangeKey;
+  dataSource?: DataSource;
   processes: ProcessOption[];
   filters: Filters;
   onChange: (next: Filters) => void;
 }) {
-  const longRange = range === '90d';
+  const minuteOnlyUnavailable = minuteDimensionsUnavailable(dataSource ?? null);
+  const minuteOnlyTitle = minuteOnlyUnavailable ? '当前页面已切换到小时聚合，无法使用分钟级归因维度筛选' : undefined;
   const update = (key: keyof Filters, value: string) => onChange({ ...filters, [key]: value });
   const attributionHint = attributionDescription(filters.attribution || null);
+  const processSuggestions = distinctProcessNames(processes);
 
   return (
     <div className="filters">
@@ -66,8 +82,8 @@ export function FiltersBar({
           value={filters.pid}
           onChange={(event) => update('pid', event.target.value)}
           placeholder="1088"
-          disabled={longRange}
-          title={longRange ? '超过分钟明细保留窗口的数据按进程名聚合，无法按具体 PID 筛选' : undefined}
+          disabled={minuteOnlyUnavailable}
+          title={minuteOnlyUnavailable ? '当前页面已切换到小时聚合，无法按具体 PID 筛选' : undefined}
         />
       </label>
       <label>
@@ -76,8 +92,8 @@ export function FiltersBar({
           value={filters.exe}
           onChange={(event) => update('exe', event.target.value)}
           placeholder="ss-server"
-          disabled={longRange}
-          title={longRange ? '超过分钟明细保留窗口的数据按进程名聚合，无法按具体 EXE 筛选' : undefined}
+          disabled={minuteOnlyUnavailable}
+          title={minuteOnlyUnavailable ? '当前页面已切换到小时聚合，无法按具体 EXE 筛选' : undefined}
         />
       </label>
       <label>
@@ -111,6 +127,8 @@ export function FiltersBar({
             value={filters.attribution}
             options={attributionOptions}
             onChange={(v) => update('attribution', v)}
+            disabled={minuteOnlyUnavailable}
+            title={minuteOnlyTitle}
           />
         </label>
         {filters.attribution && (
@@ -118,11 +136,11 @@ export function FiltersBar({
         )}
       </div>
       <datalist id="traffic-processes">
-        {processes.map((process) => (
-          <option key={`${process.pid}-${process.comm}`} value={process.comm} />
+        {processSuggestions.map((comm) => (
+          <option key={comm} value={comm} />
         ))}
       </datalist>
-      <DimensionHint visible={longRange} />
+      <DimensionHint visible={minuteOnlyUnavailable} />
     </div>
   );
 }

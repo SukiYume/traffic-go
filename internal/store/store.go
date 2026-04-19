@@ -20,11 +20,14 @@ const (
 	DataSourceMinute = "usage_1m"
 	DataSourceHour   = "usage_1h"
 
-	dataSourceMinuteForward = "usage_1m_forward"
-	dataSourceHourForward   = "usage_1h_forward"
+	DataSourceMinuteForward = "usage_1m_forward"
+	DataSourceHourForward   = "usage_1h_forward"
+	DataSourceMinuteChain   = "usage_chain_1m"
+	DataSourceHourChain     = "usage_chain_1h"
 )
 
 var ErrDimensionUnavailable = errors.New("dimension_unavailable")
+var ErrCursorSortUnsupported = errors.New("cursor pagination only supports time-desc sort")
 
 type Store struct {
 	db        *sql.DB
@@ -65,7 +68,80 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	if err := s.ensureLogEvidenceColumns(ctx); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) ensureLogEvidenceColumns(ctx context.Context) error {
+	type columnSpec struct {
+		name string
+		sql  string
+	}
+
+	columns := []columnSpec{
+		{name: "host_normalized", sql: `ALTER TABLE log_evidence ADD COLUMN host_normalized TEXT NOT NULL DEFAULT ''`},
+		{name: "entry_port", sql: `ALTER TABLE log_evidence ADD COLUMN entry_port INTEGER NOT NULL DEFAULT 0`},
+		{name: "target_port", sql: `ALTER TABLE log_evidence ADD COLUMN target_port INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, column := range columns {
+		exists, err := s.tableHasColumn(ctx, "log_evidence", column.name)
+		if err != nil {
+			return fmt.Errorf("inspect log_evidence.%s: %w", column.name, err)
+		}
+		if exists {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, column.sql); err != nil {
+			return fmt.Errorf("add log_evidence.%s: %w", column.name, err)
+		}
+	}
+
+	statements := []string{
+		`UPDATE log_evidence SET host_normalized = lower(trim(host)) WHERE host_normalized = '' AND host <> ''`,
+		`UPDATE log_evidence SET entry_port = 0 WHERE entry_port IS NULL`,
+		`UPDATE log_evidence SET target_port = CAST(path AS INTEGER) WHERE target_port = 0 AND path GLOB '[0-9]*'`,
+		`CREATE INDEX IF NOT EXISTS idx_log_evidence_client_lookup ON log_evidence (source, event_ts, client_ip)`,
+		`CREATE INDEX IF NOT EXISTS idx_log_evidence_target_lookup ON log_evidence (source, event_ts, target_ip)`,
+		`CREATE INDEX IF NOT EXISTS idx_log_evidence_entry_port ON log_evidence (source, event_ts, entry_port)`,
+		`CREATE INDEX IF NOT EXISTS idx_log_evidence_host_port ON log_evidence (source, event_ts, host_normalized, target_port)`,
+	}
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate log_evidence: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) tableHasColumn(ctx context.Context, table string, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			kind       string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultVal, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *Store) FlushMinute(
@@ -200,6 +276,68 @@ ON CONFLICT(hour_ts, proto, direction, comm, local_port, remote_ip) DO UPDATE SE
 	}
 
 	if _, err := tx.ExecContext(ctx, `
+WITH aggregated AS (
+    SELECT pid, comm, exe, source_ip, entry_port, target_ip, target_host, target_host_normalized, target_port,
+           SUM(bytes_total) AS bytes_total,
+           SUM(flow_count) AS flow_count,
+           SUM(evidence_count) AS evidence_count,
+           MAX(confidence_rank) AS confidence_rank
+    FROM usage_chain_1m
+    WHERE minute_ts >= ? AND minute_ts < ?
+    GROUP BY pid, comm, exe, source_ip, entry_port, target_ip, target_host, target_host_normalized, target_port
+),
+latest_samples AS (
+    SELECT pid, comm, exe, source_ip, entry_port, target_ip, target_host, target_host_normalized, target_port,
+           evidence_source, sample_fingerprint, sample_message, sample_time,
+           ROW_NUMBER() OVER (
+               PARTITION BY pid, comm, exe, source_ip, entry_port, target_ip, target_host, target_host_normalized, target_port
+               ORDER BY sample_time DESC, rowid DESC
+           ) AS rn
+    FROM usage_chain_1m
+    WHERE minute_ts >= ? AND minute_ts < ?
+)
+INSERT INTO usage_chain_1h (
+    hour_ts, chain_id, pid, comm, exe, source_ip, entry_port, target_ip, target_host, target_host_normalized,
+    target_port, bytes_total, flow_count, evidence_count, evidence_source, confidence, confidence_rank,
+    sample_fingerprint, sample_message, sample_time
+)
+SELECT ?, 
+       (? || '|' || ? || '|' || aggregated.pid || '|' || aggregated.comm || '|' || aggregated.exe || '|' || aggregated.source_ip || '|' || aggregated.entry_port || '|' || aggregated.target_ip || '|' || aggregated.target_host_normalized || '|' || aggregated.target_port),
+       aggregated.pid, aggregated.comm, aggregated.exe, aggregated.source_ip, aggregated.entry_port, aggregated.target_ip, aggregated.target_host, aggregated.target_host_normalized,
+       aggregated.target_port, aggregated.bytes_total, aggregated.flow_count, aggregated.evidence_count,
+       COALESCE(latest_samples.evidence_source, ''),
+       CASE aggregated.confidence_rank WHEN 3 THEN 'high' WHEN 2 THEN 'medium' ELSE 'low' END,
+       aggregated.confidence_rank,
+       COALESCE(latest_samples.sample_fingerprint, ''),
+       COALESCE(latest_samples.sample_message, ''),
+       COALESCE(latest_samples.sample_time, 0)
+FROM aggregated
+LEFT JOIN latest_samples
+    ON latest_samples.rn = 1
+   AND latest_samples.pid = aggregated.pid
+   AND latest_samples.comm = aggregated.comm
+   AND latest_samples.exe = aggregated.exe
+   AND latest_samples.source_ip = aggregated.source_ip
+   AND latest_samples.entry_port = aggregated.entry_port
+   AND latest_samples.target_ip = aggregated.target_ip
+   AND latest_samples.target_host = aggregated.target_host
+   AND latest_samples.target_host_normalized = aggregated.target_host_normalized
+   AND latest_samples.target_port = aggregated.target_port
+ON CONFLICT(chain_id) DO UPDATE SET
+    bytes_total = excluded.bytes_total,
+    flow_count = excluded.flow_count,
+    evidence_count = excluded.evidence_count,
+    evidence_source = excluded.evidence_source,
+    confidence = excluded.confidence,
+    confidence_rank = excluded.confidence_rank,
+    sample_fingerprint = excluded.sample_fingerprint,
+    sample_message = excluded.sample_message,
+    sample_time = excluded.sample_time
+`, hourTS, nextHourTS, hourTS, nextHourTS, hourTS, DataSourceHourChain, hourTS); err != nil {
+		return fmt.Errorf("aggregate usage_chain_1h: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO usage_1h_forward (
     hour_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport,
     bytes_orig, bytes_reply, pkts_orig, pkts_reply, flow_count
@@ -240,6 +378,8 @@ func (s *Store) Cleanup(ctx context.Context) error {
 		{`DELETE FROM usage_1h WHERE hour_ts < ?`, hourCutoff},
 		{`DELETE FROM usage_1m_forward WHERE minute_ts < ?`, minuteCutoff},
 		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, hourCutoff},
+		{`DELETE FROM usage_chain_1m WHERE minute_ts < ?`, minuteCutoff},
+		{`DELETE FROM usage_chain_1h WHERE hour_ts < ?`, hourCutoff},
 		{`DELETE FROM log_evidence WHERE created_at < ?`, minuteCutoff},
 	}
 
@@ -333,11 +473,70 @@ func (s *Store) ResolveUsageSource(start, end time.Time, pidFilter bool, exeFilt
 		return "", fmt.Errorf("end before start")
 	}
 	minuteWindow := time.Duration(s.retention.MinuteDays) * 24 * time.Hour
-	if end.Sub(start) > minuteWindow {
+	minuteCutoff := s.now().UTC().Add(-minuteWindow)
+	if start.UTC().Before(minuteCutoff) || end.Sub(start) > minuteWindow {
 		if pidFilter || exeFilter {
 			return "", ErrDimensionUnavailable
 		}
 		return DataSourceHour, nil
 	}
 	return DataSourceMinute, nil
+}
+
+func ForwardDataSource(source string) string {
+	switch source {
+	case DataSourceHour:
+		return DataSourceHourForward
+	default:
+		return DataSourceMinuteForward
+	}
+}
+
+func (s *Store) QueryKnownProcesses(ctx context.Context, limit int) ([]model.ProcessListItem, error) {
+	resolvedLimit := clampPageSize(limit)
+	rows, err := s.db.QueryContext(ctx, `
+WITH minute_processes AS (
+    SELECT pid, comm, exe, MAX(minute_ts) AS seen_ts
+    FROM usage_1m
+    WHERE pid > 0 OR comm <> '' OR exe <> ''
+    GROUP BY pid, comm, exe
+),
+hour_processes AS (
+    SELECT 0 AS pid, comm, '' AS exe, MAX(hour_ts) AS seen_ts
+    FROM usage_1h
+    WHERE comm <> ''
+    GROUP BY comm
+),
+combined AS (
+    SELECT pid, comm, exe, seen_ts FROM minute_processes
+    UNION ALL
+    SELECT pid, comm, exe, seen_ts FROM hour_processes
+),
+deduped AS (
+    SELECT pid, comm, exe, MAX(seen_ts) AS seen_ts
+    FROM combined
+    GROUP BY pid, comm, exe
+)
+SELECT pid, comm, exe
+FROM deduped
+ORDER BY seen_ts DESC, comm COLLATE NOCASE ASC, pid DESC
+LIMIT ?
+`, resolvedLimit)
+	if err != nil {
+		return nil, fmt.Errorf("query known processes: %w", err)
+	}
+	defer rows.Close()
+
+	processes := make([]model.ProcessListItem, 0, resolvedLimit)
+	for rows.Next() {
+		var item model.ProcessListItem
+		if err := rows.Scan(&item.PID, &item.Comm, &item.Exe); err != nil {
+			return nil, fmt.Errorf("scan known processes: %w", err)
+		}
+		processes = append(processes, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate known processes: %w", err)
+	}
+	return processes, nil
 }

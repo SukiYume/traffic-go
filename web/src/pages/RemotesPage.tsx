@@ -5,21 +5,29 @@ import { useSearchParams, useNavigate } from 'react-router-dom';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { DataTable } from '../components/DataTable';
 import { EmptyState } from '../components/EmptyState';
+import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
-import type { RangeKey, RemoteSummaryRow } from '../types';
-import { directionLabel, formatBytes, peerRoleLabel, rangeLabel, safeText } from '../utils';
+import { normalizeRangeKey } from '../ranges';
+import type { RangeKey, RemoteSortKey, RemoteSummaryRow } from '../types';
+import { directionLabel, formatBytes, rangeLabel, safeText } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
 const pageSize = 25;
 const columnHelper = createColumnHelper<RemoteSummaryRow>();
 
+function toRemoteSortKey(value: string | undefined): RemoteSortKey {
+  const candidates: RemoteSortKey[] = ['remoteIp', 'direction', 'bytesUp', 'bytesDown', 'bytesTotal', 'flowCount'];
+  return candidates.includes(value as RemoteSortKey) ? (value as RemoteSortKey) : 'bytesTotal';
+}
+
 export function RemotesPage() {
   const api = useApiClient();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  const range = (params.get('range') as RangeKey | null) ?? defaultRange;
+  const range = normalizeRangeKey(params.get('range'), defaultRange);
   const direction = (params.get('direction') as 'in' | 'out' | null) ?? '';
+  const includeLoopback = params.get('include_loopback') === '1';
   const [page, setPage] = useState(1);
   const [sorting, setSorting] = useState<SortingState>([{ id: 'bytesTotal', desc: true }]);
 
@@ -39,19 +47,30 @@ export function RemotesPage() {
     setParams(nextParams, { replace: true });
   };
 
+  const setIncludeLoopback = (next: boolean) => {
+    const nextParams = new URLSearchParams(params);
+    if (next) {
+      nextParams.set('include_loopback', '1');
+    } else {
+      nextParams.delete('include_loopback');
+    }
+    setParams(nextParams, { replace: true });
+  };
+
   useEffect(() => {
     setPage(1);
-  }, [range, direction, sorting]);
+  }, [range, direction, includeLoopback, sorting]);
 
   const currentSort = sorting[0];
   const query = useQuery({
-    queryKey: ['top-remotes', range, direction, page, currentSort?.id, currentSort?.desc],
+    queryKey: ['top-remotes', range, direction, includeLoopback, page, currentSort?.id, currentSort?.desc],
     queryFn: () =>
       api.getTopRemotes(range, {
         page,
         pageSize,
         direction: direction || undefined,
-        sortBy: (currentSort?.id as any) ?? 'bytesTotal',
+        includeLoopback,
+        sortBy: toRemoteSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
       }),
   });
@@ -63,13 +82,6 @@ export function RemotesPage() {
         header: '方向',
         meta: { className: 'col-direction', align: 'center', nowrap: true },
         cell: (info) => directionLabel(info.getValue()),
-      }),
-      columnHelper.display({
-        id: 'peerRole',
-        header: '对端角色',
-        enableSorting: false,
-        meta: { className: 'col-peer-role' },
-        cell: (info) => peerRoleLabel(info.row.original.direction),
       }),
       columnHelper.accessor('remoteIp', {
         id: 'remoteIp',
@@ -111,7 +123,7 @@ export function RemotesPage() {
           <p className="eyebrow">Remotes</p>
           <h2>对端 IP 聚合</h2>
           <p>
-            按对端 IP 聚合展示流量总量，适合先识别高频来源或高流量目标。这里是 IP 级排行，不直接展示进程与端口细节；
+            按对端 IP 聚合展示流量总量，适合先识别“哪个方向上的哪个 IP 跑掉了流量”。这里是 IP 级排行，不直接展示进程与端口细节；
             点击任意行会跳转到「流量明细」并自动带入筛选条件，继续查看逐条连接和进程归因。
           </p>
           <section className="status-row">
@@ -135,9 +147,14 @@ export function RemotesPage() {
         <button type="button" className={direction === 'out' ? 'chip active' : 'chip'} onClick={() => setDirection('out')}>
           出站目标
         </button>
+        <button type="button" className={includeLoopback ? 'chip active' : 'chip'} onClick={() => setIncludeLoopback(!includeLoopback)}>
+          {includeLoopback ? '隐藏本机回环' : '显示本机回环'}
+        </button>
       </section>
 
-      {query.data?.rows.length ? (
+      {query.isError && !query.data?.rows.length ? (
+        <QueryErrorState error={query.error} title="对端聚合加载失败" />
+      ) : query.data?.rows.length ? (
         <DataTable
           columns={columns}
           data={query.data.rows}

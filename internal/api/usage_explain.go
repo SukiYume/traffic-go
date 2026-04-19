@@ -1,17 +1,11 @@
 package api
 
 import (
-	"bufio"
-	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
-	"hash/fnv"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -19,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"traffic-go/internal/evidence"
 	"traffic-go/internal/model"
 	"traffic-go/internal/store"
 )
@@ -27,9 +22,10 @@ const (
 	usageExplainWindowPadding = int64(60)
 	logWindowStrict           = int64(120)
 	logWindowFallback         = int64(900)
+	explainLogScanBudget      = 1500 * time.Millisecond
 	maxRelatedPeers           = 8
-	maxNginxRequests          = 8
-	maxEvidenceRows           = 24
+	maxNginxRequests          = 0
+	maxEvidenceRows           = 128
 	maxScanFilesStrict        = 4
 	maxScanFilesFallback      = 8
 	maxScanLinesPerFile       = 240000
@@ -47,13 +43,14 @@ var (
 	ssTargetPattern    = regexp.MustCompile(`(?i)(?:target|dst|destination|to)\s*[=:]\s*([^\s,;]+)`)
 	ssConnectPattern   = regexp.MustCompile(`(?i)\bconnect to\s+([^\s,;]+)`)
 	ssUDPCachePattern  = regexp.MustCompile(`(?i)\[udp\]\s+cache miss:\s*([^\s,;]+)\s*<->\s*([^\s,;]+)`)
+	bracketPortPattern = regexp.MustCompile(`\[(\d{1,5})\]`)
 	rfc3339Pattern     = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})`)
 	syslogTimePattern  = regexp.MustCompile(`^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}`)
-	fileDatePattern    = regexp.MustCompile(`(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)`)
 )
 
 type usageExplainQuery struct {
 	TimeBucket int64
+	DataSource string
 	Proto      string
 	Direction  model.Direction
 	PID        *int
@@ -69,9 +66,33 @@ type usageExplainResponse struct {
 	Confidence    string                     `json:"confidence"`
 	SourceIPs     []string                   `json:"source_ips"`
 	TargetIPs     []string                   `json:"target_ips"`
+	Chains        []usageExplainChain        `json:"chains"`
 	RelatedPeers  []usageExplainPeer         `json:"related_peers"`
 	NginxRequests []usageExplainNginxRequest `json:"nginx_requests"`
 	Notes         []string                   `json:"notes"`
+}
+
+type usageExplainOptions struct {
+	allowFileScan bool
+}
+
+type usageExplainChain struct {
+	ChainID              string `json:"chain_id,omitempty"`
+	SourceIP             string `json:"source_ip,omitempty"`
+	TargetIP             string `json:"target_ip,omitempty"`
+	TargetHost           string `json:"target_host,omitempty"`
+	TargetHostNormalized string `json:"target_host_normalized,omitempty"`
+	TargetPort           *int   `json:"target_port,omitempty"`
+	LocalPort            *int   `json:"local_port,omitempty"`
+	BytesTotal           int64  `json:"bytes_total"`
+	FlowCount            int64  `json:"flow_count"`
+	EvidenceCount        int    `json:"evidence_count"`
+	Evidence             string `json:"evidence"`
+	EvidenceSource       string `json:"evidence_source,omitempty"`
+	SampleFingerprint    string `json:"sample_fingerprint,omitempty"`
+	SampleMessage        string `json:"sample_message,omitempty"`
+	SampleTime           int64  `json:"sample_time,omitempty"`
+	Confidence           string `json:"confidence"`
 }
 
 type usageExplainPeer struct {
@@ -84,15 +105,18 @@ type usageExplainPeer struct {
 }
 
 type usageExplainNginxRequest struct {
-	Time      int64  `json:"time"`
-	Method    string `json:"method"`
-	Host      string `json:"host,omitempty"`
-	Path      string `json:"path"`
-	Status    int    `json:"status"`
-	Count     int    `json:"count"`
-	Referer   string `json:"referer,omitempty"`
-	UserAgent string `json:"user_agent,omitempty"`
-	Bot       string `json:"bot,omitempty"`
+	Time              int64  `json:"time"`
+	Method            string `json:"method"`
+	Host              string `json:"host,omitempty"`
+	HostNormalized    string `json:"host_normalized,omitempty"`
+	Path              string `json:"path"`
+	Status            int    `json:"status"`
+	Count             int    `json:"count"`
+	ClientIP          string `json:"client_ip,omitempty"`
+	Referer           string `json:"referer,omitempty"`
+	UserAgent         string `json:"user_agent,omitempty"`
+	Bot               string `json:"bot,omitempty"`
+	SampleFingerprint string `json:"sample_fingerprint,omitempty"`
 }
 
 type ipWeight struct {
@@ -109,21 +133,36 @@ type peerAgg struct {
 	FlowCount  int64
 }
 
-type logFileCandidate struct {
-	Name    string
-	Path    string
-	ModTime time.Time
+type chainAgg struct {
+	ChainID              string
+	SourceIP             string
+	TargetIP             string
+	TargetHost           string
+	TargetHostNormalized string
+	TargetPort           int
+	LocalPort            int
+	BytesTotal           int64
+	FlowCount            int64
+	EvidenceCount        int
+	Evidence             string
+	EvidenceSource       string
+	SampleFingerprint    string
+	SampleMessage        string
+	SampleTime           int64
+	Confidence           string
 }
 
-type evidenceMatcher func(model.LogEvidence) bool
-
-type evidenceParser func(source string, line string, reference time.Time) (model.LogEvidence, bool)
-
-type evidenceQueryHints struct {
-	ClientIP string
-	TargetIP string
-	AnyIP    string
+type entrySourceCandidate struct {
+	RemoteIP   string
+	BytesTotal int64
+	FlowCount  int64
 }
+
+type evidenceMatcher = evidence.Matcher
+
+type evidenceParser = evidence.Parser
+
+type evidenceQueryHints = evidence.QueryHints
 
 func (s *Server) handleUsageExplain(w http.ResponseWriter, r *http.Request) {
 	query, err := parseUsageExplainQuery(r)
@@ -132,7 +171,8 @@ func (s *Server) handleUsageExplain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.analyzeUsageExplain(r.Context(), query)
+	allowFileScan := r.URL.Query().Has("scan") && parseBoolFlag(r.URL.Query().Get("scan"))
+	data, err := s.analyzeUsageExplain(r.Context(), query, allowFileScan)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
@@ -144,6 +184,7 @@ func (s *Server) handleUsageExplain(w http.ResponseWriter, r *http.Request) {
 func parseUsageExplainQuery(r *http.Request) (usageExplainQuery, error) {
 	query := usageExplainQuery{
 		TimeBucket: parseInt64WithDefault(r.URL.Query().Get("ts"), 0),
+		DataSource: strings.TrimSpace(r.URL.Query().Get("data_source")),
 		Proto:      strings.ToLower(strings.TrimSpace(r.URL.Query().Get("proto"))),
 		Direction:  model.Direction(strings.TrimSpace(r.URL.Query().Get("direction"))),
 		Comm:       strings.TrimSpace(r.URL.Query().Get("comm")),
@@ -197,21 +238,36 @@ func parseInt64WithDefault(value string, fallback int64) int64 {
 	return parsed
 }
 
-func (s *Server) analyzeUsageExplain(ctx context.Context, query usageExplainQuery) (usageExplainResponse, error) {
-	bucketTS := time.Unix(query.TimeBucket, 0).UTC().Truncate(time.Minute).Unix()
+func (s *Server) analyzeUsageExplain(ctx context.Context, query usageExplainQuery, allowFileScan bool) (usageExplainResponse, error) {
+	return s.analyzeUsageExplainWithOptions(ctx, query, usageExplainOptions{allowFileScan: allowFileScan})
+}
 
-	related, err := s.collectRelatedUsage(ctx, query, bucketTS)
-	if err != nil {
-		return usageExplainResponse{}, err
-	}
+func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usageExplainQuery, options usageExplainOptions) (usageExplainResponse, error) {
+	bucketTS := time.Unix(query.TimeBucket, 0).UTC().Truncate(time.Minute).Unix()
 
 	response := usageExplainResponse{
 		Process:       processLabel(query.Comm, query.Exe),
 		SourceIPs:     make([]string, 0),
 		TargetIPs:     make([]string, 0),
+		Chains:        make([]usageExplainChain, 0),
 		RelatedPeers:  make([]usageExplainPeer, 0),
 		NginxRequests: make([]usageExplainNginxRequest, 0),
 		Notes:         make([]string, 0),
+	}
+	allowFileScan := options.allowFileScan
+	if query.DataSource == store.DataSourceHour {
+		allowFileScan = false
+		appendNoteUnique(&response.Notes, "当前展示的是小时聚合数据，仅回放已持久化链路和已缓存日志线索。")
+	}
+	allowCachedEvidence := allowFileScan || strings.TrimSpace(query.DataSource) != ""
+
+	related := make([]model.UsageRecord, 0)
+	if query.DataSource != store.DataSourceHour {
+		var err error
+		related, err = s.collectRelatedUsage(ctx, query, bucketTS)
+		if err != nil {
+			return usageExplainResponse{}, err
+		}
 	}
 
 	sourceIPWeights := make(map[string]int64)
@@ -252,23 +308,99 @@ func (s *Server) analyzeUsageExplain(ctx context.Context, query usageExplainQuer
 	response.RelatedPeers = summarizePeers(peerMap, maxRelatedPeers)
 
 	if isShadowsocksProcess(query.Comm, query.Exe) {
-		s.addCurrentTupleNote(&response, query)
-		if err := s.enrichShadowsocksFromLogs(ctx, &response, query, bucketTS); err != nil {
-			appendNoteUnique(&response.Notes, fmt.Sprintf("SS 日志检索失败：%v", err))
+		processName := processIdentityKey(query.Comm, query.Exe)
+		if processName == "" {
+			processName = "ss-server"
+		}
+		lookupName, logDir, ok := s.lookupConfiguredProcessLogDir(query.Comm, query.Exe)
+		if ok {
+			if lookupName != "" {
+				processName = lookupName
+			}
+			logDirs := s.lookupConfiguredProcessLogDirs(query.Comm, query.Exe)
+			if len(logDirs) == 0 && strings.TrimSpace(logDir) != "" {
+				logDirs = []string{logDir}
+			}
+			if allowCachedEvidence {
+				s.addCurrentTupleNote(&response, query)
+				if err := s.enrichShadowsocksFromLogs(ctx, &response, query, bucketTS, logDirs, related, allowFileScan); err != nil {
+					appendNoteUnique(&response.Notes, fmt.Sprintf("SS 日志检索失败：%v", err))
+				}
+			} else {
+				appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
+			}
+		} else {
+			appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志路径，已跳过日志检索。", processName))
 		}
 		appendNoteUnique(&response.Notes, "Shadowsocks 使用加密与复用，日志关联是候选推断，不保证来源与目标一一对应。")
-	}
-
-	if isNginxProcess(query.Comm, query.Exe) {
-		s.addCurrentTupleNote(&response, query)
-		if err := s.enrichNginxFromLogs(ctx, &response, query.RemoteIP, bucketTS); err != nil {
-			appendNoteUnique(&response.Notes, fmt.Sprintf("Nginx 日志检索失败：%v", err))
+	} else if isNginxProcess(query.Comm, query.Exe) {
+		processName := processIdentityKey(query.Comm, query.Exe)
+		if processName == "" {
+			processName = "nginx"
+		}
+		lookupName, logDir, ok := s.lookupConfiguredProcessLogDir(query.Comm, query.Exe)
+		if ok {
+			if lookupName != "" {
+				processName = lookupName
+			}
+			if allowCachedEvidence {
+				s.addCurrentTupleNote(&response, query)
+				if err := s.enrichNginxFromLogs(ctx, &response, query.RemoteIP, bucketTS, logDir, allowFileScan); err != nil {
+					appendNoteUnique(&response.Notes, fmt.Sprintf("Nginx 日志检索失败：%v", err))
+				}
+			} else {
+				appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
+			}
+		} else {
+			appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志路径，已跳过日志检索。", processName))
 		}
 		appendNoteUnique(&response.Notes, "HTTP/HTTPS 网页路径优先来自 access.log 关联；仅靠 conntrack 无法直接提取 URI。")
+	} else {
+		processName := processIdentityKey(query.Comm, query.Exe)
+		if processName != "" {
+			lookupName, logDir, ok := s.lookupConfiguredProcessLogDir(query.Comm, query.Exe)
+			if ok {
+				if lookupName != "" {
+					processName = lookupName
+				}
+				if allowCachedEvidence {
+					s.addCurrentTupleNote(&response, query)
+					if err := s.enrichGenericProcessFromLogs(ctx, &response, query, bucketTS, related, processName, logDir, allowFileScan); err != nil {
+						appendNoteUnique(&response.Notes, fmt.Sprintf("%s 日志检索失败：%v", processName, err))
+					}
+				} else {
+					appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
+				}
+			} else {
+				appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志路径，已跳过日志检索。", processName))
+			}
+		}
+	}
+
+	response.Chains = assignCanonicalChainIDs(bucketTS, query, response.Chains)
+	storedChains, err := s.loadPersistedChains(ctx, bucketTS, query)
+	if err != nil {
+		return usageExplainResponse{}, fmt.Errorf("load persisted chains: %w", err)
+	}
+	if len(storedChains) > 0 {
+		hadChains := len(response.Chains)
+		response.Chains = mergeExplainChains(response.Chains, storedChains, 0)
+		response.SourceIPs = mergeTopIPs(response.SourceIPs, chainIPs(storedChains, true), 6)
+		response.TargetIPs = mergeTopIPs(response.TargetIPs, chainIPs(storedChains, false), 6)
+		if hadChains == 0 && len(response.Chains) > 0 {
+			appendNoteUnique(&response.Notes, fmt.Sprintf("已回放 %d 条已记录链路。", len(storedChains)))
+		}
 	}
 
 	if len(response.SourceIPs) == 0 && len(response.TargetIPs) == 0 {
 		appendNoteUnique(&response.Notes, "没有找到足够的同进程关联流量，建议放宽筛选条件或扩大时间范围后重试。")
+	}
+
+	response.Chains = assignCanonicalChainIDs(bucketTS, query, response.Chains)
+	response.SourceIPs = mergeTopIPs(response.SourceIPs, chainIPs(response.Chains, true), 6)
+	response.TargetIPs = mergeTopIPs(response.TargetIPs, chainIPs(response.Chains, false), 6)
+	if err := s.persistCanonicalChains(ctx, bucketTS, query, response.Chains); err != nil {
+		return usageExplainResponse{}, fmt.Errorf("persist canonical chains: %w", err)
 	}
 
 	response.Confidence = inferConfidence(response)
@@ -276,44 +408,94 @@ func (s *Server) analyzeUsageExplain(ctx context.Context, query usageExplainQuer
 }
 
 func (s *Server) collectRelatedUsage(ctx context.Context, query usageExplainQuery, bucketTS int64) ([]model.UsageRecord, error) {
-	usageQuery := model.UsageQuery{
+	baseQuery := model.UsageQuery{
 		Start:     time.Unix(bucketTS-usageExplainWindowPadding, 0).UTC(),
 		End:       time.Unix(bucketTS+usageExplainWindowPadding+60, 0).UTC(),
 		Proto:     query.Proto,
 		UsePage:   true,
 		Page:      1,
-		PageSize:  200,
+		PageSize:  120,
 		SortBy:    "bytes_total",
 		SortOrder: "desc",
 	}
 
 	hasIdentity := false
 	if query.PID != nil && *query.PID > 0 {
-		usageQuery.PID = query.PID
+		baseQuery.PID = query.PID
 		hasIdentity = true
 	}
 	if query.Comm != "" {
-		usageQuery.Comm = query.Comm
+		baseQuery.Comm = query.Comm
 		hasIdentity = true
 	}
 	if query.Exe != "" {
-		usageQuery.Exe = query.Exe
+		baseQuery.Exe = query.Exe
 		hasIdentity = true
 	}
 	if !hasIdentity {
-		usageQuery.RemoteIP = query.RemoteIP
-		usageQuery.Direction = query.Direction
-		usageQuery.LocalPort = query.LocalPort
+		currentQuery := baseQuery
+		currentQuery.RemoteIP = query.RemoteIP
+		currentQuery.Direction = query.Direction
+		currentQuery.LocalPort = query.LocalPort
+		currentQuery.PageSize = 200
+
+		currentRecords, _, _, err := s.store.QueryUsage(ctx, currentQuery, store.DataSourceMinute)
+		if err != nil {
+			return nil, fmt.Errorf("query related usage: %w", err)
+		}
+
+		oppositeQuery := baseQuery
+		oppositeQuery.Direction = oppositeDirection(query.Direction)
+		oppositeQuery.PageSize = 200
+
+		counterpartRows, _, _, err := s.store.QueryUsage(ctx, oppositeQuery, store.DataSourceMinute)
+		if err != nil {
+			return nil, fmt.Errorf("query counterpart usage without identity: %w", err)
+		}
+
+		anchorBytes := int64(0)
+		for _, row := range currentRecords {
+			anchorBytes += usageBytesTotal(row)
+		}
+
+		result := make([]model.UsageRecord, 0, len(currentRecords)+6)
+		result = append(result, currentRecords...)
+		result = append(result, selectCounterpartUsage(query, bucketTS, anchorBytes, counterpartRows, 6)...)
+		return dedupeUsageRecords(result), nil
 	}
 
-	records, _, _, err := s.store.QueryUsage(ctx, usageQuery, store.DataSourceMinute)
+	currentQuery := baseQuery
+	currentQuery.Direction = query.Direction
+	currentQuery.RemoteIP = query.RemoteIP
+	currentQuery.LocalPort = query.LocalPort
+	currentQuery.PageSize = 200
+
+	currentRecords, _, _, err := s.store.QueryUsage(ctx, currentQuery, store.DataSourceMinute)
 	if err != nil {
-		return nil, fmt.Errorf("query related usage: %w", err)
+		return nil, fmt.Errorf("query anchored usage: %w", err)
 	}
-	return records, nil
+
+	oppositeQuery := baseQuery
+	oppositeQuery.Direction = oppositeDirection(query.Direction)
+	oppositeQuery.PageSize = 200
+
+	counterpartRows, _, _, err := s.store.QueryUsage(ctx, oppositeQuery, store.DataSourceMinute)
+	if err != nil {
+		return nil, fmt.Errorf("query counterpart usage: %w", err)
+	}
+
+	anchorBytes := int64(0)
+	for _, row := range currentRecords {
+		anchorBytes += usageBytesTotal(row)
+	}
+
+	result := make([]model.UsageRecord, 0, len(currentRecords)+6)
+	result = append(result, currentRecords...)
+	result = append(result, selectCounterpartUsage(query, bucketTS, anchorBytes, counterpartRows, 6)...)
+	return dedupeUsageRecords(result), nil
 }
 
-func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplainResponse, clientIP string, bucketTS int64) error {
+func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplainResponse, clientIP string, bucketTS int64, logDir string, allowFileScan bool) error {
 	if strings.TrimSpace(clientIP) == "" {
 		return nil
 	}
@@ -323,9 +505,10 @@ func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplain
 	rows, note, err := s.lookupOrScanEvidence(
 		ctx,
 		evidenceSourceNginx,
-		s.nginxLogDir,
+		logDir,
 		bucketTS,
 		maxEvidenceRows,
+		allowFileScan,
 		exactMatcher,
 		evidenceQueryHints{ClientIP: clientIP},
 		isNginxLogFileName,
@@ -339,9 +522,10 @@ func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplain
 		loopbackRows, loopbackNote, loopbackErr := s.lookupOrScanEvidence(
 			ctx,
 			evidenceSourceNginx,
-			s.nginxLogDir,
+			logDir,
 			bucketTS,
 			maxEvidenceRows,
+			allowFileScan,
 			func(ev model.LogEvidence) bool {
 				return isLoopbackIP(ev.ClientIP)
 			},
@@ -362,7 +546,11 @@ func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplain
 		appendNoteUnique(&response.Notes, note)
 	}
 	if len(rows) == 0 {
-		appendNoteUnique(&response.Notes, fmt.Sprintf("目录 %s 的日志中未匹配到该来源 IP。", resolvedLogDir(s.nginxLogDir, "/var/log/nginx")))
+		if !allowFileScan {
+			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", resolvedLogDir(logDir, "")))
+			return nil
+		}
+		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志中未匹配到该来源 IP。", resolvedLogDir(logDir, "")))
 		return nil
 	}
 
@@ -381,7 +569,7 @@ func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplain
 	return nil
 }
 
-func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageExplainResponse, query usageExplainQuery, bucketTS int64) error {
+func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageExplainResponse, query usageExplainQuery, bucketTS int64, logDirs []string, related []model.UsageRecord, allowFileScan bool) error {
 	remoteIP := strings.TrimSpace(query.RemoteIP)
 	remotePort := 0
 	if query.RemotePort != nil {
@@ -404,7 +592,7 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 		if query.Direction == model.DirectionOut && remotePort > 0 && ev.Host != "" {
 			if port, ok := parseEvidencePort(ev.Path); ok && port == remotePort {
 				// Keep fallback conservative to reduce false matches on common ports like 443.
-				if absInt64(ev.EventTS-bucketTS) > logWindowStrict {
+				if evidence.AbsInt64(ev.EventTS-bucketTS) > logWindowStrict {
 					return false
 				}
 				if remoteIP != "" && ev.TargetIP != "" && !sameIP(ev.TargetIP, remoteIP) {
@@ -419,69 +607,31 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 		return false
 	}
 
-	rows := make([]model.LogEvidence, 0)
-	note := ""
-	usedLogDir := ""
-	for _, logDir := range ssLogDirCandidates(s.ssLogDir) {
-		hits, hitNote, err := s.lookupOrScanEvidence(
-			ctx,
-			evidenceSourceSS,
-			logDir,
-			bucketTS,
-			maxEvidenceRows,
-			matcher,
-			evidenceQueryHints{AnyIP: remoteIP},
-			isShadowsocksLogFileName,
-			parseSSEvidenceLine,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return err
-		}
-		if len(hits) == 0 {
-			fallbackRows, fallbackNote, fallbackErr := s.lookupOrScanEvidence(
-				ctx,
-				evidenceSourceSS,
-				logDir,
-				bucketTS,
-				maxEvidenceRows,
-				matcher,
-				evidenceQueryHints{AnyIP: remoteIP},
-				isGenericLogFileName,
-				parseSSEvidenceLine,
-			)
-			if fallbackErr != nil {
-				if errors.Is(fallbackErr, os.ErrNotExist) {
-					continue
-				}
-				return fallbackErr
-			}
-			if len(fallbackRows) > 0 {
-				hits = fallbackRows
-				if fallbackNote != "" {
-					hitNote = fallbackNote
-				}
-			}
-		}
-		if len(hits) == 0 {
-			continue
-		}
-		rows = hits
-		note = hitNote
-		usedLogDir = logDir
-		break
+	rows, notes, err := s.lookupOrScanEvidenceAcrossSourcesAndDirs(
+		ctx,
+		shadowsocksEvidenceSources(),
+		logDirs,
+		bucketTS,
+		maxEvidenceRows,
+		allowFileScan,
+		matcher,
+		evidenceQueryHints{AnyIP: remoteIP, TargetPort: remotePort},
+		isShadowsocksLogFileName,
+		parseSSEvidenceLine,
+	)
+	if err != nil {
+		return err
 	}
-	if note != "" {
+	for _, note := range notes {
 		appendNoteUnique(&response.Notes, note)
 	}
-	configuredDir := resolvedLogDir(s.ssLogDir, "/var/log")
-	if usedLogDir != "" && filepath.Clean(usedLogDir) != filepath.Clean(configuredDir) {
-		appendNoteUnique(&response.Notes, fmt.Sprintf("SS 日志目录自动回退到 %s。", usedLogDir))
-	}
+	configuredDir := formatResolvedLogDirs(logDirs)
 	if len(rows) == 0 {
-		appendNoteUnique(&response.Notes, fmt.Sprintf("目录 %s 中未命中 SS 相关日志。", configuredDir))
+		if !allowFileScan {
+			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", configuredDir))
+			return nil
+		}
+		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 中未命中 SS 相关日志。", configuredDir))
 		return nil
 	}
 
@@ -489,6 +639,8 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 	targetWeights := make(map[string]int64)
 	hostCounts := make(map[string]int)
 	sourceConfirmed := make(map[string]int)
+	chainMap := make(map[string]chainAgg)
+	entryPorts := make([]int, 0, len(rows))
 	directIPHits := 0
 	for _, row := range rows {
 		if row.ClientIP != "" {
@@ -513,10 +665,38 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 			}
 			hostCounts[host]++
 		}
+		if row.EntryPort > 0 {
+			entryPorts = append(entryPorts, row.EntryPort)
+		}
+		addExplainChain(chainMap, row, query, "ss-log")
 	}
+	sourceRows, sourceNotes, err := s.lookupShadowsocksSourceEvidenceByEntryPort(ctx, bucketTS, logDirs, entryPorts, allowFileScan)
+	if err != nil {
+		return err
+	}
+	for _, note := range sourceNotes {
+		appendNoteUnique(&response.Notes, note)
+	}
+	if len(sourceRows) > 0 {
+		for _, row := range sourceRows {
+			if row.ClientIP == "" || isLoopbackIP(row.ClientIP) {
+				continue
+			}
+			sourceWeights[row.ClientIP]++
+		}
+		hydrateChainsFromEntryPortCandidates(chainMap, buildEntryPortSourceCandidatesFromEvidence(sourceRows))
+		promoteConfirmedSourcesFromEvidence(sourceConfirmed, sourceRows)
+	}
+	entrySources, err := s.collectEntryPortSourceCandidates(ctx, bucketTS, query.Proto, entryPorts)
+	if err != nil {
+		return err
+	}
+	hydrateChainsFromEntryPortCandidates(chainMap, entrySources)
+	mergeChainUsageMetrics(chainMap, query, related)
 
 	response.SourceIPs = mergeTopIPs(response.SourceIPs, topIPsByCount(sourceWeights, 4), 6)
 	response.TargetIPs = mergeTopIPs(response.TargetIPs, topIPsByCount(targetWeights, 4), 6)
+	response.Chains = mergeExplainChains(response.Chains, summarizeChains(chainMap, 0), 0)
 	if len(hostCounts) > 0 {
 		appendNoteUnique(&response.Notes, fmt.Sprintf("SS 目标主机候选：%s", formatTopLabeledCounts(hostCounts, 5)))
 	}
@@ -529,6 +709,9 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 		appendNoteUnique(&response.Notes, "SS 日志未直接命中 remote_ip，已按远端端口筛选目标主机候选。")
 	}
 	appendNoteUnique(&response.Notes, fmt.Sprintf("SS 日志命中 %d 条。", len(rows)))
+	if len(sourceRows) > 0 {
+		appendNoteUnique(&response.Notes, fmt.Sprintf("SS/obfs 入口日志命中 %d 条来源候选。", len(sourceRows)))
+	}
 	for i := 0; i < len(rows) && i < 2; i++ {
 		if rows[i].Message != "" {
 			appendNoteUnique(&response.Notes, fmt.Sprintf("SS 样本：%s", rows[i].Message))
@@ -537,42 +720,110 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 	return nil
 }
 
-func ssLogDirCandidates(configured string) []string {
-	primary := resolvedLogDir(configured, "/var/log")
-	candidates := []string{
-		primary,
-		filepath.Join(primary, "shadowsocks"),
-		filepath.Join(primary, "ss"),
-		"/var/log/shadowsocks",
-		"/var/log/ss",
+func (s *Server) enrichGenericProcessFromLogs(
+	ctx context.Context,
+	response *usageExplainResponse,
+	query usageExplainQuery,
+	bucketTS int64,
+	related []model.UsageRecord,
+	processName string,
+	logDir string,
+	allowFileScan bool,
+) error {
+	remoteIP := strings.TrimSpace(query.RemoteIP)
+	remotePort := 0
+	if query.RemotePort != nil {
+		remotePort = *query.RemotePort
 	}
-	result := make([]string, 0, len(candidates))
-	seen := make(map[string]struct{})
-	for _, candidate := range candidates {
-		trimmed := strings.TrimSpace(candidate)
-		if trimmed == "" {
-			continue
-		}
-		cleaned := filepath.Clean(trimmed)
-		if _, ok := seen[cleaned]; ok {
-			continue
-		}
-		seen[cleaned] = struct{}{}
-		result = append(result, cleaned)
+	if remoteIP == "" && remotePort <= 0 {
+		return nil
 	}
-	return result
+
+	matcher := func(ev model.LogEvidence) bool {
+		if remoteIP != "" {
+			if sameIP(ev.ClientIP, remoteIP) || sameIP(ev.TargetIP, remoteIP) {
+				return true
+			}
+			if messageHasExactIP(ev.Message, remoteIP) {
+				return true
+			}
+		}
+		if remotePort > 0 {
+			if ev.TargetPort == remotePort {
+				return true
+			}
+			if port, ok := parseEvidencePort(ev.Path); ok && port == remotePort {
+				return true
+			}
+		}
+		return false
+	}
+
+	source := customEvidenceSource(processName)
+	rows, note, err := s.lookupOrScanEvidence(
+		ctx,
+		source,
+		logDir,
+		bucketTS,
+		maxEvidenceRows,
+		allowFileScan,
+		matcher,
+		evidenceQueryHints{AnyIP: remoteIP, TargetPort: remotePort},
+		isGenericLogFileName,
+		parseGenericEvidenceLine,
+	)
+	if err != nil {
+		return err
+	}
+	if note != "" {
+		appendNoteUnique(&response.Notes, note)
+	}
+	if len(rows) == 0 {
+		if !allowFileScan {
+			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", resolvedLogDir(logDir, "")))
+			return nil
+		}
+		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 中未命中 %s 相关日志。", resolvedLogDir(logDir, ""), processName))
+		return nil
+	}
+
+	sourceWeights := make(map[string]int64)
+	targetWeights := make(map[string]int64)
+	chainMap := make(map[string]chainAgg)
+	for _, row := range rows {
+		if row.ClientIP != "" {
+			sourceWeights[row.ClientIP]++
+		}
+		if row.TargetIP != "" {
+			targetWeights[row.TargetIP]++
+		}
+		addExplainChain(chainMap, row, query, processEvidenceLabel(processName))
+	}
+	mergeChainUsageMetrics(chainMap, query, related)
+
+	response.SourceIPs = mergeTopIPs(response.SourceIPs, topIPsByCount(sourceWeights, 4), 6)
+	response.TargetIPs = mergeTopIPs(response.TargetIPs, topIPsByCount(targetWeights, 4), 6)
+	response.Chains = mergeExplainChains(response.Chains, summarizeChains(chainMap, 0), 0)
+
+	appendNoteUnique(&response.Notes, fmt.Sprintf("%s 日志命中 %d 条。", processName, len(rows)))
+	for i := 0; i < len(rows) && i < 2; i++ {
+		if rows[i].Message != "" {
+			appendNoteUnique(&response.Notes, fmt.Sprintf("%s 样本：%s", processName, rows[i].Message))
+		}
+	}
+	return nil
+}
+
+func customEvidenceSource(processName string) string {
+	name := strings.TrimSpace(processName)
+	if name == "" {
+		return "proc"
+	}
+	return fmt.Sprintf("proc:%s", name)
 }
 
 func parseEvidencePort(value string) (int, bool) {
-	trimmed := strings.TrimSpace(value)
-	if trimmed == "" {
-		return 0, false
-	}
-	port, err := strconv.Atoi(trimmed)
-	if err != nil || port <= 0 {
-		return 0, false
-	}
-	return port, true
+	return evidence.ParsePort(value)
 }
 
 func (s *Server) lookupOrScanEvidence(
@@ -581,224 +832,220 @@ func (s *Server) lookupOrScanEvidence(
 	logDir string,
 	bucketTS int64,
 	limit int,
+	allowFileScan bool,
 	matcher evidenceMatcher,
 	queryHints evidenceQueryHints,
 	fileNameMatcher func(string) bool,
 	parser evidenceParser,
 ) ([]model.LogEvidence, string, error) {
-	strictStart := bucketTS - logWindowStrict
-	strictEnd := bucketTS + logWindowStrict
-	fallbackStart := bucketTS - logWindowFallback
-	fallbackEnd := bucketTS + logWindowFallback
-	cacheLimit := cacheEvidenceLimit(limit)
-
-	rows, err := s.store.QueryLogEvidence(ctx, store.LogEvidenceQuery{
-		Source:   source,
-		StartTS:  strictStart,
-		EndTS:    strictEnd,
-		ClientIP: queryHints.ClientIP,
-		TargetIP: queryHints.TargetIP,
-		AnyIP:    queryHints.AnyIP,
-		Limit:    cacheLimit,
+	return evidence.LookupOrScan(ctx, s.store, evidence.SearchOptions{
+		Source:               source,
+		LogDir:               logDir,
+		BucketTS:             bucketTS,
+		Limit:                limit,
+		QueryHints:           evidence.QueryHints(queryHints),
+		FileNameMatcher:      fileNameMatcher,
+		Parser:               evidence.Parser(parser),
+		Matcher:              evidence.Matcher(matcher),
+		StrictWindow:         logWindowStrict,
+		FallbackWindow:       logWindowFallback,
+		ScanBudget:           explainLogScanBudget,
+		MaxScanFilesStrict:   maxScanFilesStrict,
+		MaxScanFilesFallback: maxScanFilesFallback,
+		MaxScanLinesPerFile:  maxScanLinesPerFile,
+		CacheOnly:            !allowFileScan,
 	})
-	if err != nil {
-		return nil, "", fmt.Errorf("query cached evidence: %w", err)
-	}
-	rows = filterEvidence(rows, matcher)
-	rows = sortAndTrimEvidence(rows, bucketTS, limit)
-	if len(rows) > 0 {
-		return rows, "", nil
+}
+
+func (s *Server) lookupOrScanEvidenceAcrossDirs(
+	ctx context.Context,
+	source string,
+	logDirs []string,
+	bucketTS int64,
+	limit int,
+	allowFileScan bool,
+	matcher evidenceMatcher,
+	queryHints evidenceQueryHints,
+	fileNameMatcher func(string) bool,
+	parser evidenceParser,
+) ([]model.LogEvidence, []string, error) {
+	uniqueDirs := uniqueNonEmptyStrings(logDirs)
+	if len(uniqueDirs) == 0 {
+		return nil, nil, nil
 	}
 
-	rows, err = s.store.QueryLogEvidence(ctx, store.LogEvidenceQuery{
-		Source:   source,
-		StartTS:  fallbackStart,
-		EndTS:    fallbackEnd,
-		ClientIP: queryHints.ClientIP,
-		TargetIP: queryHints.TargetIP,
-		AnyIP:    queryHints.AnyIP,
-		Limit:    cacheLimit,
-	})
-	if err != nil {
-		return nil, "", fmt.Errorf("query fallback evidence: %w", err)
-	}
-	rows = filterEvidence(rows, matcher)
-	rows = sortAndTrimEvidence(rows, bucketTS, limit)
-	if len(rows) > 0 {
-		return rows, "在缓存中命中 ±15 分钟窗口日志。", nil
-	}
-
-	strictFiles, err := listLogFiles(logDir, fileNameMatcher, strictStart, strictEnd, maxScanFilesStrict)
-	if err != nil {
-		return nil, "", err
-	}
-	if len(strictFiles) > 0 {
-		scannedStrict, err := scanEvidenceFiles(ctx, source, strictFiles, parser, matcher, strictStart, strictEnd, bucketTS, limit*3, maxScanLinesPerFile)
+	rows := make([]model.LogEvidence, 0, limit)
+	notes := make([]string, 0, len(uniqueDirs))
+	for _, logDir := range uniqueDirs {
+		scannedRows, note, err := s.lookupOrScanEvidence(
+			ctx,
+			source,
+			logDir,
+			bucketTS,
+			limit,
+			allowFileScan,
+			matcher,
+			queryHints,
+			fileNameMatcher,
+			parser,
+		)
 		if err != nil {
-			return nil, "", err
+			return nil, nil, err
 		}
-		if len(scannedStrict) > 0 {
-			if err := s.store.UpsertLogEvidenceBatch(ctx, scannedStrict); err != nil {
-				return nil, "", fmt.Errorf("persist strict evidence: %w", err)
-			}
-			return sortAndTrimEvidence(scannedStrict, bucketTS, limit), "", nil
+		if note != "" {
+			appendUniqueString(&notes, note)
+		}
+		rows = appendDedupEvidenceRows(rows, scannedRows)
+		if len(rows) > 0 {
+			break
 		}
 	}
-
-	fallbackFiles, err := listLogFiles(logDir, fileNameMatcher, fallbackStart, fallbackEnd, maxScanFilesFallback)
-	if err != nil {
-		return nil, "", err
-	}
-	if len(fallbackFiles) == 0 {
-		return nil, "", nil
-	}
-
-	scannedFallback, err := scanEvidenceFiles(ctx, source, fallbackFiles, parser, matcher, fallbackStart, fallbackEnd, bucketTS, limit*3, maxScanLinesPerFile)
-	if err != nil {
-		return nil, "", err
-	}
-	if len(scannedFallback) > 0 {
-		if err := s.store.UpsertLogEvidenceBatch(ctx, scannedFallback); err != nil {
-			return nil, "", fmt.Errorf("persist fallback evidence: %w", err)
-		}
-		return sortAndTrimEvidence(scannedFallback, bucketTS, limit), "在 ±2 分钟窗口未命中，已回退到 ±15 分钟窗口匹配日志。", nil
-	}
-
-	return nil, "", nil
+	return evidence.SortAndTrim(rows, bucketTS, limit), notes, nil
 }
 
-func cacheEvidenceLimit(limit int) int {
-	if limit <= 0 {
-		return 200
+func shadowsocksEvidenceSources() []string {
+	sources := make([]string, 0, 1+len(shadowsocksFamilyLookupKeys()))
+	sources = append(sources, evidenceSourceSS)
+	for _, key := range shadowsocksFamilyLookupKeys() {
+		sources = append(sources, customEvidenceSource(key))
 	}
-	computed := limit * 10
-	if computed < limit+64 {
-		computed = limit + 64
-	}
-	if computed > 2000 {
-		return 2000
-	}
-	return computed
+	return uniqueNonEmptyStrings(sources)
 }
 
-func listLogFiles(logDir string, nameMatcher func(string) bool, startTS int64, endTS int64, maxCandidates int) ([]logFileCandidate, error) {
-	dir := resolvedLogDir(logDir, "")
-	if dir == "" {
-		return nil, nil
+func (s *Server) lookupOrScanEvidenceAcrossSourcesAndDirs(
+	ctx context.Context,
+	sources []string,
+	logDirs []string,
+	bucketTS int64,
+	limit int,
+	allowFileScan bool,
+	matcher evidenceMatcher,
+	queryHints evidenceQueryHints,
+	fileNameMatcher func(string) bool,
+	parser evidenceParser,
+) ([]model.LogEvidence, []string, error) {
+	orderedSources := uniqueNonEmptyStrings(sources)
+	if len(orderedSources) == 0 {
+		return nil, nil, nil
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("读取日志目录失败：%s（%w）", dir, err)
-	}
-	files := make([]logFileCandidate, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		lower := strings.ToLower(entry.Name())
-		if !nameMatcher(lower) {
-			continue
-		}
-		info, err := entry.Info()
+
+	rows := make([]model.LogEvidence, 0, limit)
+	notes := make([]string, 0, len(orderedSources))
+	for index, source := range orderedSources {
+		// Only the canonical source should perform live file scans. Older source
+		// keys are read back from cache for compatibility with pre-upgrade DBs.
+		sourceRows, sourceNotes, err := s.lookupOrScanEvidenceAcrossDirs(
+			ctx,
+			source,
+			logDirs,
+			bucketTS,
+			limit,
+			allowFileScan && index == 0,
+			matcher,
+			queryHints,
+			fileNameMatcher,
+			parser,
+		)
 		if err != nil {
-			continue
+			return nil, nil, err
 		}
-		if !isLikelyFileInTimeRange(lower, info.ModTime(), startTS, endTS) {
-			continue
+		for _, note := range sourceNotes {
+			appendUniqueString(&notes, note)
 		}
-		files = append(files, logFileCandidate{
-			Name:    entry.Name(),
-			Path:    filepath.Join(dir, entry.Name()),
-			ModTime: info.ModTime(),
-		})
+		rows = appendDedupEvidenceRows(rows, sourceRows)
 	}
-
-	if len(files) == 0 {
-		return nil, nil
-	}
-
-	centerTS := (startTS + endTS) / 2
-	sort.Slice(files, func(i, j int) bool {
-		di := absInt64(files[i].ModTime.Unix() - centerTS)
-		dj := absInt64(files[j].ModTime.Unix() - centerTS)
-		if di == dj {
-			if files[i].ModTime.Equal(files[j].ModTime) {
-				return files[i].Path > files[j].Path
-			}
-			return files[i].ModTime.After(files[j].ModTime)
-		}
-		return di < dj
-	})
-	if maxCandidates > 0 && len(files) > maxCandidates {
-		files = files[:maxCandidates]
-	}
-	return files, nil
+	return evidence.SortAndTrim(rows, bucketTS, limit), notes, nil
 }
 
-func isLikelyFileInTimeRange(lowerName string, modTime time.Time, startTS int64, endTS int64) bool {
-	if startTS <= 0 || endTS <= 0 {
-		return true
+func (s *Server) lookupShadowsocksSourceEvidenceByEntryPort(
+	ctx context.Context,
+	bucketTS int64,
+	logDirs []string,
+	entryPorts []int,
+	allowFileScan bool,
+) ([]model.LogEvidence, []string, error) {
+	ports := uniquePositiveInts(entryPorts)
+	if len(ports) == 0 {
+		return nil, nil, nil
 	}
-	if endTS < startTS {
-		startTS, endTS = endTS, startTS
-	}
-	start := time.Unix(startTS, 0).UTC()
-	end := time.Unix(endTS, 0).UTC()
-	dayStart := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, time.UTC).Add(-24 * time.Hour)
-	dayEnd := time.Date(end.Year(), end.Month(), end.Day(), 23, 59, 59, 0, time.UTC).Add(24 * time.Hour)
 
-	dates := extractDateCandidatesFromFileName(lowerName)
-	if len(dates) > 0 {
-		for _, date := range dates {
-			if !date.Before(dayStart) && !date.After(dayEnd) {
-				return true
-			}
+	rows := make([]model.LogEvidence, 0, len(ports)*4)
+	notes := make([]string, 0, len(ports))
+	for _, entryPort := range ports {
+		portValue := entryPort
+		entryRows, entryNotes, err := s.lookupOrScanEvidenceAcrossSourcesAndDirs(
+			ctx,
+			shadowsocksEvidenceSources(),
+			logDirs,
+			bucketTS,
+			maxRelatedPeers*4,
+			allowFileScan,
+			func(ev model.LogEvidence) bool {
+				return ev.EntryPort == portValue && ev.ClientIP != "" && !isLoopbackIP(ev.ClientIP)
+			},
+			evidenceQueryHints{EntryPort: portValue},
+			isShadowsocksLogFileName,
+			parseSSEvidenceLine,
+		)
+		if err != nil {
+			return nil, nil, err
 		}
-		return false
+		for _, note := range entryNotes {
+			appendUniqueString(&notes, note)
+		}
+		rows = appendDedupEvidenceRows(rows, entryRows)
 	}
-
-	if modTime.IsZero() {
-		return true
-	}
-	mod := modTime.UTC()
-	if mod.Before(dayStart.Add(-24 * time.Hour)) {
-		return false
-	}
-	if mod.After(dayEnd.Add(72 * time.Hour)) {
-		return false
-	}
-	return true
+	return evidence.SortAndTrim(rows, bucketTS, maxEvidenceRows), notes, nil
 }
 
-func extractDateCandidatesFromFileName(lowerName string) []time.Time {
-	matches := fileDatePattern.FindAllStringSubmatch(lowerName, -1)
-	if len(matches) == 0 {
-		return nil
+func (s *Server) collectEntryPortSourceCandidates(ctx context.Context, bucketTS int64, proto string, entryPorts []int) (map[int][]entrySourceCandidate, error) {
+	result := make(map[int][]entrySourceCandidate)
+	seen := make(map[int]struct{}, len(entryPorts))
+	for _, entryPort := range entryPorts {
+		if entryPort <= 0 {
+			continue
+		}
+		if _, ok := seen[entryPort]; ok {
+			continue
+		}
+		seen[entryPort] = struct{}{}
+
+		portValue := entryPort
+		rows, _, _, err := s.store.QueryUsage(ctx, model.UsageQuery{
+			Start:     time.Unix(bucketTS-usageExplainWindowPadding, 0).UTC(),
+			End:       time.Unix(bucketTS+usageExplainWindowPadding+60, 0).UTC(),
+			Direction: model.DirectionIn,
+			Proto:     proto,
+			LocalPort: &portValue,
+			UsePage:   true,
+			Page:      1,
+			PageSize:  200,
+			SortBy:    "bytes_total",
+			SortOrder: "desc",
+		}, store.DataSourceMinute)
+		if err != nil {
+			return nil, fmt.Errorf("query entry-port source candidates: %w", err)
+		}
+
+		aggregated := make(map[string]entrySourceCandidate)
+		for _, row := range rows {
+			if row.RemoteIP == "" || isLoopbackIP(row.RemoteIP) {
+				continue
+			}
+			candidate := aggregated[row.RemoteIP]
+			candidate.RemoteIP = row.RemoteIP
+			candidate.BytesTotal += usageBytesTotal(row)
+			candidate.FlowCount += row.FlowCount
+			aggregated[row.RemoteIP] = candidate
+		}
+
+		candidates := make([]entrySourceCandidate, 0, len(aggregated))
+		for _, candidate := range aggregated {
+			candidates = append(candidates, candidate)
+		}
+		result[entryPort] = candidates
 	}
-	seen := make(map[int64]struct{})
-	result := make([]time.Time, 0, len(matches))
-	for _, match := range matches {
-		if len(match) < 4 {
-			continue
-		}
-		year, errYear := strconv.Atoi(match[1])
-		month, errMonth := strconv.Atoi(match[2])
-		day, errDay := strconv.Atoi(match[3])
-		if errYear != nil || errMonth != nil || errDay != nil {
-			continue
-		}
-		candidate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
-		if candidate.Year() != year || int(candidate.Month()) != month || candidate.Day() != day {
-			continue
-		}
-		unix := candidate.Unix()
-		if _, exists := seen[unix]; exists {
-			continue
-		}
-		seen[unix] = struct{}{}
-		result = append(result, candidate)
-	}
-	return result
+	return result, nil
 }
 
 func summarizeNginxRequests(rows []model.LogEvidence, limit int) []usageExplainNginxRequest {
@@ -827,15 +1074,18 @@ func summarizeNginxRequests(rows []model.LogEvidence, limit int) []usageExplainN
 		}
 
 		request := usageExplainNginxRequest{
-			Time:      row.EventTS,
-			Method:    method,
-			Host:      host,
-			Path:      path,
-			Status:    status,
-			Count:     1,
-			Referer:   trimDisplayValue(referer, 180),
-			UserAgent: trimDisplayValue(userAgent, 180),
-			Bot:       bot,
+			Time:              row.EventTS,
+			Method:            method,
+			Host:              host,
+			HostNormalized:    evidence.NormalizeHost(host),
+			Path:              path,
+			Status:            status,
+			Count:             1,
+			ClientIP:          row.ClientIP,
+			Referer:           trimDisplayValue(referer, 180),
+			UserAgent:         trimDisplayValue(userAgent, 180),
+			Bot:               bot,
+			SampleFingerprint: row.Fingerprint,
 		}
 
 		key := fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s", request.Method, request.Host, request.Path, request.Status, request.Bot, request.UserAgent, request.Referer)
@@ -847,6 +1097,11 @@ func summarizeNginxRequests(rows []model.LogEvidence, limit int) []usageExplainN
 		agg.Count++
 		if request.Time > agg.Time {
 			agg.Time = request.Time
+			agg.ClientIP = request.ClientIP
+			agg.SampleFingerprint = request.SampleFingerprint
+			agg.Referer = request.Referer
+			agg.UserAgent = request.UserAgent
+			agg.Bot = request.Bot
 		}
 	}
 
@@ -1047,121 +1302,6 @@ func isLikelyBinaryRequestPart(decoded []byte, original string) bool {
 	return false
 }
 
-func scanEvidenceFiles(
-	ctx context.Context,
-	source string,
-	files []logFileCandidate,
-	parser evidenceParser,
-	matcher evidenceMatcher,
-	startTS int64,
-	endTS int64,
-	referenceTS int64,
-	limit int,
-	maxLinesPerFile int,
-) ([]model.LogEvidence, error) {
-	if len(files) == 0 {
-		return nil, nil
-	}
-	collected := make([]model.LogEvidence, 0)
-	seen := make(map[string]struct{})
-	reference := time.Unix(referenceTS, 0).In(time.Local)
-
-	for _, file := range files {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		reader, err := openMaybeGzip(file.Path)
-		if err != nil {
-			continue
-		}
-
-		scanner := bufio.NewScanner(reader)
-		buffer := make([]byte, 0, 64*1024)
-		scanner.Buffer(buffer, 1024*1024)
-		linesRead := 0
-		overEndStreak := 0
-		for scanner.Scan() {
-			if ctx.Err() != nil {
-				_ = reader.Close()
-				return nil, ctx.Err()
-			}
-			linesRead++
-			if maxLinesPerFile > 0 && linesRead > maxLinesPerFile {
-				break
-			}
-			evidence, ok := parser(source, scanner.Text(), reference)
-			if !ok {
-				continue
-			}
-			if evidence.EventTS > endTS {
-				overEndStreak++
-				if overEndStreak >= 200 {
-					break
-				}
-				continue
-			}
-			overEndStreak = 0
-			if evidence.EventTS < startTS || evidence.EventTS > endTS {
-				continue
-			}
-			if matcher != nil && !matcher(evidence) {
-				continue
-			}
-			if evidence.Fingerprint == "" {
-				evidence.Fingerprint = evidenceFingerprint(evidence)
-			}
-			if _, exists := seen[evidence.Fingerprint]; exists {
-				continue
-			}
-			seen[evidence.Fingerprint] = struct{}{}
-			collected = append(collected, evidence)
-			if limit > 0 && len(collected) >= limit {
-				break
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			_ = reader.Close()
-			return nil, fmt.Errorf("scan evidence file %s: %w", file.Path, err)
-		}
-		_ = reader.Close()
-		if limit > 0 && len(collected) >= limit {
-			break
-		}
-	}
-	return collected, nil
-}
-
-func openMaybeGzip(path string) (io.ReadCloser, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	if !strings.HasSuffix(strings.ToLower(path), ".gz") {
-		return file, nil
-	}
-	reader, err := gzip.NewReader(file)
-	if err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	return &stackedCloser{Reader: reader, closers: []io.Closer{reader, file}}, nil
-}
-
-type stackedCloser struct {
-	io.Reader
-	closers []io.Closer
-}
-
-func (s *stackedCloser) Close() error {
-	var firstErr error
-	for _, closer := range s.closers {
-		if err := closer.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
 func parseNginxEvidenceLine(source string, line string, _ time.Time) (model.LogEvidence, bool) {
 	match := nginxAccessPattern.FindStringSubmatch(line)
 	if len(match) < 6 {
@@ -1193,7 +1333,7 @@ func parseNginxEvidenceLine(source string, line string, _ time.Time) (model.LogE
 	}
 	status := statusValue
 
-	evidence := model.LogEvidence{
+	ev := model.LogEvidence{
 		Source:   source,
 		EventTS:  eventTS,
 		ClientIP: clientIPs[0],
@@ -1204,8 +1344,9 @@ func parseNginxEvidenceLine(source string, line string, _ time.Time) (model.LogE
 		Status:   &status,
 		Message:  truncateMessage(line, 1024),
 	}
-	evidence.Fingerprint = evidenceFingerprint(evidence)
-	return evidence, true
+	ev = evidence.Normalize(ev)
+	ev.Fingerprint = evidenceFingerprint(ev)
+	return ev, true
 }
 
 func parseSSEvidenceLine(source string, line string, reference time.Time) (model.LogEvidence, bool) {
@@ -1270,7 +1411,7 @@ func parseSSEvidenceLine(source string, line string, reference time.Time) (model
 		path = strconv.Itoa(targetPort)
 	}
 
-	evidence := model.LogEvidence{
+	ev := model.LogEvidence{
 		Source:      source,
 		EventTS:     eventTS,
 		ClientIP:    clientIP,
@@ -1278,12 +1419,80 @@ func parseSSEvidenceLine(source string, line string, reference time.Time) (model
 		Host:        host,
 		Path:        path,
 		Method:      method,
+		EntryPort:   extractLogEntryPort(line),
+		TargetPort:  targetPort,
 		Status:      nil,
 		Message:     truncateMessage(line, 512),
 		Fingerprint: "",
 	}
-	evidence.Fingerprint = evidenceFingerprint(evidence)
-	return evidence, true
+	ev = evidence.Normalize(ev)
+	ev.Fingerprint = evidenceFingerprint(ev)
+	return ev, true
+}
+
+func parseGenericEvidenceLine(source string, line string, reference time.Time) (model.LogEvidence, bool) {
+	eventTS, ok := parseFlexibleTimestamp(line, reference)
+	if !ok {
+		return model.LogEvidence{}, false
+	}
+
+	clientIP := extractEndpointIP(ssClientPattern, line)
+	if clientIP == "" {
+		clientIP = normalizeIP(extractEndpointToken(ssFromPattern, line))
+	}
+
+	targetToken := extractEndpointToken(ssTargetPattern, line)
+	if targetToken == "" {
+		if match := ssConnectPattern.FindStringSubmatch(line); len(match) >= 2 {
+			targetToken = match[1]
+		}
+	}
+	host, targetPort, targetIP := parseSSTargetToken(targetToken)
+
+	ips := extractIPs(line)
+	if clientIP == "" && len(ips) > 0 {
+		clientIP = ips[0]
+	}
+	if targetIP == "" && len(ips) > 0 {
+		for i := len(ips) - 1; i >= 0; i-- {
+			if !sameIP(ips[i], clientIP) {
+				targetIP = ips[i]
+				break
+			}
+		}
+	}
+
+	if clientIP == "" && targetIP == "" && host == "" {
+		return model.LogEvidence{}, false
+	}
+
+	method := "log"
+	lower := strings.ToLower(line)
+	if strings.Contains(lower, "connect") {
+		method = "connect"
+	} else if strings.Contains(lower, "accept") {
+		method = "accept"
+	}
+
+	path := ""
+	if targetPort > 0 {
+		path = strconv.Itoa(targetPort)
+	}
+
+	ev := model.LogEvidence{
+		Source:    source,
+		EventTS:   eventTS,
+		ClientIP:  clientIP,
+		TargetIP:  targetIP,
+		Host:      host,
+		Path:      path,
+		Method:    method,
+		EntryPort: extractLogEntryPort(line),
+		Message:   truncateMessage(line, 512),
+	}
+	ev = evidence.Normalize(ev)
+	ev.Fingerprint = evidenceFingerprint(ev)
+	return ev, true
 }
 
 func parseNginxTimestamp(value string) (int64, bool) {
@@ -1387,6 +1596,21 @@ func parseSSTargetToken(value string) (string, int, string) {
 	return host, port, ""
 }
 
+func extractLogEntryPort(line string) int {
+	matches := bracketPortPattern.FindAllStringSubmatch(line, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+	for i := len(matches) - 1; i >= 0; i-- {
+		port, err := strconv.Atoi(matches[i][1])
+		if err != nil || port <= 0 || port > 65535 {
+			continue
+		}
+		return port
+	}
+	return 0
+}
+
 func isDigits(value string) bool {
 	if value == "" {
 		return false
@@ -1458,37 +1682,6 @@ func extractIPs(text string) []string {
 	return result
 }
 
-func filterEvidence(rows []model.LogEvidence, matcher evidenceMatcher) []model.LogEvidence {
-	if matcher == nil || len(rows) == 0 {
-		return rows
-	}
-	filtered := make([]model.LogEvidence, 0, len(rows))
-	for _, row := range rows {
-		if matcher(row) {
-			filtered = append(filtered, row)
-		}
-	}
-	return filtered
-}
-
-func sortAndTrimEvidence(rows []model.LogEvidence, bucketTS int64, limit int) []model.LogEvidence {
-	if len(rows) == 0 {
-		return rows
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		di := absInt64(rows[i].EventTS - bucketTS)
-		dj := absInt64(rows[j].EventTS - bucketTS)
-		if di == dj {
-			return rows[i].EventTS > rows[j].EventTS
-		}
-		return di < dj
-	})
-	if limit > 0 && len(rows) > limit {
-		rows = rows[:limit]
-	}
-	return rows
-}
-
 func isNginxLogFileName(lowerName string) bool {
 	if !strings.Contains(lowerName, ".log") {
 		return false
@@ -1513,7 +1706,7 @@ func isShadowsocksLogFileName(lowerName string) bool {
 	if !strings.Contains(lowerName, ".log") {
 		return false
 	}
-	keywords := []string{"ss", "shadowsocks", "outline", "v2ray", "xray", "singbox", "hysteria"}
+	keywords := []string{"ss", "shadowsocks", "outline", "obfs", "server", "manager", "v2ray", "xray", "singbox", "hysteria"}
 	for _, keyword := range keywords {
 		if strings.Contains(lowerName, keyword) {
 			return true
@@ -1522,21 +1715,8 @@ func isShadowsocksLogFileName(lowerName string) bool {
 	return false
 }
 
-func evidenceFingerprint(evidence model.LogEvidence) string {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(fmt.Sprintf(
-		"%s|%d|%s|%s|%s|%s|%s|%v|%s",
-		evidence.Source,
-		evidence.EventTS,
-		evidence.ClientIP,
-		evidence.TargetIP,
-		evidence.Host,
-		evidence.Path,
-		evidence.Method,
-		statusValue(evidence.Status),
-		evidence.Message,
-	)))
-	return fmt.Sprintf("%x", h.Sum64())
+func evidenceFingerprint(row model.LogEvidence) string {
+	return evidence.Fingerprint(row)
 }
 
 func statusValue(status *int) int {
@@ -1614,6 +1794,131 @@ func topIPsByCount(weights map[string]int64, maxCount int) []string {
 	return topIPsByWeight(weights, maxCount)
 }
 
+func oppositeDirection(direction model.Direction) model.Direction {
+	if direction == model.DirectionIn {
+		return model.DirectionOut
+	}
+	return model.DirectionIn
+}
+
+type scoredUsageRecord struct {
+	record model.UsageRecord
+	score  int
+	delta  int64
+	bytes  int64
+}
+
+func selectCounterpartUsage(query usageExplainQuery, bucketTS int64, anchorBytes int64, rows []model.UsageRecord, maxCount int) []model.UsageRecord {
+	if len(rows) == 0 || maxCount <= 0 {
+		return nil
+	}
+	candidates := make([]scoredUsageRecord, 0, len(rows))
+	for _, row := range rows {
+		if row.Direction != oppositeDirection(query.Direction) || row.RemoteIP == "" {
+			continue
+		}
+		delta := evidence.AbsInt64(row.TimeBucket - bucketTS)
+		if delta > usageExplainWindowPadding+60 {
+			continue
+		}
+		bytesTotal := usageBytesTotal(row)
+		score := 0
+		switch {
+		case delta == 0:
+			score += 6
+		case delta <= 60:
+			score += 4
+		default:
+			score += 2
+		}
+		if anchorBytes > 0 && bytesTotal > 0 {
+			ratio := float64(maxInt64(anchorBytes, bytesTotal)) / float64(minInt64(anchorBytes, bytesTotal))
+			switch {
+			case ratio <= 2:
+				score += 4
+			case ratio <= 5:
+				score += 2
+			}
+		}
+		if query.LocalPort != nil && row.LocalPort == *query.LocalPort {
+			score++
+		}
+		if query.RemotePort != nil && row.RemotePort != nil && *row.RemotePort == *query.RemotePort {
+			score++
+		}
+		if query.RemoteIP != "" && sameIP(row.RemoteIP, query.RemoteIP) {
+			score -= 3
+		}
+		if row.Attribution != nil && (*row.Attribution == model.AttributionExact || *row.Attribution == model.AttributionHeuristic) {
+			score++
+		}
+		if score < 4 {
+			continue
+		}
+		candidates = append(candidates, scoredUsageRecord{
+			record: row,
+			score:  score,
+			delta:  delta,
+			bytes:  bytesTotal,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].score == candidates[j].score {
+			if candidates[i].delta == candidates[j].delta {
+				if candidates[i].bytes == candidates[j].bytes {
+					return candidates[i].record.RemoteIP < candidates[j].record.RemoteIP
+				}
+				return candidates[i].bytes > candidates[j].bytes
+			}
+			return candidates[i].delta < candidates[j].delta
+		}
+		return candidates[i].score > candidates[j].score
+	})
+	if len(candidates) > maxCount {
+		candidates = candidates[:maxCount]
+	}
+	result := make([]model.UsageRecord, 0, len(candidates))
+	for _, candidate := range candidates {
+		result = append(result, candidate.record)
+	}
+	return result
+}
+
+func usageBytesTotal(row model.UsageRecord) int64 {
+	return row.BytesUp + row.BytesDown
+}
+
+func dedupeUsageRecords(rows []model.UsageRecord) []model.UsageRecord {
+	if len(rows) <= 1 {
+		return rows
+	}
+	seen := make(map[string]struct{}, len(rows))
+	result := make([]model.UsageRecord, 0, len(rows))
+	for _, row := range rows {
+		key := fmt.Sprintf("%d|%d|%s|%s|%v|%s|%d|%s|%v", row.RowID, row.TimeBucket, row.Proto, row.Direction, row.PID, row.RemoteIP, row.LocalPort, nullableStringValue(row.Exe), nullablePortValue(row.RemotePort))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, row)
+	}
+	return result
+}
+
+func nullableStringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func nullablePortValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
 func summarizePeers(peers map[string]peerAgg, maxCount int) []usageExplainPeer {
 	if len(peers) == 0 {
 		return nil
@@ -1648,6 +1953,719 @@ func summarizePeers(peers map[string]peerAgg, maxCount int) []usageExplainPeer {
 	return result
 }
 
+func addExplainChain(chains map[string]chainAgg, row model.LogEvidence, query usageExplainQuery, evidenceLabel string) {
+	if chains == nil {
+		return
+	}
+	if row.TargetIP == "" && row.Host == "" {
+		return
+	}
+
+	targetPort := row.TargetPort
+	if targetPort <= 0 {
+		targetPort, _ = parseEvidencePort(row.Path)
+	}
+	entryPort := row.EntryPort
+	if entryPort <= 0 {
+		entryPort = queryLocalPort(query)
+	}
+	targetIP := strings.TrimSpace(row.TargetIP)
+	key := fmt.Sprintf("%s|%d|%s|%s|%d", row.ClientIP, entryPort, targetIP, evidence.NormalizeHost(row.Host), targetPort)
+	chain := chains[key]
+	if sourceIP := strings.TrimSpace(row.ClientIP); sourceIP != "" {
+		chain.SourceIP = sourceIP
+	}
+	if targetIP != "" {
+		chain.TargetIP = targetIP
+	}
+	if row.Host != "" {
+		chain.TargetHost = row.Host
+		chain.TargetHostNormalized = evidence.NormalizeHost(row.Host)
+	}
+	if targetPort > 0 {
+		chain.TargetPort = targetPort
+	}
+	if entryPort > 0 {
+		chain.LocalPort = entryPort
+	}
+	chain.EvidenceCount++
+	chain.Evidence = fallbackText(strings.TrimSpace(evidenceLabel), "log")
+	chain.EvidenceSource = fallbackText(strings.TrimSpace(evidenceLabel), "log")
+	if row.Fingerprint != "" && (chain.SampleFingerprint == "" || row.EventTS >= chain.SampleTime) {
+		chain.SampleFingerprint = row.Fingerprint
+		chain.SampleMessage = row.Message
+		chain.SampleTime = row.EventTS
+	}
+	chain.Confidence = explainChainConfidence(chain.SourceIP, chain.TargetIP)
+	chains[key] = chain
+}
+
+func explainChainConfidence(sourceIP string, targetIP string) string {
+	sourceIP = strings.TrimSpace(sourceIP)
+	targetIP = strings.TrimSpace(targetIP)
+	if sourceIP != "" && targetIP != "" {
+		return "high"
+	}
+	if sourceIP != "" || targetIP != "" {
+		return "medium"
+	}
+	return "low"
+}
+
+func processEvidenceLabel(processName string) string {
+	normalized := strings.ToLower(strings.TrimSpace(processName))
+	if normalized == "" {
+		return "proc-log"
+	}
+	return normalized + "-log"
+}
+
+func mergeChainUsageMetrics(chains map[string]chainAgg, query usageExplainQuery, related []model.UsageRecord) {
+	if len(chains) == 0 || len(related) == 0 {
+		return
+	}
+
+	type usageTotals struct {
+		bytes int64
+		flows int64
+	}
+
+	byTargetPort := make(map[string]usageTotals)
+	bySourceEntry := make(map[string]usageTotals)
+	hostOnlyCandidates := make(map[string]int)
+	sourceEntryCandidates := make(map[string]int)
+	for _, row := range related {
+		if row.Direction == model.DirectionIn && row.RemoteIP != "" && row.LocalPort > 0 {
+			key := fmt.Sprintf("%s|%d", row.RemoteIP, row.LocalPort)
+			totals := bySourceEntry[key]
+			totals.bytes += usageBytesTotal(row)
+			totals.flows += row.FlowCount
+			bySourceEntry[key] = totals
+		}
+		if row.Direction != model.DirectionOut {
+			continue
+		}
+		if row.RemoteIP == "" {
+			continue
+		}
+		port := 0
+		if row.RemotePort != nil {
+			port = *row.RemotePort
+		}
+		key := fmt.Sprintf("%s|%d", row.RemoteIP, port)
+		totals := byTargetPort[key]
+		totals.bytes += usageBytesTotal(row)
+		totals.flows += row.FlowCount
+		byTargetPort[key] = totals
+	}
+	for _, chain := range chains {
+		if chain.SourceIP != "" && chain.LocalPort > 0 {
+			sourceEntryCandidates[fmt.Sprintf("%s|%d", chain.SourceIP, chain.LocalPort)]++
+		}
+		if chain.TargetIP == "" && chain.TargetPort > 0 {
+			hostOnlyCandidates[fmt.Sprintf("%d|%d", chain.LocalPort, chain.TargetPort)]++
+		}
+	}
+
+	for key, chain := range chains {
+		if chain.TargetIP == "" && query.Direction == model.DirectionOut && strings.TrimSpace(query.RemoteIP) != "" {
+			candidateKey := fmt.Sprintf("%d|%d", chain.LocalPort, chain.TargetPort)
+			if hostOnlyCandidates[candidateKey] == 1 && (query.RemotePort == nil || chain.TargetPort <= 0 || *query.RemotePort == chain.TargetPort) {
+				chain.TargetIP = strings.TrimSpace(query.RemoteIP)
+			}
+		}
+		if chain.TargetPort <= 0 && query.RemotePort != nil {
+			chain.TargetPort = *query.RemotePort
+		}
+		port := chain.TargetPort
+		lookupKey := fmt.Sprintf("%s|%d", chain.TargetIP, port)
+		if totals, ok := byTargetPort[lookupKey]; ok {
+			chain.BytesTotal = totals.bytes
+			chain.FlowCount = totals.flows
+			chain.Confidence = explainChainConfidence(chain.SourceIP, chain.TargetIP)
+			chains[key] = chain
+			continue
+		}
+		if query.Direction == model.DirectionOut && strings.TrimSpace(query.RemoteIP) != "" {
+			candidateKey := fmt.Sprintf("%d|%d", chain.LocalPort, chain.TargetPort)
+			if hostOnlyCandidates[candidateKey] != 1 {
+				continue
+			}
+			anchorKey := fmt.Sprintf("%s|%d", strings.TrimSpace(query.RemoteIP), port)
+			if totals, ok := byTargetPort[anchorKey]; ok {
+				chain.TargetIP = strings.TrimSpace(query.RemoteIP)
+				chain.BytesTotal = totals.bytes
+				chain.FlowCount = totals.flows
+				chain.Confidence = explainChainConfidence(chain.SourceIP, chain.TargetIP)
+				chains[key] = chain
+				continue
+			}
+		}
+		if chain.SourceIP != "" && chain.LocalPort > 0 {
+			sourceKey := fmt.Sprintf("%s|%d", chain.SourceIP, chain.LocalPort)
+			if sourceEntryCandidates[sourceKey] == 1 {
+				if totals, ok := bySourceEntry[sourceKey]; ok {
+					chain.BytesTotal = totals.bytes
+					chain.FlowCount = totals.flows
+					chain.Confidence = explainChainConfidence(chain.SourceIP, chain.TargetIP)
+					chains[key] = chain
+				}
+			}
+		}
+	}
+}
+
+func hydrateChainsFromEntryPortCandidates(chains map[string]chainAgg, candidates map[int][]entrySourceCandidate) {
+	for key, chain := range chains {
+		if chain.SourceIP != "" || chain.LocalPort <= 0 {
+			continue
+		}
+		ip, ok := chooseEntrySourceCandidate(candidates[chain.LocalPort])
+		if !ok {
+			continue
+		}
+		chain.SourceIP = ip
+		chain.Confidence = explainChainConfidence(chain.SourceIP, chain.TargetIP)
+		chains[key] = chain
+	}
+}
+
+func buildEntryPortSourceCandidatesFromEvidence(rows []model.LogEvidence) map[int][]entrySourceCandidate {
+	if len(rows) == 0 {
+		return nil
+	}
+	aggregated := make(map[int]map[string]entrySourceCandidate)
+	for _, row := range rows {
+		if row.EntryPort <= 0 || row.ClientIP == "" || isLoopbackIP(row.ClientIP) {
+			continue
+		}
+		perPort := aggregated[row.EntryPort]
+		if perPort == nil {
+			perPort = make(map[string]entrySourceCandidate)
+			aggregated[row.EntryPort] = perPort
+		}
+		candidate := perPort[row.ClientIP]
+		candidate.RemoteIP = row.ClientIP
+		candidate.FlowCount++
+		candidate.BytesTotal++
+		if row.Method == "udp-cache-miss" || row.TargetIP != "" || row.Host != "" {
+			candidate.BytesTotal += 2
+		}
+		perPort[row.ClientIP] = candidate
+	}
+
+	result := make(map[int][]entrySourceCandidate, len(aggregated))
+	for entryPort, perPort := range aggregated {
+		items := make([]entrySourceCandidate, 0, len(perPort))
+		for _, candidate := range perPort {
+			items = append(items, candidate)
+		}
+		result[entryPort] = items
+	}
+	return result
+}
+
+func promoteConfirmedSourcesFromEvidence(target map[string]int, rows []model.LogEvidence) {
+	candidates := buildEntryPortSourceCandidatesFromEvidence(rows)
+	for _, perPort := range candidates {
+		sourceIP, ok := chooseEntrySourceCandidate(perPort)
+		if !ok || sourceIP == "" {
+			continue
+		}
+		target[sourceIP] += 2
+	}
+}
+
+func chooseEntrySourceCandidate(candidates []entrySourceCandidate) (string, bool) {
+	if len(candidates) == 0 {
+		return "", false
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].BytesTotal == candidates[j].BytesTotal {
+			if candidates[i].FlowCount == candidates[j].FlowCount {
+				return candidates[i].RemoteIP < candidates[j].RemoteIP
+			}
+			return candidates[i].FlowCount > candidates[j].FlowCount
+		}
+		return candidates[i].BytesTotal > candidates[j].BytesTotal
+	})
+	if len(candidates) == 1 {
+		return candidates[0].RemoteIP, true
+	}
+	if candidates[0].BytesTotal > 0 && candidates[0].BytesTotal >= candidates[1].BytesTotal*3 {
+		return candidates[0].RemoteIP, true
+	}
+	return "", false
+}
+
+func summarizeChains(chains map[string]chainAgg, maxCount int) []usageExplainChain {
+	if len(chains) == 0 {
+		return nil
+	}
+	items := make([]chainAgg, 0, len(chains))
+	for _, item := range chains {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].FlowCount == items[j].FlowCount {
+			if items[i].EvidenceCount == items[j].EvidenceCount {
+				return items[i].SourceIP < items[j].SourceIP
+			}
+			return items[i].EvidenceCount > items[j].EvidenceCount
+		}
+		return items[i].FlowCount > items[j].FlowCount
+	})
+	if maxCount > 0 && len(items) > maxCount {
+		items = items[:maxCount]
+	}
+	result := make([]usageExplainChain, 0, len(items))
+	for _, item := range items {
+		result = append(result, usageExplainChain{
+			SourceIP:             item.SourceIP,
+			TargetIP:             item.TargetIP,
+			TargetHost:           item.TargetHost,
+			TargetHostNormalized: item.TargetHostNormalized,
+			TargetPort:           nullablePort(item.TargetPort),
+			LocalPort:            nullablePort(item.LocalPort),
+			BytesTotal:           item.BytesTotal,
+			FlowCount:            item.FlowCount,
+			EvidenceCount:        item.EvidenceCount,
+			Evidence:             item.Evidence,
+			EvidenceSource:       item.EvidenceSource,
+			SampleFingerprint:    item.SampleFingerprint,
+			SampleMessage:        item.SampleMessage,
+			SampleTime:           item.SampleTime,
+			Confidence:           item.Confidence,
+		})
+	}
+	return result
+}
+
+func mergeExplainChains(existing []usageExplainChain, incoming []usageExplainChain, maxCount int) []usageExplainChain {
+	if len(existing) == 0 && len(incoming) == 0 {
+		return nil
+	}
+	order := make([]string, 0, len(existing)+len(incoming))
+	merged := make(map[string]usageExplainChain, len(existing)+len(incoming))
+	appendChain := func(chain usageExplainChain) {
+		key := explainChainIdentity(chain)
+		if _, ok := merged[key]; !ok {
+			order = append(order, key)
+			merged[key] = chain
+			return
+		}
+		merged[key] = mergeExplainChainPair(merged[key], chain)
+	}
+	for _, chain := range existing {
+		appendChain(chain)
+	}
+	for _, chain := range incoming {
+		appendChain(chain)
+	}
+	result := make([]usageExplainChain, 0, len(merged))
+	for _, key := range order {
+		result = append(result, merged[key])
+	}
+	sortExplainChains(result)
+	if maxCount > 0 && len(result) > maxCount {
+		return result[:maxCount]
+	}
+	return result
+}
+
+func (s *Server) loadPersistedChains(ctx context.Context, bucketTS int64, query usageExplainQuery) ([]usageExplainChain, error) {
+	pidFilter, hasIdentity := explainChainPIDFilter(query.PID)
+	if strings.TrimSpace(query.Comm) != "" || strings.TrimSpace(query.Exe) != "" {
+		hasIdentity = true
+	}
+	if !hasIdentity {
+		return nil, nil
+	}
+
+	type chainLookup struct {
+		bucket int64
+		source string
+		label  string
+	}
+	hourBucket := time.Unix(bucketTS, 0).UTC().Truncate(time.Hour).Unix()
+	lookups := []chainLookup{
+		{bucket: bucketTS, source: store.DataSourceMinuteChain, label: "分钟链路记录"},
+		{bucket: hourBucket, source: store.DataSourceHourChain, label: "小时链路记录"},
+	}
+	if query.DataSource == store.DataSourceHour {
+		lookups[0], lookups[1] = lookups[1], lookups[0]
+	}
+
+	var (
+		rows        []model.UsageChainRecord
+		sourceLabel string
+		err         error
+	)
+	for _, lookup := range lookups {
+		rows, err = s.store.QueryUsageChainsForProcess(ctx, lookup.bucket, pidFilter, query.Comm, query.Exe, lookup.source)
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) > 0 {
+			sourceLabel = lookup.label
+			break
+		}
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	relevant := make([]model.UsageChainRecord, 0, len(rows))
+	for _, row := range rows {
+		if chainRecordMatchesExplain(row, query) {
+			relevant = append(relevant, row)
+		}
+	}
+	if len(relevant) == 0 {
+		return nil, nil
+	}
+
+	chains := make([]usageExplainChain, 0, len(relevant))
+	for _, row := range relevant {
+		chain := usageExplainChainFromRecord(row, sourceLabel)
+		if !shouldPersistCanonicalChain(chain) {
+			continue
+		}
+		chains = append(chains, chain)
+	}
+	if len(chains) == 0 {
+		return nil, nil
+	}
+	return chains, nil
+}
+
+func explainChainIdentity(chain usageExplainChain) string {
+	targetHost := ""
+	if strings.TrimSpace(chain.TargetIP) == "" {
+		targetHost = strings.TrimSpace(chain.TargetHostNormalized)
+		if targetHost == "" {
+			targetHost = evidence.NormalizeHost(strings.TrimSpace(chain.TargetHost))
+		}
+	}
+	return fmt.Sprintf(
+		"%s|%s|%s|%d|%d",
+		strings.TrimSpace(chain.SourceIP),
+		strings.TrimSpace(chain.TargetIP),
+		targetHost,
+		nullablePortValue(chain.TargetPort),
+		nullablePortValue(chain.LocalPort),
+	)
+}
+
+func explainConfidenceRank(value string) int {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "high":
+		return 3
+	case "medium":
+		return 2
+	default:
+		return 1
+	}
+}
+
+func explainChainCompleteness(chain usageExplainChain) int {
+	score := 0
+	if strings.TrimSpace(chain.SourceIP) != "" {
+		score++
+	}
+	if strings.TrimSpace(chain.TargetIP) != "" {
+		score++
+	}
+	if strings.TrimSpace(chain.TargetHost) != "" || strings.TrimSpace(chain.TargetHostNormalized) != "" {
+		score++
+	}
+	if nullablePortValue(chain.TargetPort) > 0 {
+		score++
+	}
+	if nullablePortValue(chain.LocalPort) > 0 {
+		score++
+	}
+	if strings.TrimSpace(chain.SampleFingerprint) != "" {
+		score++
+	}
+	if strings.TrimSpace(chain.SampleMessage) != "" {
+		score++
+	}
+	return score
+}
+
+func preferExplainChain(left usageExplainChain, right usageExplainChain) bool {
+	leftRank := explainConfidenceRank(left.Confidence)
+	rightRank := explainConfidenceRank(right.Confidence)
+	if leftRank != rightRank {
+		return leftRank > rightRank
+	}
+	leftComplete := explainChainCompleteness(left)
+	rightComplete := explainChainCompleteness(right)
+	if leftComplete != rightComplete {
+		return leftComplete > rightComplete
+	}
+	if left.EvidenceCount != right.EvidenceCount {
+		return left.EvidenceCount > right.EvidenceCount
+	}
+	if left.FlowCount != right.FlowCount {
+		return left.FlowCount > right.FlowCount
+	}
+	if left.BytesTotal != right.BytesTotal {
+		return left.BytesTotal > right.BytesTotal
+	}
+	if left.SampleTime != right.SampleTime {
+		return left.SampleTime > right.SampleTime
+	}
+	return strings.TrimSpace(left.ChainID) <= strings.TrimSpace(right.ChainID)
+}
+
+func mergeExplainChainPair(current usageExplainChain, incoming usageExplainChain) usageExplainChain {
+	primary := current
+	secondary := incoming
+	if !preferExplainChain(primary, secondary) {
+		primary, secondary = secondary, primary
+	}
+
+	if strings.TrimSpace(primary.ChainID) == "" {
+		primary.ChainID = strings.TrimSpace(secondary.ChainID)
+	}
+	if strings.TrimSpace(primary.SourceIP) == "" {
+		primary.SourceIP = strings.TrimSpace(secondary.SourceIP)
+	}
+	if strings.TrimSpace(primary.TargetIP) == "" {
+		primary.TargetIP = strings.TrimSpace(secondary.TargetIP)
+	}
+	if strings.TrimSpace(primary.TargetHost) == "" {
+		primary.TargetHost = strings.TrimSpace(secondary.TargetHost)
+	}
+	if strings.TrimSpace(primary.TargetHostNormalized) == "" {
+		primary.TargetHostNormalized = fallbackText(strings.TrimSpace(secondary.TargetHostNormalized), evidence.NormalizeHost(primary.TargetHost))
+	}
+	if primary.TargetPort == nil && secondary.TargetPort != nil {
+		primary.TargetPort = secondary.TargetPort
+	}
+	if primary.LocalPort == nil && secondary.LocalPort != nil {
+		primary.LocalPort = secondary.LocalPort
+	}
+	if primary.BytesTotal < secondary.BytesTotal {
+		primary.BytesTotal = secondary.BytesTotal
+	}
+	if primary.FlowCount < secondary.FlowCount {
+		primary.FlowCount = secondary.FlowCount
+	}
+	if primary.EvidenceCount < secondary.EvidenceCount {
+		primary.EvidenceCount = secondary.EvidenceCount
+	}
+	if strings.TrimSpace(primary.Evidence) == "" {
+		primary.Evidence = strings.TrimSpace(secondary.Evidence)
+	}
+	if strings.TrimSpace(primary.EvidenceSource) == "" {
+		primary.EvidenceSource = strings.TrimSpace(secondary.EvidenceSource)
+	}
+	if explainConfidenceRank(secondary.Confidence) > explainConfidenceRank(primary.Confidence) {
+		primary.Confidence = secondary.Confidence
+	}
+	if secondary.SampleTime > primary.SampleTime {
+		primary.SampleTime = secondary.SampleTime
+		if strings.TrimSpace(secondary.SampleFingerprint) != "" {
+			primary.SampleFingerprint = strings.TrimSpace(secondary.SampleFingerprint)
+		}
+		if strings.TrimSpace(secondary.SampleMessage) != "" {
+			primary.SampleMessage = strings.TrimSpace(secondary.SampleMessage)
+		}
+	} else {
+		if strings.TrimSpace(primary.SampleFingerprint) == "" {
+			primary.SampleFingerprint = strings.TrimSpace(secondary.SampleFingerprint)
+		}
+		if strings.TrimSpace(primary.SampleMessage) == "" {
+			primary.SampleMessage = strings.TrimSpace(secondary.SampleMessage)
+		}
+	}
+	return primary
+}
+
+func sortExplainChains(chains []usageExplainChain) {
+	sort.Slice(chains, func(i, j int) bool {
+		if chains[i].FlowCount == chains[j].FlowCount {
+			if chains[i].EvidenceCount == chains[j].EvidenceCount {
+				if chains[i].BytesTotal == chains[j].BytesTotal {
+					return explainChainIdentity(chains[i]) < explainChainIdentity(chains[j])
+				}
+				return chains[i].BytesTotal > chains[j].BytesTotal
+			}
+			return chains[i].EvidenceCount > chains[j].EvidenceCount
+		}
+		return chains[i].FlowCount > chains[j].FlowCount
+	})
+}
+
+func explainChainPIDFilter(pid *int) (*int, bool) {
+	if pid == nil || *pid <= 0 {
+		return nil, false
+	}
+	result := *pid
+	return &result, true
+}
+
+func chainRecordMatchesExplain(record model.UsageChainRecord, query usageExplainQuery) bool {
+	switch query.Direction {
+	case model.DirectionIn:
+		if query.RemoteIP != "" {
+			if !sameIP(record.SourceIP, query.RemoteIP) {
+				return false
+			}
+			if query.LocalPort != nil && record.EntryPort != nil && *record.EntryPort != *query.LocalPort {
+				return false
+			}
+			return true
+		}
+		return record.EntryPort != nil && query.LocalPort != nil && *record.EntryPort == *query.LocalPort
+	case model.DirectionOut:
+		if query.RemoteIP == "" {
+			return false
+		}
+		if !sameIP(record.TargetIP, query.RemoteIP) {
+			return false
+		}
+		if query.RemotePort != nil && record.TargetPort != nil && *record.TargetPort != *query.RemotePort {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func usageExplainChainFromRecord(record model.UsageChainRecord, evidenceLabel string) usageExplainChain {
+	evidenceSource := strings.TrimSpace(record.EvidenceSource)
+	return usageExplainChain{
+		ChainID:              record.ChainID,
+		SourceIP:             strings.TrimSpace(record.SourceIP),
+		TargetIP:             strings.TrimSpace(record.TargetIP),
+		TargetHost:           strings.TrimSpace(record.TargetHost),
+		TargetHostNormalized: strings.TrimSpace(record.TargetHostNormalized),
+		TargetPort:           record.TargetPort,
+		LocalPort:            record.EntryPort,
+		BytesTotal:           record.BytesTotal,
+		FlowCount:            record.FlowCount,
+		EvidenceCount:        record.EvidenceCount,
+		Evidence:             fallbackText(strings.TrimSpace(evidenceLabel), evidenceSource),
+		EvidenceSource:       evidenceSource,
+		SampleFingerprint:    strings.TrimSpace(record.SampleFingerprint),
+		SampleMessage:        strings.TrimSpace(record.SampleMessage),
+		SampleTime:           record.SampleTime,
+		Confidence:           record.Confidence,
+	}
+}
+
+func assignCanonicalChainIDs(bucketTS int64, query usageExplainQuery, chains []usageExplainChain) []usageExplainChain {
+	if len(chains) == 0 {
+		return nil
+	}
+	exe := strings.TrimSpace(query.Exe)
+	var exePtr *string
+	if exe != "" {
+		exePtr = &exe
+	}
+
+	result := make([]usageExplainChain, 0, len(chains))
+	for _, chain := range chains {
+		if strings.TrimSpace(chain.ChainID) == "" {
+			record := model.UsageChainRecord{
+				TimeBucket: bucketTS,
+				PID:        query.PID,
+				Comm:       strings.TrimSpace(query.Comm),
+				Exe:        exePtr,
+				SourceIP:   strings.TrimSpace(chain.SourceIP),
+				EntryPort:  chain.LocalPort,
+				TargetIP:   strings.TrimSpace(chain.TargetIP),
+				TargetHost: strings.TrimSpace(chain.TargetHost),
+				TargetPort: chain.TargetPort,
+				Confidence: chain.Confidence,
+			}
+			chain.ChainID = store.BuildUsageChainID(bucketTS, store.DataSourceMinuteChain, record)
+		}
+		result = append(result, chain)
+	}
+	return result
+}
+
+func (s *Server) persistCanonicalChains(ctx context.Context, bucketTS int64, query usageExplainQuery, chains []usageExplainChain) error {
+	if len(chains) == 0 {
+		return nil
+	}
+
+	exe := strings.TrimSpace(query.Exe)
+	var exePtr *string
+	if exe != "" {
+		exePtr = &exe
+	}
+
+	records := make([]model.UsageChainRecord, 0, len(chains))
+	for _, chain := range chains {
+		if strings.HasPrefix(strings.TrimSpace(chain.ChainID), store.DataSourceHourChain+"|") {
+			continue
+		}
+		if !shouldPersistCanonicalChain(chain) {
+			continue
+		}
+		records = append(records, model.UsageChainRecord{
+			ChainID:           chain.ChainID,
+			TimeBucket:        bucketTS,
+			PID:               query.PID,
+			Comm:              strings.TrimSpace(query.Comm),
+			Exe:               exePtr,
+			SourceIP:          strings.TrimSpace(chain.SourceIP),
+			EntryPort:         chain.LocalPort,
+			TargetIP:          strings.TrimSpace(chain.TargetIP),
+			TargetHost:        strings.TrimSpace(chain.TargetHost),
+			TargetPort:        chain.TargetPort,
+			BytesTotal:        chain.BytesTotal,
+			FlowCount:         chain.FlowCount,
+			EvidenceCount:     chain.EvidenceCount,
+			EvidenceSource:    fallbackText(strings.TrimSpace(chain.EvidenceSource), strings.TrimSpace(chain.Evidence)),
+			Confidence:        chain.Confidence,
+			SampleFingerprint: chain.SampleFingerprint,
+			SampleMessage:     chain.SampleMessage,
+			SampleTime:        chain.SampleTime,
+		})
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	return s.store.UpsertUsageChains(ctx, records)
+}
+
+func shouldPersistCanonicalChain(chain usageExplainChain) bool {
+	if explainConfidenceRank(chain.Confidence) < 2 {
+		return false
+	}
+	if nullablePortValue(chain.LocalPort) <= 0 {
+		return false
+	}
+	if chain.BytesTotal <= 0 && chain.FlowCount <= 0 {
+		return false
+	}
+	hasTargetDescriptor := strings.TrimSpace(chain.TargetIP) != "" ||
+		strings.TrimSpace(chain.TargetHostNormalized) != "" ||
+		strings.TrimSpace(chain.TargetHost) != ""
+	if !hasTargetDescriptor {
+		return false
+	}
+	// Keep persisted chains replayable. Host-only candidates without a resolved
+	// target IP can still be shown during live analysis, but once detached from
+	// the original minute window they become too ambiguous to reuse safely.
+	return strings.TrimSpace(chain.TargetIP) != ""
+}
+
+func queryLocalPort(query usageExplainQuery) int {
+	if query.LocalPort == nil {
+		return 0
+	}
+	return *query.LocalPort
+}
+
 func nullablePort(port int) *int {
 	if port <= 0 {
 		return nil
@@ -1660,6 +2678,9 @@ func inferConfidence(response usageExplainResponse) string {
 	if len(response.NginxRequests) > 0 {
 		return "high"
 	}
+	if len(response.Chains) > 0 {
+		return "high"
+	}
 	if len(response.SourceIPs) > 0 && len(response.TargetIPs) > 0 {
 		return "high"
 	}
@@ -1669,14 +2690,121 @@ func inferConfidence(response usageExplainResponse) string {
 	return "low"
 }
 
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func minInt64(left, right int64) int64 {
+	if left < right {
+		return left
+	}
+	return right
+}
+
 func isShadowsocksProcess(comm, exe string) bool {
 	text := strings.ToLower(comm + " " + exe)
-	return strings.Contains(text, "ss-") || strings.Contains(text, "shadowsocks")
+	return strings.Contains(text, "ss-") || strings.Contains(text, "shadowsocks") || strings.Contains(text, "obfs")
+}
+
+func processIdentityKey(comm, exe string) string {
+	if normalizedComm := strings.ToLower(strings.TrimSpace(comm)); normalizedComm != "" {
+		return normalizedComm
+	}
+	if normalizedExe := strings.ToLower(strings.TrimSpace(executableName(exe))); normalizedExe != "" {
+		return normalizedExe
+	}
+	return ""
+}
+
+func processLookupKeys(comm, exe string) []string {
+	keys := make([]string, 0, 4)
+	seen := make(map[string]struct{}, 4)
+	appendKey := func(value string) {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" {
+			return
+		}
+		if _, ok := seen[normalized]; ok {
+			return
+		}
+		seen[normalized] = struct{}{}
+		keys = append(keys, normalized)
+	}
+
+	appendKey(comm)
+	exeValue := strings.TrimSpace(exe)
+	appendKey(exeValue)
+	if exeValue != "" {
+		normalizedPath := strings.ReplaceAll(exeValue, "\\", "/")
+		appendKey(normalizedPath)
+		appendKey(filepath.Base(normalizedPath))
+	}
+	return keys
+}
+
+func shadowsocksFamilyLookupKeys() []string {
+	return []string{
+		"ss-server",
+		"ss-manager",
+		"obfs-server",
+		"obfs-local",
+		"simple-obfs",
+	}
+}
+
+func (s *Server) lookupConfiguredProcessLogDir(comm, exe string) (string, string, bool) {
+	if len(s.processLogDirs) == 0 {
+		return "", "", false
+	}
+	for _, key := range processLookupKeys(comm, exe) {
+		if dir, ok := s.processLogDirs[key]; ok && strings.TrimSpace(dir) != "" {
+			return key, dir, true
+		}
+	}
+	if isShadowsocksProcess(comm, exe) {
+		for _, key := range shadowsocksFamilyLookupKeys() {
+			if dir, ok := s.processLogDirs[key]; ok && strings.TrimSpace(dir) != "" {
+				return key, dir, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func (s *Server) lookupConfiguredProcessLogDirs(comm, exe string) []string {
+	if len(s.processLogDirs) == 0 {
+		return nil
+	}
+	keys := processLookupKeys(comm, exe)
+	if isShadowsocksProcess(comm, exe) {
+		keys = append(keys, shadowsocksFamilyLookupKeys()...)
+	}
+	result := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		dir, ok := s.processLogDirs[key]
+		if !ok {
+			continue
+		}
+		normalizedDir := strings.TrimSpace(dir)
+		if normalizedDir == "" {
+			continue
+		}
+		if _, ok := seen[normalizedDir]; ok {
+			continue
+		}
+		seen[normalizedDir] = struct{}{}
+		result = append(result, normalizedDir)
+	}
+	return result
 }
 
 func isNginxProcess(comm, exe string) bool {
 	text := strings.ToLower(comm + " " + exe)
-	return strings.Contains(text, "nginx") || strings.Contains(text, "openresty") || strings.Contains(text, "apache") || strings.Contains(text, "caddy")
+	return strings.Contains(text, "nginx")
 }
 
 func extractHostAndPath(target string) (string, string) {
@@ -1703,11 +2831,7 @@ func extractHostAndPath(target string) (string, string) {
 }
 
 func resolvedLogDir(value string, fallback string) string {
-	resolved := strings.TrimSpace(value)
-	if resolved == "" {
-		return fallback
-	}
-	return resolved
+	return evidence.ResolvedLogDir(value, fallback)
 }
 
 func appendNoteUnique(notes *[]string, text string) {
@@ -1721,6 +2845,93 @@ func appendNoteUnique(notes *[]string, text string) {
 		}
 	}
 	*notes = append(*notes, trimmed)
+}
+
+func appendUniqueString(items *[]string, value string) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return
+	}
+	for _, existing := range *items {
+		if existing == trimmed {
+			return
+		}
+	}
+	*items = append(*items, trimmed)
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func uniquePositiveInts(values []int) []int {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]int, 0, len(values))
+	seen := make(map[int]struct{}, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func appendDedupEvidenceRows(existing []model.LogEvidence, incoming []model.LogEvidence) []model.LogEvidence {
+	if len(incoming) == 0 {
+		return existing
+	}
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	for _, row := range existing {
+		if row.Fingerprint == "" {
+			continue
+		}
+		seen[row.Fingerprint] = struct{}{}
+	}
+	for _, row := range incoming {
+		if row.Fingerprint != "" {
+			if _, ok := seen[row.Fingerprint]; ok {
+				continue
+			}
+			seen[row.Fingerprint] = struct{}{}
+		}
+		existing = append(existing, row)
+	}
+	return existing
+}
+
+func formatResolvedLogDirs(logDirs []string) string {
+	uniqueDirs := uniqueNonEmptyStrings(logDirs)
+	if len(uniqueDirs) == 0 {
+		return ""
+	}
+	resolved := make([]string, 0, len(uniqueDirs))
+	for _, logDir := range uniqueDirs {
+		resolved = append(resolved, resolvedLogDir(logDir, ""))
+	}
+	return strings.Join(resolved, "，")
 }
 
 func mergeTopIPs(existing []string, incoming []string, maxCount int) []string {
@@ -1748,6 +2959,29 @@ func mergeTopIPs(existing []string, incoming []string, maxCount int) []string {
 	}
 	if maxCount > 0 && len(result) > maxCount {
 		return result[:maxCount]
+	}
+	return result
+}
+
+func chainIPs(chains []usageExplainChain, source bool) []string {
+	if len(chains) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(chains))
+	seen := make(map[string]struct{}, len(chains))
+	for _, chain := range chains {
+		ip := chain.TargetIP
+		if source {
+			ip = chain.SourceIP
+		}
+		if ip == "" {
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		result = append(result, ip)
 	}
 	return result
 }
@@ -1935,17 +3169,32 @@ func sameIP(left string, right string) bool {
 	return leftIP.Equal(rightIP)
 }
 
+func messageHasExactIP(message string, targetIP string) bool {
+	if strings.TrimSpace(message) == "" || strings.TrimSpace(targetIP) == "" {
+		return false
+	}
+	for _, candidate := range extractIPs(message) {
+		if sameIP(candidate, targetIP) {
+			return true
+		}
+	}
+
+	for _, token := range strings.Fields(message) {
+		candidate := token
+		if idx := strings.Index(candidate, "="); idx >= 0 && idx < len(candidate)-1 {
+			candidate = candidate[idx+1:]
+		}
+		if normalized := normalizeIP(strings.Trim(candidate, "[]()\"';,")); normalized != "" && sameIP(normalized, targetIP) {
+			return true
+		}
+	}
+	return false
+}
+
 func isLoopbackIP(value string) bool {
 	ip := net.ParseIP(strings.TrimSpace(value))
 	if ip == nil {
 		return false
 	}
 	return ip.IsLoopback()
-}
-
-func absInt64(value int64) int64 {
-	if value < 0 {
-		return -value
-	}
-	return value
 }

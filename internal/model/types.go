@@ -66,7 +66,11 @@ type FlowSnapshot struct {
 	BaselineRPkts uint64
 	LastOPkts     uint64
 	LastRPkts     uint64
-	LastSeen      time.Time
+	// Counted records whether this conntrack flow has already contributed its
+	// one-time flow_count increment. Byte/packet deltas can keep accruing after
+	// that, but the flow itself should only be counted once.
+	Counted  bool
+	LastSeen time.Time
 }
 
 type UsageKey struct {
@@ -193,16 +197,42 @@ type ActiveStats struct {
 }
 
 type LogEvidence struct {
-	Source      string
-	EventTS     int64
-	ClientIP    string
-	TargetIP    string
-	Host        string
-	Path        string
-	Method      string
-	Status      *int
-	Message     string
-	Fingerprint string
+	Source         string
+	EventTS        int64
+	ClientIP       string
+	TargetIP       string
+	Host           string
+	HostNormalized string
+	Path           string
+	Method         string
+	EntryPort      int
+	TargetPort     int
+	Status         *int
+	Message        string
+	Fingerprint    string
+}
+
+type UsageChainRecord struct {
+	ChainID              string  `json:"chain_id"`
+	TimeBucket           int64   `json:"time_bucket"`
+	PID                  *int    `json:"pid"`
+	Comm                 string  `json:"comm"`
+	Exe                  *string `json:"exe"`
+	SourceIP             string  `json:"source_ip"`
+	EntryPort            *int    `json:"entry_port"`
+	TargetIP             string  `json:"target_ip"`
+	TargetHost           string  `json:"target_host"`
+	TargetHostNormalized string  `json:"target_host_normalized"`
+	TargetPort           *int    `json:"target_port"`
+	BytesTotal           int64   `json:"bytes_total"`
+	FlowCount            int64   `json:"flow_count"`
+	EvidenceCount        int     `json:"evidence_count"`
+	EvidenceSource       string  `json:"evidence_source"`
+	Confidence           string  `json:"confidence"`
+	SampleFingerprint    string  `json:"sample_fingerprint"`
+	SampleMessage        string  `json:"sample_message"`
+	SampleTime           int64   `json:"sample_time"`
+	DataSource           string  `json:"data_source"`
 }
 
 type UsageQuery struct {

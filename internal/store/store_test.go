@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,7 +86,7 @@ func TestFlushAndAggregate(t *testing.T) {
 	}
 
 	hourStart := time.Unix(minute, 0).Truncate(time.Hour)
-	top, totalRows, err := store.QueryTopProcesses(ctx, hourStart, hourStart.Add(time.Hour), DataSourceHour, "total", "desc", 10, 0)
+	top, totalRows, err := store.QueryTopProcesses(ctx, hourStart, hourStart.Add(time.Hour), DataSourceHour, "comm", "total", "desc", 10, 0)
 	if err != nil {
 		t.Fatalf("query top: %v", err)
 	}
@@ -156,7 +157,10 @@ func TestResolveUsageSourceUsesConfiguredRetention(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	start := time.Unix(0, 0)
+	now := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	start := now.Add(-45 * 24 * time.Hour)
 	end := start.Add(45 * 24 * time.Hour)
 
 	source, err := store.ResolveUsageSource(start, end, false, false)
@@ -165,6 +169,27 @@ func TestResolveUsageSourceUsesConfiguredRetention(t *testing.T) {
 	}
 	if source != DataSourceMinute {
 		t.Fatalf("expected minute source, got %s", source)
+	}
+}
+
+func TestResolveUsageSourceFallsBackForOldAbsoluteWindow(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	start := now.Add(-31 * 24 * time.Hour)
+	end := start.Add(30 * time.Minute)
+
+	source, err := store.ResolveUsageSource(start, end, false, false)
+	if err != nil {
+		t.Fatalf("resolve source: %v", err)
+	}
+	if source != DataSourceHour {
+		t.Fatalf("expected old window to use hour source, got %s", source)
+	}
+
+	if _, err := store.ResolveUsageSource(start, end, true, false); err != ErrDimensionUnavailable {
+		t.Fatalf("expected minute-only dimensions to be unavailable, got %v", err)
 	}
 }
 
@@ -344,6 +369,269 @@ CREATE TABLE flows_snapshot (
 	}
 }
 
+func TestMigrateLegacyLogEvidenceAddsHostPortColumnsAndIndex(t *testing.T) {
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
+
+	db, err := sql.Open("sqlite", cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE log_evidence (
+    source TEXT NOT NULL,
+    event_ts INTEGER NOT NULL,
+    client_ip TEXT NOT NULL,
+    target_ip TEXT NOT NULL,
+    host TEXT NOT NULL,
+    path TEXT NOT NULL,
+    method TEXT NOT NULL,
+    status INTEGER,
+    message TEXT NOT NULL,
+    fingerprint TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_lookup ON log_evidence (source, event_ts, client_ip, target_ip);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_created_at ON log_evidence (created_at);
+`)
+	if err != nil {
+		t.Fatalf("create legacy log_evidence table: %v", err)
+	}
+	_ = db.Close()
+
+	store, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	hasHostNormalized, err := store.tableHasColumn(context.Background(), "log_evidence", "host_normalized")
+	if err != nil {
+		t.Fatalf("check host_normalized column: %v", err)
+	}
+	if !hasHostNormalized {
+		t.Fatalf("expected host_normalized column to be added")
+	}
+
+	hasEntryPort, err := store.tableHasColumn(context.Background(), "log_evidence", "entry_port")
+	if err != nil {
+		t.Fatalf("check entry_port column: %v", err)
+	}
+	if !hasEntryPort {
+		t.Fatalf("expected entry_port column to be added")
+	}
+
+	hasTargetPort, err := store.tableHasColumn(context.Background(), "log_evidence", "target_port")
+	if err != nil {
+		t.Fatalf("check target_port column: %v", err)
+	}
+	if !hasTargetPort {
+		t.Fatalf("expected target_port column to be added")
+	}
+
+	row := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_log_evidence_host_port'`)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("count host/port index: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected idx_log_evidence_host_port to exist, found %d", count)
+	}
+}
+
+func TestUsageChainsUpsertAggregateAndCleanup(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 1, 8, 0, 0, time.UTC)
+	pid := 1088
+	exe := "/usr/bin/ss-server"
+	entryPort := 12096
+	targetPort := 443
+
+	if err := store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        minute.Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "159.226.171.34",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "www.google.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        4096,
+			FlowCount:         3,
+			EvidenceCount:     2,
+			EvidenceSource:    "ss-log",
+			Confidence:        "medium",
+			SampleFingerprint: "chain-fp-1",
+			SampleMessage:     "sample",
+			SampleTime:        minute.Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert usage chains: %v", err)
+	}
+
+	rows, err := store.QueryUsageChainsForProcess(ctx, minute.Unix(), &pid, "ss-server", exe, DataSourceMinuteChain)
+	if err != nil {
+		t.Fatalf("query minute chains: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 minute chain row, got %+v", rows)
+	}
+	if rows[0].TargetHostNormalized != "www.google.com" || rows[0].ChainID == "" {
+		t.Fatalf("unexpected minute chain row: %+v", rows[0])
+	}
+
+	if err := store.AggregateHour(ctx, minute); err != nil {
+		t.Fatalf("aggregate hour: %v", err)
+	}
+	hourRows, err := store.QueryUsageChainsForProcess(ctx, minute.Truncate(time.Hour).Unix(), &pid, "ss-server", exe, DataSourceHourChain)
+	if err != nil {
+		t.Fatalf("query hour chains: %v", err)
+	}
+	if len(hourRows) != 1 {
+		t.Fatalf("expected 1 hour chain row, got %+v", hourRows)
+	}
+	if hourRows[0].BytesTotal != 4096 || hourRows[0].FlowCount != 3 {
+		t.Fatalf("unexpected hour chain aggregate: %+v", hourRows[0])
+	}
+	if !strings.HasPrefix(hourRows[0].ChainID, DataSourceHourChain+"|") {
+		t.Fatalf("expected hourly chain id prefix, got %+v", hourRows[0])
+	}
+
+	store.retention.MinuteDays = 1
+	store.retention.HourlyDays = 1
+	store.now = func() time.Time { return minute.Add(72 * time.Hour) }
+	if err := store.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	row := store.db.QueryRow(`SELECT COUNT(*) FROM usage_chain_1m`)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("count minute chains after cleanup: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected minute chains to be cleaned up, found %d", count)
+	}
+}
+
+func TestAggregateHourKeepsUsageChainSampleFieldsFromLatestMinuteRow(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 1, 0, 0, 0, time.UTC)
+	pid := 1088
+	exe := "/usr/bin/ss-server"
+	entryPort := 12096
+	targetPort := 443
+
+	if err := store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        minute.Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "chatgpt.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        1024,
+			FlowCount:         1,
+			EvidenceCount:     1,
+			EvidenceSource:    "older-log",
+			Confidence:        "medium",
+			SampleFingerprint: "zz-older",
+			SampleMessage:     "older-message",
+			SampleTime:        minute.Unix(),
+		},
+		{
+			TimeBucket:        minute.Add(10 * time.Minute).Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "chatgpt.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        2048,
+			FlowCount:         2,
+			EvidenceCount:     1,
+			EvidenceSource:    "newer-log",
+			Confidence:        "high",
+			SampleFingerprint: "aa-newer",
+			SampleMessage:     "newer-message",
+			SampleTime:        minute.Add(10 * time.Minute).Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert chain rows: %v", err)
+	}
+
+	if err := store.AggregateHour(ctx, minute); err != nil {
+		t.Fatalf("aggregate hour: %v", err)
+	}
+
+	rows, err := store.QueryUsageChainsForProcess(ctx, minute.Truncate(time.Hour).Unix(), &pid, "ss-server", exe, DataSourceHourChain)
+	if err != nil {
+		t.Fatalf("query aggregated chains: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected one aggregated chain row, got %+v", rows)
+	}
+	if rows[0].SampleTime != minute.Add(10*time.Minute).Unix() {
+		t.Fatalf("expected latest sample time to win, got %+v", rows[0])
+	}
+	if rows[0].SampleFingerprint != "aa-newer" || rows[0].SampleMessage != "newer-message" || rows[0].EvidenceSource != "newer-log" {
+		t.Fatalf("expected sample fields from latest minute row, got %+v", rows[0])
+	}
+}
+
+func TestQueryUsageChainsSupportsExeBasenameFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 1, 8, 0, 0, time.UTC)
+	pid := 1088
+	exe := "/usr/local/bin/ss-server"
+	entryPort := 12096
+	targetPort := 443
+
+	if err := store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        minute.Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "chatgpt.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        4096,
+			FlowCount:         3,
+			EvidenceCount:     2,
+			EvidenceSource:    "ss-log",
+			Confidence:        "high",
+			SampleFingerprint: "chain-fp-1",
+			SampleMessage:     "sample",
+			SampleTime:        minute.Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert usage chains: %v", err)
+	}
+
+	rows, err := store.QueryUsageChainsForProcess(ctx, minute.Unix(), &pid, "ss-server", "ss-server", DataSourceMinuteChain)
+	if err != nil {
+		t.Fatalf("query minute chains by basename exe: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected basename exe filter to match chain row, got %+v", rows)
+	}
+}
+
 func TestQueryTopRemotesExcludesLoopbackByDefault(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -466,6 +754,7 @@ func TestQueryTopProcessesSeparatesPidAndEmptyComm(t *testing.T) {
 		time.Unix(minute, 0).Add(-time.Minute),
 		time.Unix(minute, 0).Add(time.Minute),
 		DataSourceMinute,
+		"pid",
 		"total",
 		"desc",
 		10,
@@ -650,6 +939,140 @@ func TestQueryLogEvidenceSupportsAnyIP(t *testing.T) {
 	}
 }
 
+func TestQueryLogEvidenceAnyIPDoesNotDuplicateRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	rows := []model.LogEvidence{
+		{
+			Source:      "ss",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 20, 0, time.UTC).Unix(),
+			ClientIP:    "203.0.113.10",
+			TargetIP:    "203.0.113.10",
+			Host:        "example.com",
+			Path:        "443",
+			Method:      "connect",
+			Message:     "self ip",
+			Fingerprint: "fp-any-dup-1",
+		},
+	}
+	if err := store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert evidence: %v", err)
+	}
+
+	fetched, err := store.QueryLogEvidence(ctx, LogEvidenceQuery{
+		Source:  "ss",
+		StartTS: time.Date(2026, 4, 16, 0, 59, 0, 0, time.UTC).Unix(),
+		EndTS:   time.Date(2026, 4, 16, 1, 2, 0, 0, time.UTC).Unix(),
+		AnyIP:   "203.0.113.10",
+		Limit:   50,
+	})
+	if err != nil {
+		t.Fatalf("query any ip evidence: %v", err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("expected one deduped evidence row, got %d", len(fetched))
+	}
+}
+
+func TestQueryLogEvidenceAnyIPRespectsHostPortFilters(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	rows := []model.LogEvidence{
+		{
+			Source:      "ss",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 20, 0, time.UTC).Unix(),
+			ClientIP:    "203.0.113.10",
+			TargetIP:    "142.250.72.14",
+			Host:        "chatgpt.com",
+			Path:        "443",
+			Method:      "connect",
+			Message:     "match",
+			Fingerprint: "fp-any-host-port-match",
+		},
+		{
+			Source:      "ss",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 30, 0, time.UTC).Unix(),
+			ClientIP:    "203.0.113.10",
+			TargetIP:    "1.1.1.1",
+			Host:        "one.one.one.one",
+			Path:        "443",
+			Method:      "connect",
+			Message:     "mismatch host",
+			Fingerprint: "fp-any-host-port-mismatch",
+		},
+	}
+	if err := store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert evidence: %v", err)
+	}
+
+	fetched, err := store.QueryLogEvidence(ctx, LogEvidenceQuery{
+		Source:         "ss",
+		StartTS:        time.Date(2026, 4, 16, 0, 59, 0, 0, time.UTC).Unix(),
+		EndTS:          time.Date(2026, 4, 16, 1, 2, 0, 0, time.UTC).Unix(),
+		AnyIP:          "203.0.113.10",
+		HostNormalized: "chatgpt.com",
+		TargetPort:     443,
+		Limit:          50,
+	})
+	if err != nil {
+		t.Fatalf("query any ip with host/port: %v", err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("expected one filtered evidence row, got %d", len(fetched))
+	}
+	if fetched[0].HostNormalized != "chatgpt.com" || fetched[0].TargetPort != 443 {
+		t.Fatalf("unexpected filtered row: %+v", fetched[0])
+	}
+}
+
+func TestQueryLogEvidenceRespectsEntryPort(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	rows := []model.LogEvidence{
+		{
+			Source:      "ss",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 20, 0, time.UTC).Unix(),
+			ClientIP:    "203.0.113.24",
+			EntryPort:   12096,
+			Method:      "accept",
+			Message:     "[12096] accepted connection from 203.0.113.24",
+			Fingerprint: "fp-entry-12096",
+		},
+		{
+			Source:      "ss",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 30, 0, time.UTC).Unix(),
+			ClientIP:    "198.51.100.77",
+			EntryPort:   12098,
+			Method:      "accept",
+			Message:     "[12098] accepted connection from 198.51.100.77",
+			Fingerprint: "fp-entry-12098",
+		},
+	}
+	if err := store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert evidence: %v", err)
+	}
+
+	fetched, err := store.QueryLogEvidence(ctx, LogEvidenceQuery{
+		Source:    "ss",
+		StartTS:   time.Date(2026, 4, 16, 0, 59, 0, 0, time.UTC).Unix(),
+		EndTS:     time.Date(2026, 4, 16, 1, 2, 0, 0, time.UTC).Unix(),
+		EntryPort: 12096,
+		Limit:     20,
+	})
+	if err != nil {
+		t.Fatalf("query entry-port evidence: %v", err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("expected one entry-port evidence row, got %d", len(fetched))
+	}
+	if fetched[0].EntryPort != 12096 || fetched[0].ClientIP != "203.0.113.24" {
+		t.Fatalf("unexpected entry-port evidence row: %+v", fetched[0])
+	}
+}
+
 func TestCleanupRemovesExpiredLogEvidence(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -714,5 +1137,45 @@ func TestCleanupRemovesExpiredLogEvidence(t *testing.T) {
 	}
 	if fetched[0].Fingerprint != "fp-clean-new" {
 		t.Fatalf("unexpected remaining evidence row: %+v", fetched[0])
+	}
+}
+
+func TestQueryLogEvidenceMatchesHostOnlyRowsByTargetPort(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	rows := []model.LogEvidence{
+		{
+			Source:      "ss",
+			EventTS:     time.Date(2026, 4, 16, 1, 0, 20, 0, time.UTC).Unix(),
+			ClientIP:    "",
+			TargetIP:    "",
+			Host:        "chatgpt.com",
+			Path:        "443",
+			Method:      "connect",
+			Message:     "connect to chatgpt.com:443",
+			Fingerprint: "fp-host-only-443",
+		},
+	}
+	if err := store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		t.Fatalf("upsert host-only evidence: %v", err)
+	}
+
+	fetched, err := store.QueryLogEvidence(ctx, LogEvidenceQuery{
+		Source:         "ss",
+		StartTS:        time.Date(2026, 4, 16, 0, 59, 0, 0, time.UTC).Unix(),
+		EndTS:          time.Date(2026, 4, 16, 1, 2, 0, 0, time.UTC).Unix(),
+		HostNormalized: "chatgpt.com",
+		TargetPort:     443,
+		Limit:          20,
+	})
+	if err != nil {
+		t.Fatalf("query host-only evidence: %v", err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("expected one host-only evidence row, got %d", len(fetched))
+	}
+	if fetched[0].TargetPort != 443 || fetched[0].HostNormalized != "chatgpt.com" {
+		t.Fatalf("unexpected normalized evidence row: %+v", fetched[0])
 	}
 }

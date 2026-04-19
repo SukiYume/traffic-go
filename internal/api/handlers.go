@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,12 +18,19 @@ import (
 
 type envelope map[string]any
 
+const processSuggestionLimit = 200
+
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, envelope{"ok": true})
 }
 
 func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
-	processes := s.runtime.ActiveProcesses()
+	processes, err := s.store.QueryKnownProcesses(r.Context(), processSuggestionLimit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		return
+	}
+	processes = mergeProcessListItems(s.runtime.ActiveProcesses(), processes)
 	writeJSON(w, http.StatusOK, envelope{"data": processes})
 }
 
@@ -112,6 +121,10 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			writeDimensionError(w, err)
 			return
 		}
+		if errors.Is(err, store.ErrCursorSortUnsupported) {
+			writeError(w, http.StatusBadRequest, "invalid_usage_query", err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
@@ -136,12 +149,17 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 		writeDimensionError(w, err)
 		return
 	}
-	page, pageSize := parsePageParams(r)
+	page, pageSize, err := parsePageParams(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err)
+		return
+	}
 	entries, totalRows, err := s.store.QueryTopProcesses(
 		r.Context(),
 		start,
 		end,
 		source,
+		r.URL.Query().Get("group_by"),
 		r.URL.Query().Get("sort_by"),
 		r.URL.Query().Get("sort_order"),
 		pageSize,
@@ -171,7 +189,11 @@ func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
 		writeDimensionError(w, err)
 		return
 	}
-	page, pageSize := parsePageParams(r)
+	page, pageSize, err := parsePageParams(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err)
+		return
+	}
 	includeLoopback := parseBoolFlag(r.URL.Query().Get("include_loopback"))
 	entries, totalRows, err := s.store.QueryTopRemotes(
 		r.Context(),
@@ -238,11 +260,15 @@ func (s *Server) handleForwardUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	records, nextCursor, totalRows, err := s.store.QueryForwardUsage(r.Context(), query, source)
 	if err != nil {
+		if errors.Is(err, store.ErrCursorSortUnsupported) {
+			writeError(w, http.StatusBadRequest, "invalid_forward_query", err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope{
-		"data_source": source,
+		"data_source": store.ForwardDataSource(source),
 		"data":        records,
 		"next_cursor": nextCursor,
 		"total_rows":  totalRows,
@@ -278,22 +304,10 @@ func writeDimensionError(w http.ResponseWriter, err error) {
 func parseWindow(r *http.Request) (time.Time, time.Time, string, error) {
 	query := r.URL.Query()
 	if startValue := query.Get("start"); startValue != "" {
-		start, err := parseTimeValue(startValue)
-		if err != nil {
-			return time.Time{}, time.Time{}, "", err
-		}
-		endValue := query.Get("end")
-		if endValue == "" {
-			return time.Time{}, time.Time{}, "", fmt.Errorf("end is required when start is provided")
-		}
-		end, err := parseTimeValue(endValue)
-		if err != nil {
-			return time.Time{}, time.Time{}, "", err
-		}
-		return start.UTC(), end.UTC(), fmt.Sprintf("%s..%s", startValue, endValue), nil
+		return parseExplicitWindow(query, startValue)
 	}
 
-	rangeLabel := query.Get("range")
+	rangeLabel := strings.TrimSpace(query.Get("range"))
 	if rangeLabel == "" {
 		rangeLabel = "24h"
 	}
@@ -303,11 +317,15 @@ func parseWindow(r *http.Request) (time.Time, time.Time, string, error) {
 	}
 	end := time.Now().UTC()
 	start := end.Add(-duration)
-	return start, end, rangeLabel, nil
+	return normalizeWindow(start, end, rangeLabel)
 }
 
 func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {
 	start, end, _, err := parseWindow(r)
+	if err != nil {
+		return model.UsageQuery{}, err
+	}
+	listParams, err := parseListQueryParams(r.URL.Query())
 	if err != nil {
 		return model.UsageQuery{}, err
 	}
@@ -320,12 +338,14 @@ func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {
 		Direction:   model.Direction(r.URL.Query().Get("direction")),
 		Proto:       r.URL.Query().Get("proto"),
 		Attribution: model.Attribution(r.URL.Query().Get("attribution")),
-		Limit:       parseIntWithDefault(r.URL.Query().Get("limit"), 200),
-		Page:        parseIntWithDefault(r.URL.Query().Get("page"), 1),
-		PageSize:    parseIntWithDefault(r.URL.Query().Get("page_size"), 50),
-		SortBy:      r.URL.Query().Get("sort_by"),
-		SortOrder:   r.URL.Query().Get("sort_order"),
-		UsePage:     r.URL.Query().Has("page") || r.URL.Query().Has("page_size"),
+		Limit:       listParams.Limit,
+		Page:        listParams.Page,
+		PageSize:    listParams.PageSize,
+		SortBy:      listParams.SortBy,
+		SortOrder:   listParams.SortOrder,
+		CursorTS:    listParams.CursorTS,
+		CursorRowID: listParams.CursorRowID,
+		UsePage:     listParams.UsePage,
 	}
 	if pidValue := r.URL.Query().Get("pid"); pidValue != "" {
 		pid, err := strconv.Atoi(pidValue)
@@ -341,13 +361,10 @@ func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {
 		}
 		query.LocalPort = &port
 	}
-	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
-		ts, rowID, err := store.DecodeCursor(cursor)
-		if err != nil {
-			return query, fmt.Errorf("invalid cursor: %w", err)
+	if !query.UsePage {
+		if err := validateCursorSort(query.SortBy, query.SortOrder); err != nil {
+			return query, err
 		}
-		query.CursorTS = ts
-		query.CursorRowID = rowID
 	}
 	return query, nil
 }
@@ -357,39 +374,72 @@ func parseForwardQuery(r *http.Request) (model.ForwardQuery, error) {
 	if err != nil {
 		return model.ForwardQuery{}, err
 	}
-	query := model.ForwardQuery{
-		Start:     start,
-		End:       end,
-		Proto:     r.URL.Query().Get("proto"),
-		OrigSrcIP: r.URL.Query().Get("orig_src_ip"),
-		OrigDstIP: r.URL.Query().Get("orig_dst_ip"),
-		Limit:     parseIntWithDefault(r.URL.Query().Get("limit"), 200),
-		Page:      parseIntWithDefault(r.URL.Query().Get("page"), 1),
-		PageSize:  parseIntWithDefault(r.URL.Query().Get("page_size"), 50),
-		SortBy:    r.URL.Query().Get("sort_by"),
-		SortOrder: r.URL.Query().Get("sort_order"),
-		UsePage:   r.URL.Query().Has("page") || r.URL.Query().Has("page_size"),
+	listParams, err := parseListQueryParams(r.URL.Query())
+	if err != nil {
+		return model.ForwardQuery{}, err
 	}
-	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
-		ts, rowID, err := store.DecodeCursor(cursor)
-		if err != nil {
-			return query, fmt.Errorf("invalid cursor: %w", err)
+	query := model.ForwardQuery{
+		Start:       start,
+		End:         end,
+		Proto:       r.URL.Query().Get("proto"),
+		OrigSrcIP:   r.URL.Query().Get("orig_src_ip"),
+		OrigDstIP:   r.URL.Query().Get("orig_dst_ip"),
+		Limit:       listParams.Limit,
+		Page:        listParams.Page,
+		PageSize:    listParams.PageSize,
+		SortBy:      listParams.SortBy,
+		SortOrder:   listParams.SortOrder,
+		CursorTS:    listParams.CursorTS,
+		CursorRowID: listParams.CursorRowID,
+		UsePage:     listParams.UsePage,
+	}
+	if !query.UsePage {
+		if err := validateCursorSort(query.SortBy, query.SortOrder); err != nil {
+			return query, err
 		}
-		query.CursorTS = ts
-		query.CursorRowID = rowID
 	}
 	return query, nil
 }
 
+func validateCursorSort(sortBy string, sortOrder string) error {
+	// Cursor tokens are derived from (time_bucket, rowid), so allowing arbitrary
+	// sort orders would make "next page" semantics unstable and non-repeatable.
+	normalizedSortBy := strings.TrimSpace(sortBy)
+	switch normalizedSortBy {
+	case "", "time", "minute_ts", "hour_ts":
+	default:
+		return store.ErrCursorSortUnsupported
+	}
+
+	normalizedSortOrder := strings.ToLower(strings.TrimSpace(sortOrder))
+	switch normalizedSortOrder {
+	case "", "desc":
+		return nil
+	default:
+		return store.ErrCursorSortUnsupported
+	}
+}
+
 func parseRange(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
 	if strings.HasSuffix(value, "d") {
 		days, err := strconv.Atoi(strings.TrimSuffix(value, "d"))
 		if err != nil {
 			return 0, err
 		}
+		if days <= 0 {
+			return 0, fmt.Errorf("range must be positive")
+		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
-	return time.ParseDuration(value)
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("range must be positive")
+	}
+	return duration, nil
 }
 
 func parseBucket(value string) time.Duration {
@@ -434,27 +484,100 @@ func parseTimeValue(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339, value)
 }
 
-func parseIntWithDefault(value string, fallback int) int {
+func parseExplicitWindow(query url.Values, startValue string) (time.Time, time.Time, string, error) {
+	start, err := parseTimeValue(startValue)
+	if err != nil {
+		return time.Time{}, time.Time{}, "", err
+	}
+	endValue := query.Get("end")
+	if endValue == "" {
+		return time.Time{}, time.Time{}, "", fmt.Errorf("end is required when start is provided")
+	}
+	end, err := parseTimeValue(endValue)
+	if err != nil {
+		return time.Time{}, time.Time{}, "", err
+	}
+	return normalizeWindow(start.UTC(), end.UTC(), fmt.Sprintf("%s..%s", startValue, endValue))
+}
+
+func normalizeWindow(start time.Time, end time.Time, label string) (time.Time, time.Time, string, error) {
+	if !end.After(start) {
+		return time.Time{}, time.Time{}, "", fmt.Errorf("end must be after start")
+	}
+	return start.UTC(), end.UTC(), label, nil
+}
+
+type listQueryParams struct {
+	Limit       int
+	Page        int
+	PageSize    int
+	SortBy      string
+	SortOrder   string
+	CursorTS    int64
+	CursorRowID int64
+	UsePage     bool
+}
+
+func parseListQueryParams(query url.Values) (listQueryParams, error) {
+	limit, err := parseIntWithDefault(query.Get("limit"), 200, "limit")
+	if err != nil {
+		return listQueryParams{}, err
+	}
+	page, err := parseIntWithDefault(query.Get("page"), 1, "page")
+	if err != nil {
+		return listQueryParams{}, err
+	}
+	pageSize, err := parseIntWithDefault(query.Get("page_size"), 50, "page_size")
+	if err != nil {
+		return listQueryParams{}, err
+	}
+
+	params := listQueryParams{
+		Limit:     limit,
+		Page:      page,
+		PageSize:  pageSize,
+		SortBy:    query.Get("sort_by"),
+		SortOrder: query.Get("sort_order"),
+		UsePage:   query.Has("page") || query.Has("page_size"),
+	}
+	if cursor := query.Get("cursor"); cursor != "" {
+		ts, rowID, err := store.DecodeCursor(cursor)
+		if err != nil {
+			return listQueryParams{}, fmt.Errorf("invalid cursor: %w", err)
+		}
+		params.CursorTS = ts
+		params.CursorRowID = rowID
+	}
+	return params, nil
+}
+
+func parseIntWithDefault(value string, fallback int, field string) (int, error) {
 	if value == "" {
-		return fallback
+		return fallback, nil
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("invalid %s: %w", field, err)
 	}
-	return parsed
+	return parsed, nil
 }
 
-func parsePageParams(r *http.Request) (int, int) {
-	page := parseIntWithDefault(r.URL.Query().Get("page"), 1)
+func parsePageParams(r *http.Request) (int, int, error) {
+	page, err := parseIntWithDefault(r.URL.Query().Get("page"), 1, "page")
+	if err != nil {
+		return 0, 0, err
+	}
 	if page <= 0 {
 		page = 1
 	}
-	pageSize := parseIntWithDefault(r.URL.Query().Get("page_size"), 25)
+	pageSize, err := parseIntWithDefault(r.URL.Query().Get("page_size"), 25, "page_size")
+	if err != nil {
+		return 0, 0, err
+	}
 	if pageSize <= 0 {
 		pageSize = 25
 	}
-	return page, pageSize
+	return page, pageSize, nil
 }
 
 func parseBoolFlag(value string) bool {
@@ -464,4 +587,41 @@ func parseBoolFlag(value string) bool {
 	default:
 		return false
 	}
+}
+
+func mergeProcessListItems(primary []model.ProcessListItem, secondary []model.ProcessListItem) []model.ProcessListItem {
+	if len(primary) == 0 && len(secondary) == 0 {
+		return nil
+	}
+
+	merged := make([]model.ProcessListItem, 0, len(primary)+len(secondary))
+	seen := make(map[string]struct{}, len(primary)+len(secondary))
+	appendItems := func(items []model.ProcessListItem) {
+		for _, item := range items {
+			if item.PID <= 0 && strings.TrimSpace(item.Comm) == "" && strings.TrimSpace(item.Exe) == "" {
+				continue
+			}
+			key := fmt.Sprintf("%d|%s|%s", item.PID, strings.TrimSpace(item.Comm), strings.TrimSpace(item.Exe))
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			merged = append(merged, item)
+		}
+	}
+
+	appendItems(primary)
+	appendItems(secondary)
+	sort.SliceStable(merged, func(i, j int) bool {
+		leftComm := strings.ToLower(strings.TrimSpace(merged[i].Comm))
+		rightComm := strings.ToLower(strings.TrimSpace(merged[j].Comm))
+		if leftComm != rightComm {
+			return leftComm < rightComm
+		}
+		if merged[i].PID != merged[j].PID {
+			return merged[i].PID < merged[j].PID
+		}
+		return strings.ToLower(strings.TrimSpace(merged[i].Exe)) < strings.ToLower(strings.TrimSpace(merged[j].Exe))
+	})
+	return merged
 }

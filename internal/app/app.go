@@ -19,22 +19,29 @@ type App struct {
 	logger    *log.Logger
 	store     *store.Store
 	collector collector.Runner
+	apiServer *api.Server
 	server    *http.Server
 }
 
 func New(cfg config.Config, logger *log.Logger) (*App, error) {
+	cfg = config.Derive(cfg)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	trafficStore, err := store.Open(cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	trafficCollector := collector.New(cfg, trafficStore, logger)
-	apiServer := api.NewServer(trafficStore, trafficCollector, logger, embedfs.StaticFS(), cfg.NginxLogDir, cfg.SSLogDir)
+	apiServer := api.NewServer(trafficStore, trafficCollector, logger, embedfs.StaticFS(), cfg.ProcessLogDirs)
 	return &App{
 		cfg:       cfg,
 		logger:    logger,
 		store:     trafficStore,
 		collector: trafficCollector,
+		apiServer: apiServer,
 		server: &http.Server{
 			Addr:    cfg.Listen,
 			Handler: apiServer.Handler(),
@@ -85,11 +92,19 @@ func (a *App) serveHTTP() error {
 func (a *App) runMaintenance(ctx context.Context) error {
 	aggregationTicker := time.NewTicker(time.Minute)
 	cleanupTicker := time.NewTicker(time.Hour)
+	var prefetchTicker *time.Ticker
+	if a.cfg.Prefetch.Enabled && len(a.cfg.ProcessLogDirs) > 0 {
+		prefetchTicker = time.NewTicker(a.cfg.Prefetch.Interval)
+	}
 	defer aggregationTicker.Stop()
 	defer cleanupTicker.Stop()
+	if prefetchTicker != nil {
+		defer prefetchTicker.Stop()
+	}
 
 	a.runAggregation(ctx)
 	a.runCleanup(ctx)
+	a.runPrefetch(ctx)
 
 	for {
 		select {
@@ -99,12 +114,19 @@ func (a *App) runMaintenance(ctx context.Context) error {
 			a.runAggregation(ctx)
 		case <-cleanupTicker.C:
 			a.runCleanup(ctx)
+		case <-prefetchTick(prefetchTicker):
+			a.runPrefetch(ctx)
 		}
 	}
 }
 
 func (a *App) runAggregation(ctx context.Context) {
 	before := time.Now().UTC().Truncate(time.Hour)
+	latestCompleteHour := before.Add(-time.Hour)
+	if err := a.store.AggregateHour(ctx, latestCompleteHour); err != nil {
+		a.logger.Printf("refresh latest completed hour %s failed: %v", latestCompleteHour.Format(time.RFC3339), err)
+	}
+
 	lastHour, ok, err := a.store.LastAggregatedHour(ctx)
 	if err != nil {
 		a.logger.Printf("read aggregation cursor failed: %v", err)
@@ -157,4 +179,38 @@ func (a *App) runCleanup(ctx context.Context) {
 	if err := a.store.SetLastVacuum(ctx, now); err != nil {
 		a.logger.Printf("persist vacuum cursor failed: %v", err)
 	}
+}
+
+func (a *App) runPrefetch(ctx context.Context) {
+	if a.apiServer == nil || !a.cfg.Prefetch.Enabled || len(a.cfg.ProcessLogDirs) == 0 {
+		return
+	}
+	summary := a.apiServer.RunBackgroundPrefetch(ctx, api.BackgroundPrefetchOptions{
+		Enabled:             a.cfg.Prefetch.Enabled,
+		Now:                 time.Now().UTC(),
+		EvidenceLookback:    a.cfg.Prefetch.EvidenceLookback,
+		ChainLookback:       a.cfg.Prefetch.ChainLookback,
+		ScanBudget:          a.cfg.Prefetch.ScanBudget,
+		MaxScanFiles:        a.cfg.Prefetch.MaxScanFiles,
+		MaxScanLinesPerFile: a.cfg.Prefetch.MaxScanLinesPerFile,
+	})
+	if summary.Sources == 0 && summary.UsageRows == 0 && summary.Errors == 0 {
+		return
+	}
+	a.logger.Printf(
+		"prefetch sources=%d evidence_rows=%d usage_rows=%d chain_rows=%d partial_sources=%d errors=%d",
+		summary.Sources,
+		summary.EvidenceRows,
+		summary.UsageRows,
+		summary.ChainRows,
+		summary.PartialSources,
+		summary.Errors,
+	)
+}
+
+func prefetchTick(ticker *time.Ticker) <-chan time.Time {
+	if ticker == nil {
+		return nil
+	}
+	return ticker.C
 }

@@ -67,7 +67,9 @@ env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "${GO_BIN}" build -o "${RELEASE_DIR}/t
 popd >/dev/null
 
 cp "${ROOT_DIR}/deploy/config.example.yaml" "${RELEASE_DIR}/config.yaml"
+cp "${ROOT_DIR}/deploy/config.example.yaml" "${RELEASE_DIR}/config.example.yaml"
 cp "${ROOT_DIR}/deploy/install-centos7.sh" "${RELEASE_DIR}/install-centos7.sh"
+cp "${ROOT_DIR}/deploy/traffic-go.service" "${RELEASE_DIR}/traffic-go.service"
 chmod +x "${RELEASE_DIR}/install-centos7.sh"
 
 tar -C "${RELEASE_DIR}" -czf "${ARCHIVE_PATH}" .
@@ -85,5 +87,7 @@ Upload one of these options to the server:
   1. ${ARCHIVE_PATH}
   2. ${RELEASE_DIR}/traffic-go
      ${RELEASE_DIR}/config.yaml
+     ${RELEASE_DIR}/config.example.yaml
      ${RELEASE_DIR}/install-centos7.sh
+     ${RELEASE_DIR}/traffic-go.service
 EOF

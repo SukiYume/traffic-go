@@ -72,8 +72,8 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 	// Any previously unseen inode still forces one full /proc scan even if the
 	// positive cache TTL has not elapsed yet. The negative cache prevents sockets
 	// that cannot be resolved from paying this full-scan cost on every tick.
-	scanned, ok := scanFn(ctx)
-	if ok {
+	scanned, scanOK := scanFn(ctx)
+	if scanOK {
 		r.cache = scanned
 		r.lastFullScan = now
 		for inode := range scanned {
@@ -84,6 +84,9 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 	for inode := range missing {
 		if cached, ok := r.cache[inode]; ok {
 			resolved[inode] = cached
+			continue
+		}
+		if !scanOK {
 			continue
 		}
 		if expiry, ok := r.negativeCache[inode]; ok && expiry.After(now) {

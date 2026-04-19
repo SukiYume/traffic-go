@@ -1,6 +1,41 @@
 import type { BucketKey, DataSource, Direction, RangeKey } from './types';
 
 const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+type DataSourceMeta = {
+  label: string;
+  description: string;
+  autoNote: string;
+  minuteDimensionsUnavailable: boolean;
+};
+
+// Keep source-specific UI copy in one place so badges, filter hints, and
+// auto-switch notes stay aligned when we add or rename sources.
+const DATA_SOURCE_META: Record<DataSource, DataSourceMeta> = {
+  usage_1m: {
+    label: '分钟明细',
+    description: '逐分钟累计的明细数据，支持 PID / EXE 等细粒度维度。',
+    autoNote: '当前页面正在读取分钟明细。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
+    minuteDimensionsUnavailable: false,
+  },
+  usage_1h: {
+    label: '小时聚合',
+    description: '按小时聚合后的历史数据，长时间范围会自动切换到这里。',
+    autoNote: '当前页面正在读取小时聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
+    minuteDimensionsUnavailable: true,
+  },
+  usage_1m_forward: {
+    label: '分钟转发明细',
+    description: '逐分钟累计的 forward / NAT 明细。',
+    autoNote: '当前页面正在读取分钟转发明细。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
+    minuteDimensionsUnavailable: false,
+  },
+  usage_1h_forward: {
+    label: '小时转发聚合',
+    description: '按小时聚合后的 forward / NAT 历史数据。',
+    autoNote: '当前页面正在读取小时转发聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
+    minuteDimensionsUnavailable: true,
+  },
+};
 
 export function formatBytes(value: number) {
   if (!Number.isFinite(value) || value <= 0) return '0 B';
@@ -27,12 +62,7 @@ export function formatDateTime(ts: number) {
 }
 
 export function formatLongDateTime(ts: number) {
-  return new Intl.DateTimeFormat('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  }).format(ts * 1000);
+  return formatDateTime(ts);
 }
 
 export function rangeLabel(range: RangeKey) {
@@ -45,8 +75,9 @@ export function rangeLabel(range: RangeKey) {
   }[range];
 }
 
-export function isLongRange(range: RangeKey) {
-  return range === '90d';
+export function minuteDimensionsUnavailable(dataSource?: DataSource | null) {
+  if (!dataSource) return false;
+  return DATA_SOURCE_META[dataSource].minuteDimensionsUnavailable;
 }
 
 export function bucketLabel(bucket: BucketKey) {
@@ -60,27 +91,15 @@ export function bucketLabel(bucket: BucketKey) {
 }
 
 export function dataSourceLabel(dataSource: DataSource) {
-  return {
-    usage_1m: '分钟明细',
-    usage_1h: '小时聚合',
-    usage_1m_forward: '分钟转发明细',
-    usage_1h_forward: '小时转发聚合',
-  }[dataSource];
+  return DATA_SOURCE_META[dataSource].label;
 }
 
 export function dataSourceDescription(dataSource: DataSource) {
-  return {
-    usage_1m: '逐分钟累计的明细数据，支持 PID / EXE 等细粒度维度。',
-    usage_1h: '按小时聚合后的历史数据，长时间范围会自动切换到这里。',
-    usage_1m_forward: '逐分钟累计的 forward / NAT 明细。',
-    usage_1h_forward: '按小时聚合后的 forward / NAT 历史数据。',
-  }[dataSource];
+  return DATA_SOURCE_META[dataSource].description;
 }
 
 export function dataSourceAutoNote(dataSource: DataSource) {
-  return dataSource.endsWith('_1h')
-    ? '当前页面正在读取小时聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。'
-    : '当前页面正在读取分钟明细。它不是一个手动筛选项，时间范围或维度变化后会自动切换。';
+  return DATA_SOURCE_META[dataSource].autoNote;
 }
 
 export function peerRoleLabel(direction: Exclude<Direction, 'forward'>) {

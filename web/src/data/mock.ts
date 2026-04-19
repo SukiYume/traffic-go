@@ -1,15 +1,22 @@
 import type {
+  ForwardSortKey,
+  ForwardUsageQuery,
   ForwardUsageResponse,
+  ProcessGroupBy,
+  ProcessSortKey,
   ProcessSummaryResponse,
   ProcessesResponse,
   RangeKey,
+  RemoteSortKey,
   RemoteSummaryResponse,
+  SortOrder,
   TimeSeriesFilters,
   TimeSeriesPoint,
   TopResponse,
   TrafficApiClient,
   UsageQuery,
   UsageResponse,
+  UsageSortKey,
   OverviewStats,
   UsageRow,
   ForwardUsageRow,
@@ -97,8 +104,210 @@ function filterUsage(query: UsageQuery, rows: UsageRow[]) {
   });
 }
 
-function filterForward(query: UsageQuery, rows: ForwardUsageRow[]) {
-  return rows.filter((row) => !query.proto || row.proto === query.proto);
+function filterForward(query: ForwardUsageQuery, rows: ForwardUsageRow[]) {
+  return rows.filter((row) => {
+    if (query.proto && row.proto !== query.proto) return false;
+    if (query.origSrcIp && row.origSrc !== query.origSrcIp) return false;
+    if (query.origDstIp && row.origDst !== query.origDstIp) return false;
+    return true;
+  });
+}
+
+function compareText(left: string | null | undefined, right: string | null | undefined) {
+  return (left ?? '').localeCompare(right ?? '', 'zh-CN');
+}
+
+function compareNumber(left: number | null | undefined, right: number | null | undefined) {
+  return (left ?? 0) - (right ?? 0);
+}
+
+function normalizeSortOrder(sortOrder?: SortOrder): SortOrder {
+  return sortOrder === 'asc' ? 'asc' : 'desc';
+}
+
+function applyOrder(value: number, sortOrder: SortOrder) {
+  return sortOrder === 'asc' ? value : -value;
+}
+
+function sortUsageRows(rows: UsageRow[], sortBy?: UsageSortKey, sortOrder?: SortOrder) {
+  const key = sortBy ?? 'minuteTs';
+  const order = normalizeSortOrder(sortOrder);
+  return [...rows].sort((left, right) => {
+    let result = 0;
+    switch (key) {
+      case 'bytesUp':
+        result = compareNumber(left.bytesUp, right.bytesUp);
+        break;
+      case 'bytesDown':
+        result = compareNumber(left.bytesDown, right.bytesDown);
+        break;
+      case 'bytesTotal':
+        result = compareNumber(left.bytesUp + left.bytesDown, right.bytesUp + right.bytesDown);
+        break;
+      case 'flowCount':
+        result = compareNumber(left.flowCount, right.flowCount);
+        break;
+      case 'remoteIp':
+        result = compareText(left.remoteIp, right.remoteIp);
+        break;
+      case 'direction':
+        result = compareText(left.direction, right.direction);
+        break;
+      case 'localPort':
+        result = compareNumber(left.localPort, right.localPort);
+        break;
+      case 'comm':
+        result = compareText(left.comm, right.comm);
+        break;
+      case 'pid':
+        result = compareNumber(left.pid, right.pid);
+        break;
+      case 'minuteTs':
+      default:
+        result = compareNumber(left.minuteTs, right.minuteTs);
+        break;
+    }
+
+    if (result !== 0) {
+      return applyOrder(result, order);
+    }
+    return compareNumber(right.minuteTs, left.minuteTs);
+  });
+}
+
+function sortForwardRows(rows: ForwardUsageRow[], sortBy?: ForwardSortKey, sortOrder?: SortOrder) {
+  const key = sortBy ?? 'minuteTs';
+  const order = normalizeSortOrder(sortOrder);
+  return [...rows].sort((left, right) => {
+    let result = 0;
+    switch (key) {
+      case 'bytesOrig':
+        result = compareNumber(left.bytesOrig, right.bytesOrig);
+        break;
+      case 'bytesReply':
+        result = compareNumber(left.bytesReply, right.bytesReply);
+        break;
+      case 'bytesTotal':
+        result = compareNumber(left.bytesOrig + left.bytesReply, right.bytesOrig + right.bytesReply);
+        break;
+      case 'flowCount':
+        result = compareNumber(left.flowCount, right.flowCount);
+        break;
+      case 'origSrc':
+        result = compareText(left.origSrc, right.origSrc);
+        break;
+      case 'origDst':
+        result = compareText(left.origDst, right.origDst);
+        break;
+      case 'minuteTs':
+      default:
+        result = compareNumber(left.minuteTs, right.minuteTs);
+        break;
+    }
+
+    if (result !== 0) {
+      return applyOrder(result, order);
+    }
+    return compareNumber(right.minuteTs, left.minuteTs);
+  });
+}
+
+function sortProcessRows(
+  rows: Array<{
+    pid: number | null;
+    comm: string | null;
+    exe: string | null;
+    bytesUp: number;
+    bytesDown: number;
+    flowCount: number;
+    totalBytes: number;
+  }>,
+  sortBy?: ProcessSortKey,
+  sortOrder?: SortOrder,
+  allowPID = true,
+) {
+  const key = sortBy ?? 'bytesTotal';
+  const order = normalizeSortOrder(sortOrder);
+
+  return [...rows].sort((left, right) => {
+    let result = 0;
+    switch (key) {
+      case 'comm':
+        result = compareText(left.comm, right.comm);
+        break;
+      case 'pid':
+        if (allowPID) {
+          result = compareNumber(left.pid, right.pid);
+          break;
+        }
+        result = compareNumber(left.totalBytes, right.totalBytes);
+        break;
+      case 'bytesUp':
+        result = compareNumber(left.bytesUp, right.bytesUp);
+        break;
+      case 'bytesDown':
+        result = compareNumber(left.bytesDown, right.bytesDown);
+        break;
+      case 'flowCount':
+        result = compareNumber(left.flowCount, right.flowCount);
+        break;
+      case 'bytesTotal':
+      default:
+        result = compareNumber(left.totalBytes, right.totalBytes);
+        break;
+    }
+
+    if (result !== 0) {
+      return applyOrder(result, order);
+    }
+    return compareText(left.comm, right.comm);
+  });
+}
+
+function sortRemoteRows(
+  rows: Array<{
+    direction: 'in' | 'out';
+    remoteIp: string;
+    bytesUp: number;
+    bytesDown: number;
+    flowCount: number;
+    totalBytes: number;
+  }>,
+  sortBy?: RemoteSortKey,
+  sortOrder?: SortOrder,
+) {
+  const key = sortBy ?? 'bytesTotal';
+  const order = normalizeSortOrder(sortOrder);
+
+  return [...rows].sort((left, right) => {
+    let result = 0;
+    switch (key) {
+      case 'remoteIp':
+        result = compareText(left.remoteIp, right.remoteIp);
+        break;
+      case 'direction':
+        result = compareText(left.direction, right.direction);
+        break;
+      case 'bytesUp':
+        result = compareNumber(left.bytesUp, right.bytesUp);
+        break;
+      case 'bytesDown':
+        result = compareNumber(left.bytesDown, right.bytesDown);
+        break;
+      case 'flowCount':
+        result = compareNumber(left.flowCount, right.flowCount);
+        break;
+      case 'bytesTotal':
+      default:
+        result = compareNumber(left.totalBytes, right.totalBytes);
+        break;
+    }
+
+    if (result !== 0) {
+      return applyOrder(result, order);
+    }
+    return compareText(left.remoteIp, right.remoteIp);
+  });
 }
 
 function paginate<T>(rows: T[], page = 1, pageSize = 50) {
@@ -114,7 +323,7 @@ function paginate<T>(rows: T[], page = 1, pageSize = 50) {
 }
 
 function createFilteredUsage(query: UsageQuery) {
-  return filterUsage(query, USAGE_ROWS).sort((a, b) => b.minuteTs - a.minuteTs);
+  return sortUsageRows(filterUsage(query, USAGE_ROWS), query.sortBy, query.sortOrder);
 }
 
 function normalizeUsageRows(range: RangeKey, rows: UsageRow[]) {
@@ -130,8 +339,8 @@ function normalizeUsageRows(range: RangeKey, rows: UsageRow[]) {
   }));
 }
 
-function createFilteredForward(query: UsageQuery) {
-  return filterForward(query, FORWARD_ROWS).sort((a, b) => b.minuteTs - a.minuteTs);
+function createFilteredForward(query: ForwardUsageQuery) {
+  return sortForwardRows(filterForward(query, FORWARD_ROWS), query.sortBy, query.sortOrder);
 }
 
 function createRelatedRowsForExplain(row: UsageRow) {
@@ -161,6 +370,7 @@ function sortIpsByWeight(weights: Map<string, number>) {
 
 function inferExplainConfidence(payload: Omit<UsageExplain, 'confidence' | 'process'>): UsageExplain['confidence'] {
   if (payload.nginxRequests.length) return 'high';
+  if (payload.chains.length) return 'high';
   if (payload.sourceIps.length && payload.targetIps.length) return 'high';
   if (payload.sourceIps.length || payload.targetIps.length) return 'medium';
   return 'low';
@@ -232,9 +442,30 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
     notes.push('未找到可用的关联流量样本。');
   }
 
+  const sourceIps = sortIpsByWeight(sourceWeights);
+  const targetIps = sortIpsByWeight(targetWeights);
+  const chains =
+    isShadowsocksRow(row) && (sourceIps.length || targetIps.length)
+      ? [
+          {
+            sourceIp: sourceIps[0] ?? null,
+            targetIp: targetIps[0] ?? null,
+            targetHost: row.remotePort === 443 ? 'chatgpt.com' : null,
+            targetPort: row.remotePort ?? null,
+            localPort: row.localPort ?? null,
+            bytesTotal: row.bytesUp + row.bytesDown,
+            flowCount: row.flowCount,
+            evidenceCount: Math.max(1, row.flowCount),
+            evidence: 'ss-log',
+            confidence: (targetIps.length && sourceIps.length ? 'high' : 'medium') as UsageExplain['confidence'],
+          },
+        ]
+      : [];
+
   const basePayload = {
-    sourceIps: sortIpsByWeight(sourceWeights),
-    targetIps: sortIpsByWeight(targetWeights),
+    sourceIps,
+    targetIps,
+    chains,
     relatedPeers: [...relatedPeersMap.values()]
       .sort((left, right) => {
         if (left.bytesTotal === right.bytesTotal) return right.flowCount - left.flowCount;
@@ -252,19 +483,46 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
   };
 }
 
-function processSummaries(range: RangeKey, query?: { page?: number; pageSize?: number }): ProcessSummaryResponse {
-  const rows = PROCESSES.map((process) => ({
-    pid: range === '90d' ? null : process.pid,
+function processSummaries(
+  range: RangeKey,
+  query?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy },
+): ProcessSummaryResponse {
+  const source = range === '90d' ? 'usage_1h' : 'usage_1m';
+  const effectiveGroupBy: ProcessGroupBy = source === 'usage_1h' ? 'comm' : (query?.groupBy ?? 'pid');
+
+  const baseRows = PROCESSES.map((process) => ({
+    pid: source === 'usage_1h' ? null : process.pid,
     comm: process.comm,
-    exe: range === '90d' ? null : process.exe,
+    exe: source === 'usage_1h' ? null : process.exe,
     bytesUp: Math.round(process.totalBytes * 0.34),
     bytesDown: Math.round(process.totalBytes * 0.66),
     flowCount: Math.max(1, Math.round(process.totalBytes / (32 * 1024 * 1024))),
     totalBytes: process.totalBytes,
-  })).sort((left, right) => right.totalBytes - left.totalBytes);
-  const page = paginate(rows, query?.page ?? 1, query?.pageSize ?? 25);
+  }));
+
+  const groupedRows = effectiveGroupBy === 'comm'
+    ? (() => {
+        const map = new Map<string, (typeof baseRows)[number]>();
+        for (const row of baseRows) {
+          const key = row.comm ?? '未知';
+          const existing = map.get(key);
+          if (!existing) {
+            map.set(key, { ...row, pid: null, exe: null });
+            continue;
+          }
+          existing.bytesUp += row.bytesUp;
+          existing.bytesDown += row.bytesDown;
+          existing.flowCount += row.flowCount;
+          existing.totalBytes += row.totalBytes;
+        }
+        return [...map.values()];
+      })()
+    : baseRows;
+
+  const sortedRows = sortProcessRows(groupedRows, query?.sortBy, query?.sortOrder, effectiveGroupBy === 'pid' && source !== 'usage_1h');
+  const page = paginate(sortedRows, query?.page ?? 1, query?.pageSize ?? 25);
   return {
-    dataSource: range === '90d' ? 'usage_1h' : 'usage_1m',
+    dataSource: source,
     rows: page.rows,
     page: page.page,
     pageSize: page.pageSize,
@@ -274,7 +532,7 @@ function processSummaries(range: RangeKey, query?: { page?: number; pageSize?: n
 
 function remoteSummaries(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; direction?: 'in' | 'out'; includeLoopback?: boolean },
+  options?: { page?: number; pageSize?: number; direction?: 'in' | 'out'; includeLoopback?: boolean; sortBy?: RemoteSortKey; sortOrder?: SortOrder },
 ): RemoteSummaryResponse {
   const grouped = new Map<string, { direction: 'in' | 'out'; remoteIp: string; bytesUp: number; bytesDown: number; flowCount: number }>();
   for (const row of createFilteredUsage({ range })) {
@@ -293,10 +551,9 @@ function remoteSummaries(
     current.flowCount += row.flowCount;
     grouped.set(key, current);
   }
-  const rows = [...grouped.values()]
-    .map((row) => ({ ...row, totalBytes: row.bytesUp + row.bytesDown }))
-    .sort((left, right) => right.totalBytes - left.totalBytes);
-  const page = paginate(rows, options?.page ?? 1, options?.pageSize ?? 25);
+  const rows = [...grouped.values()].map((row) => ({ ...row, totalBytes: row.bytesUp + row.bytesDown }));
+  const sortedRows = sortRemoteRows(rows, options?.sortBy, options?.sortOrder);
+  const page = paginate(sortedRows, options?.page ?? 1, options?.pageSize ?? 25);
   return {
     dataSource: range === '90d' ? 'usage_1h' : 'usage_1m',
     rows: page.rows,

@@ -1,10 +1,12 @@
 import type {
   BucketKey,
+  ForwardUsageQuery,
   ForwardUsageResponse,
   ForwardUsageRow,
   ForwardSortKey,
   GroupBy,
   OverviewStats,
+  ProcessGroupBy,
   ProcessSortKey,
   ProcessesResponse,
   ProcessSummaryResponse,
@@ -27,6 +29,19 @@ import { createMockApiClient } from './data/mock';
 import { RANGE_TO_BUCKET } from './ranges';
 
 type QueryValue = string | number | boolean | undefined | null;
+type ListQueryOptions<SortKey extends string> = {
+  cursor?: string;
+  limit?: number;
+  page?: number;
+  pageSize?: number;
+  sortBy?: SortKey;
+  sortOrder?: SortOrder;
+};
+
+type RawErrorResponse = {
+  error?: string;
+  message?: string;
+};
 
 type RawOverviewResponse = {
   data: {
@@ -82,6 +97,24 @@ type RawUsageExplainResponse = {
     confidence: UsageExplain['confidence'];
     source_ips: string[];
     target_ips: string[];
+    chains?: Array<{
+      chain_id?: string;
+      source_ip?: string;
+      target_ip?: string;
+      target_host?: string;
+      target_host_normalized?: string;
+      target_port?: number | null;
+      local_port?: number | null;
+      bytes_total: number;
+      flow_count: number;
+      evidence_count?: number;
+      evidence: string;
+      evidence_source?: string;
+      sample_fingerprint?: string;
+      sample_message?: string;
+      sample_time?: number;
+      confidence: UsageExplain['confidence'];
+    }>;
     related_peers: Array<{
       direction: UsageRow['direction'];
       remote_ip: string;
@@ -94,12 +127,15 @@ type RawUsageExplainResponse = {
       time: number;
       method: string;
       host?: string;
+      host_normalized?: string;
       path: string;
       status: number;
       count?: number;
+      client_ip?: string;
       referer?: string;
       user_agent?: string;
       bot?: string;
+      sample_fingerprint?: string;
     }>;
     notes: string[];
   };
@@ -182,6 +218,25 @@ function buildQuery(entries: Array<[string, QueryValue]>) {
   return query ? `?${query}` : '';
 }
 
+const usageSortKeys: UsageSortKey[] = [
+  'minuteTs',
+  'bytesUp',
+  'bytesDown',
+  'bytesTotal',
+  'flowCount',
+  'remoteIp',
+  'direction',
+  'localPort',
+  'comm',
+  'pid',
+];
+
+export function normalizeUsageSortKey(value?: string): UsageSortKey {
+  return usageSortKeys.includes(value as UsageSortKey)
+    ? (value as UsageSortKey)
+    : 'minuteTs';
+}
+
 function usageSortKey(value?: UsageSortKey) {
   return {
     minuteTs: undefined,
@@ -215,7 +270,7 @@ function processSortKey(value?: ProcessSortKey) {
     pid: 'pid',
     bytesUp: 'bytes_up',
     bytesDown: 'bytes_down',
-    bytesTotal: 'total',
+    bytesTotal: 'bytes_total',
     flowCount: 'flow_count',
   }[value ?? 'bytesTotal'];
 }
@@ -226,47 +281,66 @@ function remoteSortKey(value?: RemoteSortKey) {
     direction: 'direction',
     bytesUp: 'bytes_up',
     bytesDown: 'bytes_down',
-    bytesTotal: 'total',
+    bytesTotal: 'bytes_total',
     flowCount: 'flow_count',
   }[value ?? 'bytesTotal'];
 }
 
+function appendListQuery<SortKey extends string>(
+  entries: Array<[string, QueryValue]>,
+  options: ListQueryOptions<SortKey>,
+  sortParam: QueryValue,
+) {
+  return [
+    ...entries,
+    ['cursor', options.cursor],
+    ['limit', options.limit ?? undefined],
+    ['page', options.page ?? undefined],
+    ['page_size', options.pageSize ?? undefined],
+    ['sort_by', sortParam],
+    ['sort_order', options.sortOrder ?? undefined],
+  ] as Array<[string, QueryValue]>;
+}
+
 function buildUsageQuery(query: UsageQuery) {
-  return buildQuery([
-    ['range', query.range],
-    ['comm', query.comm],
-    ['pid', query.pid],
-    ['exe', query.exe],
-    ['remote_ip', query.remoteIp],
-    ['local_port', query.localPort],
-    ['direction', query.direction],
-    ['proto', query.proto],
-    ['attribution', query.attribution],
-    ['cursor', query.cursor],
-    ['limit', query.limit ?? undefined],
-    ['page', query.page ?? undefined],
-    ['page_size', query.pageSize ?? undefined],
-    ['sort_by', usageSortKey(query.sortBy)],
-    ['sort_order', query.sortOrder ?? undefined],
-  ]);
+  return buildQuery(
+    appendListQuery(
+      [
+        ['range', query.range],
+        ['comm', query.comm],
+        ['pid', query.pid],
+        ['exe', query.exe],
+        ['remote_ip', query.remoteIp],
+        ['local_port', query.localPort],
+        ['direction', query.direction],
+        ['proto', query.proto],
+        ['attribution', query.attribution],
+      ],
+      query,
+      usageSortKey(query.sortBy),
+    ),
+  );
 }
 
-function buildForwardQuery(query: UsageQuery) {
-  return buildQuery([
-    ['range', query.range],
-    ['proto', query.proto],
-    ['cursor', query.cursor],
-    ['limit', query.limit ?? undefined],
-    ['page', query.page ?? undefined],
-    ['page_size', query.pageSize ?? undefined],
-    ['sort_by', forwardSortKey(query.sortBy as ForwardSortKey | undefined)],
-    ['sort_order', query.sortOrder ?? undefined],
-  ]);
+function buildForwardQuery(query: ForwardUsageQuery) {
+  return buildQuery(
+    appendListQuery(
+      [
+        ['range', query.range],
+        ['proto', query.proto],
+        ['orig_src_ip', query.origSrcIp],
+        ['orig_dst_ip', query.origDstIp],
+      ],
+      query,
+      forwardSortKey(query.sortBy),
+    ),
+  );
 }
 
-function buildUsageExplainQuery(row: UsageRow) {
+function buildUsageExplainQuery(row: UsageRow, options?: { dataSource?: UsageResponse['dataSource']; allowScan?: boolean }) {
   return buildQuery([
     ['ts', row.minuteTs],
+    ['data_source', options?.dataSource],
     ['proto', row.proto],
     ['direction', row.direction],
     ['pid', row.pid ?? undefined],
@@ -275,12 +349,13 @@ function buildUsageExplainQuery(row: UsageRow) {
     ['local_port', row.localPort],
     ['remote_ip', row.remoteIp],
     ['remote_port', row.remotePort],
+    ['scan', options?.allowScan ? 1 : undefined],
   ]);
 }
 
 function buildTopProcessesQuery(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder },
+  options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy },
 ) {
   return buildQuery([
     ['range', range],
@@ -288,6 +363,7 @@ function buildTopProcessesQuery(
     ['page_size', options?.pageSize ?? undefined],
     ['sort_by', processSortKey(options?.sortBy)],
     ['sort_order', options?.sortOrder ?? undefined],
+    ['group_by', options?.groupBy],
   ]);
 }
 
@@ -320,12 +396,34 @@ function buildTimeSeriesQuery(range: RangeKey, bucket: BucketKey, groupBy: Group
   ]);
 }
 
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+
+  constructor(status: number, code: string | undefined, message: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export function isDimensionUnavailableError(error: unknown) {
+  return error instanceof ApiError && error.code === 'dimension_unavailable';
+}
+
 async function requestJson<T>(path: string, decode: (raw: unknown) => T): Promise<T> {
   const response = await fetch(path, {
     headers: { Accept: 'application/json' },
   });
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+    let payload: RawErrorResponse | null = null;
+    try {
+      payload = (await response.json()) as RawErrorResponse;
+    } catch {
+      payload = null;
+    }
+    throw new ApiError(response.status, payload?.error, payload?.message ?? `Request failed: ${response.status}`);
   }
   return decode(await response.json());
 }
@@ -414,6 +512,24 @@ function decodeUsageExplain(raw: unknown): UsageExplain {
     confidence: payload.data.confidence,
     sourceIps: payload.data.source_ips ?? [],
     targetIps: payload.data.target_ips ?? [],
+    chains: (payload.data.chains ?? []).map((chain) => ({
+      chainId: chain.chain_id ?? null,
+      sourceIp: chain.source_ip ?? null,
+      targetIp: chain.target_ip ?? null,
+      targetHost: chain.target_host ?? null,
+      targetHostNormalized: chain.target_host_normalized ?? null,
+      targetPort: chain.target_port ?? null,
+      localPort: chain.local_port ?? null,
+      bytesTotal: chain.bytes_total,
+      flowCount: chain.flow_count,
+      evidenceCount: chain.evidence_count ?? 0,
+      evidence: chain.evidence,
+      evidenceSource: chain.evidence_source ?? null,
+      sampleFingerprint: chain.sample_fingerprint ?? null,
+      sampleMessage: chain.sample_message ?? null,
+      sampleTime: chain.sample_time ?? null,
+      confidence: chain.confidence,
+    })),
     relatedPeers: (payload.data.related_peers ?? []).map((peer) => ({
       direction: peer.direction,
       remoteIp: peer.remote_ip,
@@ -426,12 +542,15 @@ function decodeUsageExplain(raw: unknown): UsageExplain {
       time: request.time,
       method: request.method,
       host: request.host ?? null,
+      hostNormalized: request.host_normalized ?? null,
       path: request.path,
       status: request.status,
       count: request.count ?? 1,
+      clientIp: request.client_ip ?? null,
       referer: request.referer ?? null,
       userAgent: request.user_agent ?? null,
       bot: request.bot ?? null,
+      sampleFingerprint: request.sample_fingerprint ?? null,
     })),
     notes: payload.data.notes ?? [],
   };
@@ -471,7 +590,7 @@ function decodeProcessSummary(raw: unknown): ProcessSummaryResponse {
     totalRows: payload.total_rows ?? payload.data?.length ?? 0,
     rows: (payload.data ?? []).map((row) => ({
       pid: row.pid ?? null,
-      comm: row.comm || null,
+      comm: row.comm ?? null,
       exe: row.exe ?? null,
       bytesUp: row.bytes_up,
       bytesDown: row.bytes_down,
@@ -538,8 +657,8 @@ export function createHttpClient(): TrafficApiClient {
     getUsage(query: UsageQuery) {
       return requestJson(withAppBase(`/api/v1/usage${buildUsageQuery(query)}`), decodeUsage);
     },
-    getUsageExplain(row: UsageRow) {
-      return requestJson(withAppBase(`/api/v1/usage/explain${buildUsageExplainQuery(row)}`), decodeUsageExplain);
+    getUsageExplain(row: UsageRow, options) {
+      return requestJson(withAppBase(`/api/v1/usage/explain${buildUsageExplainQuery(row, options)}`), decodeUsageExplain);
     },
     getTopProcesses(range, options) {
       return requestJson(withAppBase(`/api/v1/top/processes${buildTopProcessesQuery(range, options)}`), decodeProcessSummary);
@@ -553,7 +672,7 @@ export function createHttpClient(): TrafficApiClient {
     getProcesses() {
       return requestJson(withAppBase('/api/v1/processes'), decodeProcesses);
     },
-    getForwardUsage(query: UsageQuery) {
+    getForwardUsage(query: ForwardUsageQuery) {
       return requestJson(withAppBase(`/api/v1/forward/usage${buildForwardQuery(query)}`), decodeForwardUsage);
     },
   };

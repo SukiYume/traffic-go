@@ -90,8 +90,11 @@ CREATE TABLE IF NOT EXISTS log_evidence (
     client_ip TEXT NOT NULL,
     target_ip TEXT NOT NULL,
     host TEXT NOT NULL,
+    host_normalized TEXT NOT NULL DEFAULT '',
     path TEXT NOT NULL,
     method TEXT NOT NULL,
+    entry_port INTEGER NOT NULL DEFAULT 0,
+    target_port INTEGER NOT NULL DEFAULT 0,
     status INTEGER,
     message TEXT NOT NULL,
     fingerprint TEXT NOT NULL PRIMARY KEY,
@@ -99,5 +102,59 @@ CREATE TABLE IF NOT EXISTS log_evidence (
 );
 
 CREATE INDEX IF NOT EXISTS idx_log_evidence_lookup ON log_evidence (source, event_ts, client_ip, target_ip);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_client_lookup ON log_evidence (source, event_ts, client_ip);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_target_lookup ON log_evidence (source, event_ts, target_ip);
 CREATE INDEX IF NOT EXISTS idx_log_evidence_created_at ON log_evidence (created_at);
+
+CREATE TABLE IF NOT EXISTS usage_chain_1m (
+    minute_ts INTEGER NOT NULL,
+    chain_id TEXT NOT NULL PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    comm TEXT NOT NULL,
+    exe TEXT NOT NULL,
+    source_ip TEXT NOT NULL,
+    entry_port INTEGER NOT NULL,
+    target_ip TEXT NOT NULL,
+    target_host TEXT NOT NULL,
+    target_host_normalized TEXT NOT NULL,
+    target_port INTEGER NOT NULL,
+    bytes_total INTEGER NOT NULL,
+    flow_count INTEGER NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    evidence_source TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    confidence_rank INTEGER NOT NULL,
+    sample_fingerprint TEXT NOT NULL,
+    sample_message TEXT NOT NULL,
+    sample_time INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_chain_1m_lookup ON usage_chain_1m (minute_ts, pid, comm, entry_port, target_ip, target_host_normalized, target_port);
+CREATE INDEX IF NOT EXISTS idx_usage_chain_1m_source ON usage_chain_1m (minute_ts, source_ip, entry_port);
+
+CREATE TABLE IF NOT EXISTS usage_chain_1h (
+    hour_ts INTEGER NOT NULL,
+    chain_id TEXT NOT NULL PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    comm TEXT NOT NULL,
+    exe TEXT NOT NULL,
+    source_ip TEXT NOT NULL,
+    entry_port INTEGER NOT NULL,
+    target_ip TEXT NOT NULL,
+    target_host TEXT NOT NULL,
+    target_host_normalized TEXT NOT NULL,
+    target_port INTEGER NOT NULL,
+    bytes_total INTEGER NOT NULL,
+    flow_count INTEGER NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    evidence_source TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    confidence_rank INTEGER NOT NULL,
+    sample_fingerprint TEXT NOT NULL,
+    sample_message TEXT NOT NULL,
+    sample_time INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_chain_1h_lookup ON usage_chain_1h (hour_ts, pid, comm, entry_port, target_ip, target_host_normalized, target_port);
+CREATE INDEX IF NOT EXISTS idx_usage_chain_1h_source ON usage_chain_1h (hour_ts, source_ip, entry_port);
 `

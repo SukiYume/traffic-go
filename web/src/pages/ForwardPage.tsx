@@ -3,21 +3,39 @@ import { useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
 import { useSearchParams } from 'react-router-dom';
 import { DataSourceBadge } from '../components/DataSourceBadge';
+import { CustomSelect } from '../components/CustomSelect';
 import { DataTable } from '../components/DataTable';
 import { EmptyState } from '../components/EmptyState';
+import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
-import type { ForwardUsageRow, RangeKey } from '../types';
+import { normalizeRangeKey } from '../ranges';
+import type { ForwardSortKey, ForwardUsageRow, RangeKey } from '../types';
 import { formatBytes, formatDateTime, rangeLabel } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
 const pageSize = 25;
 const columnHelper = createColumnHelper<ForwardUsageRow>();
+const protoOptions = [
+  { value: '', label: '全部协议' },
+  { value: 'tcp', label: 'TCP' },
+  { value: 'udp', label: 'UDP' },
+];
+
+function toForwardSortKey(value: string | undefined): ForwardSortKey {
+  const candidates: ForwardSortKey[] = ['minuteTs', 'bytesOrig', 'bytesReply', 'bytesTotal', 'flowCount', 'origSrc', 'origDst'];
+  return candidates.includes(value as ForwardSortKey) ? (value as ForwardSortKey) : 'minuteTs';
+}
 
 export function ForwardPage() {
   const api = useApiClient();
   const [params, setParams] = useSearchParams();
-  const range = (params.get('range') as RangeKey | null) ?? defaultRange;
+  const range = normalizeRangeKey(params.get('range'), defaultRange);
+  const filters = {
+    origSrcIp: params.get('origSrcIp') ?? '',
+    origDstIp: params.get('origDstIp') ?? '',
+    proto: params.get('proto') ?? '',
+  };
   const [page, setPage] = useState(1);
   const [sorting, setSorting] = useState<SortingState>([{ id: 'minuteTs', desc: true }]);
 
@@ -27,19 +45,33 @@ export function ForwardPage() {
     setParams(nextParams, { replace: true });
   };
 
+  const setFilter = (key: keyof typeof filters, value: string) => {
+    const nextParams = new URLSearchParams(params);
+    nextParams.set('range', range);
+    if (value) {
+      nextParams.set(key, value);
+    } else {
+      nextParams.delete(key);
+    }
+    setParams(nextParams, { replace: true });
+  };
+
   useEffect(() => {
     setPage(1);
-  }, [range, sorting]);
+  }, [range, sorting, filters.origSrcIp, filters.origDstIp, filters.proto]);
 
   const currentSort = sorting[0];
   const query = useQuery({
-    queryKey: ['forward', range, page, currentSort?.id, currentSort?.desc],
+    queryKey: ['forward', range, filters.origSrcIp, filters.origDstIp, filters.proto, page, currentSort?.id, currentSort?.desc],
     queryFn: () =>
       api.getForwardUsage({
         range,
+        proto: filters.proto,
+        origSrcIp: filters.origSrcIp,
+        origDstIp: filters.origDstIp,
         page,
         pageSize,
-        sortBy: (currentSort?.id as any) ?? 'minuteTs',
+        sortBy: toForwardSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
       }),
   });
@@ -100,7 +132,36 @@ export function ForwardPage() {
         <RangeSelect value={range} onChange={setRange} />
       </header>
 
-      {query.data?.rows.length ? (
+      <section className="filters" style={{ marginBottom: 16 }}>
+        <label>
+          <span>来源 IP</span>
+          <input
+            value={filters.origSrcIp}
+            onChange={(event) => setFilter('origSrcIp', event.target.value)}
+            placeholder="10.0.0.2"
+          />
+        </label>
+        <label>
+          <span>目标 IP</span>
+          <input
+            value={filters.origDstIp}
+            onChange={(event) => setFilter('origDstIp', event.target.value)}
+            placeholder="1.1.1.1"
+          />
+        </label>
+        <label>
+          <span>协议</span>
+          <CustomSelect
+            value={filters.proto}
+            options={protoOptions}
+            onChange={(value) => setFilter('proto', value)}
+          />
+        </label>
+      </section>
+
+      {query.isError && !query.data?.rows.length ? (
+        <QueryErrorState error={query.error} title="转发流量加载失败" />
+      ) : query.data?.rows.length ? (
         <DataTable
           columns={columns}
           data={query.data.rows}

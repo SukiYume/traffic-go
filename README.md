@@ -24,7 +24,7 @@
 - WebUI 和 JSON API 一起由同一进程提供。
 - 支持按进程、PID、可执行文件、端口、远端 IP、方向、协议过滤。
 - 超过分钟保留窗口后，自动切换到小时聚合查询。
-- 非 Linux 或 `mock_data: true` 时自动使用 mock collector，方便前端开发。
+- 非 Linux 默认只读运行；只有显式设置 `mock_data: true` 才会写入 mock 流量。
 
 ## 工作原理
 
@@ -82,7 +82,12 @@ TRAFFIC_GO_DEV_PROXY=http://127.0.0.1:<your-port> npm --prefix web run dev -- --
 VITE_TRAFFICGO_USE_MOCK=1 npm --prefix web run dev -- --host 127.0.0.1
 ```
 
-如果你在非 Linux 上启动后端，collector 会自动进入 mock 模式，便于开发 UI 和 API 调试。
+如果你在非 Linux 上启动后端，collector 会保持只读不采集，避免把假数据写进拷贝下来的生产库。
+如果你需要本地演示数据，再显式开启后端 mock：
+
+```yaml
+mock_data: true
+```
 
 ### Makefile
 
@@ -120,6 +125,7 @@ bash deploy/build-linux-gitbash.sh
 
 - `release/linux-amd64/traffic-go`
 - `release/linux-amd64/config.yaml`
+- `release/linux-amd64/traffic-go.service`
 - `release/linux-amd64/install-centos7.sh`
 - `release/traffic-go-linux-amd64.tar.gz`
 
@@ -127,20 +133,26 @@ bash deploy/build-linux-gitbash.sh
 
 ## 在 CentOS 7 上安装
 
-最省事的路径是直接用打包产物里的安装脚本。它不会创建新用户，而是把服务放到 `/root/traffic-go-release` 下运行。
+最省事的路径是直接用打包产物里的安装脚本。它会创建 `traffic-go` 系统用户，并统一安装到标准路径：
+
+- 二进制：`/usr/local/bin/traffic-go`
+- 配置：`/etc/traffic-go/config.yaml`
+- 数据库：`/var/lib/traffic-go/traffic.db`
+- unit：`/etc/systemd/system/traffic-go.service`
 
 ```bash
-mkdir -p /root/traffic-go-release
-tar -xzf traffic-go-linux-amd64.tar.gz -C /root/traffic-go-release
-cd /root/traffic-go-release
+mkdir -p /tmp/traffic-go-release
+tar -xzf traffic-go-linux-amd64.tar.gz -C /tmp/traffic-go-release
+cd /tmp/traffic-go-release
 bash install-centos7.sh
 ```
 
 这个脚本会自动：
 
-- 安装/覆盖 `/root/traffic-go-release/traffic-go`
-- 安装/覆盖 `/root/traffic-go-release/config.yaml`
-- 把 `db_path` 改写为 `/root/traffic-go-release/traffic.db`
+- 创建 `traffic-go` 系统用户和用户组
+- 安装/覆盖 `/usr/local/bin/traffic-go`
+- 安装/覆盖 `/etc/traffic-go/config.yaml`
+- 把 `db_path` 改写为 `/var/lib/traffic-go/traffic.db`
 - 写入 `/etc/systemd/system/traffic-go.service`
 - `modprobe nf_conntrack`
 - 写入 `/etc/modules-load.d/nf_conntrack.conf`
@@ -151,24 +163,19 @@ bash install-centos7.sh
 如果你已经把文件单独传到服务器，也可以这样安装：
 
 ```bash
-cd /root/traffic-go-release
-bash install-centos7.sh ./traffic-go ./config.yaml
+cd /tmp/traffic-go-release
+bash install-centos7.sh ./traffic-go ./config.yaml ./traffic-go.service
 ```
 
 ### 手动 systemd 部署
 
-如果你想走更标准的 FHS 路径，仓库里还有一个手写模板：
+仓库里的 `deploy/traffic-go.service` 与安装脚本现在使用同一份 systemd 模板，默认假定：
 
 - `deploy/traffic-go.service`
-
-这个模板假定你使用：
-
 - `/usr/local/bin/traffic-go`
 - `/etc/traffic-go/config.yaml`
 - `/var/lib/traffic-go/traffic.db`
 - `traffic-go` 用户
-
-它更接近长期生产部署，但需要你自己创建用户、放置文件和处理 capability。
 
 ## Nginx 反代到 `/traffic/`
 
@@ -252,17 +259,29 @@ location /ops/traffic/ {
 - `tick_interval`: 采集周期，默认 `2s`
 - `proc_fs`: `procfs` 根目录，默认 `/proc`
 - `conntrack_path`: conntrack 文件路径，默认 `/proc/net/nf_conntrack`
-- `nginx_log_dir`: Nginx 日志目录，默认 `/var/log/nginx`，`/api/v1/usage/explain` 会扫描该目录下匹配 `*log` 的文件
-- `ss_log_dir`: Shadowsocks / 代理日志目录，默认 `/var/log`，`/api/v1/usage/explain` 会优先扫描包含 `ss/shadowsocks` 关键词的日志文件
+- `process_log_dirs`: 进程日志路径映射（key 为进程名，大小写不敏感），`/api/v1/usage/explain` 仅按当前进程检索，不做跨进程检索或默认回退。value 支持目录路径或 glob 文件模式（例如 `/var/log/frps*`）
 - `mock_data`: 强制 mock collector
 - `retention.flows_days`: 分钟数据保留天数，也是 PID/EXE 过滤可用的最长窗口
 - `retention.hourly_days`: 小时数据保留天数
+- `prefetch.enabled`: 是否启用后台日志预热与链路预物化
+- `prefetch.interval`: 后台预热周期
+- `prefetch.evidence_lookback`: 每轮预热回看多久的日志时间窗
+- `prefetch.chain_lookback`: 每轮预物化回看多久的分钟级 usage
+- `prefetch.scan_budget`: 单个日志源每轮允许消耗的扫描时间
+- `prefetch.max_scan_files`: 单个日志源每轮最多扫描多少个候选文件
+- `prefetch.max_scan_lines_per_file`: 单个候选文件每轮最多读取多少行
 
 补充说明：
 
 - `flows_days` 或 `hourly_days` 设为 `0` 时，当前实现会回退到默认值 `30` 和 `180`。
 - `log_level` 字段会被解析，但当前后端仍使用基础 stdout logger，没有真正的按级别过滤。
-- Usage 详情日志关联采用“缓存优先、文件补扫、再写回缓存”的流程，支持 `.log` / `.log-*` / `.gz` 日志轮转文件。
+- `nginx_log_dir` 与 `ss_log_dir` 仍可作为兼容字段使用；如果对应进程键未在 `process_log_dirs` 中出现，会被合并为 `nginx` / `ss-server`。
+- 如果多个进程共用同一批日志文件，需要在 `process_log_dirs` 中分别配置各自键到同一路径（例如都指向同一个目录或同一个 glob 模式）。
+- 对 `shadowsocks-libev + shadowsocks-manager + simple-obfs`，最实用的落盘方式是把 `ss-server` / `ss-manager` / `obfs-server` 分别写到 `/var/log/shadowsocks/server.log`、`/var/log/shadowsocks/manager.log`、`/var/log/shadowsocks/obfs.log`，然后把三个进程键都指向 `/var/log/shadowsocks`。当前解析器已经支持这三种文件名，并会把它们当作同一类 Shadowsocks 证据流预热。
+- Usage 详情日志关联采用“后台预热缓存优先、按需文件补扫兜底、再写回缓存”的流程，支持 `.log` / `.log-*` / `.gz` 日志轮转文件。
+- `prefetch` 会周期性把近期日志导入 `log_evidence`，并为近期分钟级 usage 预物化 `usage_chain_1m`。正常情况下，前端展开详情只查 SQLite，不再等待深度文件扫描。
+
+CentOS 7 如果使用 `shadowsocks-libev` 的 `use_syslog: true`，可以直接套用 [deploy/rsyslog-shadowsocks.conf.example](./deploy/rsyslog-shadowsocks.conf.example) 把三类进程按 programname 分流到独立文件。这样后台会优先把 `entry_port -> target_host:port` 的 `ss-server` 记录和 `entry_port -> source_ip` 的 `obfs-server` / `ss-manager` 记录预热进库，再拼成 `source_ip -> entry_port -> target_host:port` 这条 canonical chain。
 
 ## API 概览
 
@@ -348,7 +367,7 @@ curl "http://${LISTEN_ADDR}/api/v1/forward/usage?range=1h&limit=50"
 - 分钟数据源是 `usage_1m`，小时数据源是 `usage_1h`。
 - 当查询窗口超过 `retention.flows_days` 时，系统会自动降级到小时表。
 - 一旦降级到小时表，`pid`、`exe`、`attribution` 等分钟级维度不可用。
-- `/api/v1/processes` 返回的是当前活跃且成功归因的进程，不是历史进程目录。
+- `/api/v1/processes` 返回的是“当前活跃进程 + 最近历史窗口里出现过的进程建议”，用于补全筛选项，不等同于完整进程审计清单。
 - `forward` 流量单独落到 `usage_1m_forward` / `usage_1h_forward`，不会和普通入站/出站重复计算。
 
 ## 已知限制

@@ -3,17 +3,30 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { ChartPanel } from '../components/ChartPanel';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { EmptyState } from '../components/EmptyState';
+import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { StatCard } from '../components/StatCard';
 import { useApiClient } from '../api-context';
+import { normalizeRangeKey } from '../ranges';
 import { displayExecutableName, formatBytes, peerRoleLabel, rangeLabel, safeText } from '../utils';
 import type { RangeKey } from '../types';
 
 const defaultRange = '24h' satisfies RangeKey;
 
+function buildDrilldownPath(path: string, range: RangeKey, extra?: Record<string, string>) {
+  const params = new URLSearchParams();
+  params.set('range', range);
+  for (const [key, value] of Object.entries(extra ?? {})) {
+    if (value) {
+      params.set(key, value);
+    }
+  }
+  return `${path}?${params.toString()}`;
+}
+
 function useRangeParam() {
   const [params, setParams] = useSearchParams();
-  const range = (params.get('range') as RangeKey | null) ?? defaultRange;
+  const range = normalizeRangeKey(params.get('range'), defaultRange);
   const setRange = (next: RangeKey) => {
     const nextParams = new URLSearchParams(params);
     nextParams.set('range', next);
@@ -80,13 +93,21 @@ export function DashboardPage() {
         <RangeSelect value={range} onChange={setRange} />
       </header>
 
-      <section className="stat-grid">
-        {cards.map((card) => (
-          <StatCard key={card.label} {...card} />
-        ))}
-      </section>
+      {overview.isError ? (
+        <QueryErrorState error={overview.error} title="总览加载失败" />
+      ) : cards.length ? (
+        <section className="stat-grid">
+          {cards.map((card) => (
+            <StatCard key={card.label} {...card} />
+          ))}
+        </section>
+      ) : (
+        <EmptyState title="总览加载中" description="正在获取总览统计。" />
+      )}
 
-      {series.data ? (
+      {series.isError ? (
+        <QueryErrorState error={series.error} title="趋势加载失败" />
+      ) : series.data ? (
         <ChartPanel points={series.data.points} range={range} />
       ) : (
         <EmptyState title="趋势加载中" description="正在获取时间序列。" />
@@ -96,76 +117,100 @@ export function DashboardPage() {
         <section className="panel">
           <div className="panel-head">
             <h2>Top 进程</h2>
-            <Link to="/processes">查看全部</Link>
+            <Link to={buildDrilldownPath('/processes', range)}>查看全部</Link>
           </div>
-          <ol className="top-list detailed-list">
-            {topProcesses.data?.rows.map((row, index) => (
-              <li key={`${row.pid ?? 'none'}-${row.comm ?? 'unknown'}-${index}`}>
-                <div>
-                  <strong>{safeText(row.comm)}</strong>
-                  <span>{row.pid !== null ? `PID ${row.pid}` : '按进程名聚合'}</span>
-                </div>
-                <div className="top-value">
-                  <strong>{formatBytes(row.totalBytes)}</strong>
-                  <span>{row.exe ? displayExecutableName(row.exe) : '未归因 / EXE 不可用'}</span>
-                </div>
-              </li>
-            ))}
-          </ol>
+          {topProcesses.isError ? (
+            <QueryErrorState error={topProcesses.error} title="Top 进程加载失败" compact />
+          ) : topProcesses.data?.rows.length ? (
+            <ol className="top-list detailed-list">
+              {topProcesses.data.rows.map((row, index) => (
+                <li key={`${row.pid ?? 'none'}-${row.comm ?? 'unknown'}-${index}`}>
+                  <div>
+                    <strong>{safeText(row.comm)}</strong>
+                    <span>{row.pid !== null ? `PID ${row.pid}` : '按进程名聚合'}</span>
+                  </div>
+                  <div className="top-value">
+                    <strong>{formatBytes(row.totalBytes)}</strong>
+                    <span>{row.exe ? displayExecutableName(row.exe) : '未归因 / EXE 不可用'}</span>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <EmptyState title="暂无进程数据" description="当前时间范围没有命中的进程排行。" />
+          )}
         </section>
         <section className="panel">
           <div className="panel-head">
             <h2>Top 入站来源 IP</h2>
-            <Link to="/remotes?direction=in">查看全部</Link>
+            <Link to={buildDrilldownPath('/remotes', range, { direction: 'in' })}>查看全部</Link>
           </div>
-          <ol className="top-list detailed-list">
-            {topInboundRemotes.data?.rows.map((row) => (
-              <li key={`in-${row.remoteIp}`}>
-                <div>
-                  <strong>{safeText(row.remoteIp)}</strong>
-                  <span>{peerRoleLabel('in')}</span>
-                </div>
-                <div className="top-value">
-                  <strong>{formatBytes(row.totalBytes)}</strong>
-                  <span>上行 {formatBytes(row.bytesUp)} / 下行 {formatBytes(row.bytesDown)}</span>
-                </div>
-              </li>
-            ))}
-          </ol>
+          {topInboundRemotes.isError ? (
+            <QueryErrorState error={topInboundRemotes.error} title="入站排行加载失败" compact />
+          ) : topInboundRemotes.data?.rows.length ? (
+            <ol className="top-list detailed-list">
+              {topInboundRemotes.data.rows.map((row) => (
+                <li key={`in-${row.remoteIp}`}>
+                  <div>
+                    <strong>{safeText(row.remoteIp)}</strong>
+                    <span>{peerRoleLabel('in')}</span>
+                  </div>
+                  <div className="top-value">
+                    <strong>{formatBytes(row.totalBytes)}</strong>
+                    <span>上行 {formatBytes(row.bytesUp)} / 下行 {formatBytes(row.bytesDown)}</span>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <EmptyState title="暂无入站来源" description="当前时间范围没有命中的入站来源 IP。" />
+          )}
         </section>
         <section className="panel">
           <div className="panel-head">
             <h2>Top 出站目标 IP</h2>
-            <Link to="/remotes?direction=out">查看全部</Link>
+            <Link to={buildDrilldownPath('/remotes', range, { direction: 'out' })}>查看全部</Link>
           </div>
-          <ol className="top-list detailed-list">
-            {topOutboundRemotes.data?.rows.map((row) => (
-              <li key={`out-${row.remoteIp}`}>
-                <div>
-                  <strong>{safeText(row.remoteIp)}</strong>
-                  <span>{peerRoleLabel('out')}</span>
-                </div>
-                <div className="top-value">
-                  <strong>{formatBytes(row.totalBytes)}</strong>
-                  <span>上行 {formatBytes(row.bytesUp)} / 下行 {formatBytes(row.bytesDown)}</span>
-                </div>
-              </li>
-            ))}
-          </ol>
+          {topOutboundRemotes.isError ? (
+            <QueryErrorState error={topOutboundRemotes.error} title="出站排行加载失败" compact />
+          ) : topOutboundRemotes.data?.rows.length ? (
+            <ol className="top-list detailed-list">
+              {topOutboundRemotes.data.rows.map((row) => (
+                <li key={`out-${row.remoteIp}`}>
+                  <div>
+                    <strong>{safeText(row.remoteIp)}</strong>
+                    <span>{peerRoleLabel('out')}</span>
+                  </div>
+                  <div className="top-value">
+                    <strong>{formatBytes(row.totalBytes)}</strong>
+                    <span>上行 {formatBytes(row.bytesUp)} / 下行 {formatBytes(row.bytesDown)}</span>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <EmptyState title="暂无出站目标" description="当前时间范围没有命中的出站目标 IP。" />
+          )}
         </section>
         <section className="panel">
           <div className="panel-head">
             <h2>Top 端口</h2>
-            <Link to="/usage">查看全部</Link>
+            <Link to={buildDrilldownPath('/usage', range)}>查看全部</Link>
           </div>
-          <ol className="top-list">
-            {topPorts.data?.rows.slice(0, 5).map((row) => (
-              <li key={row.label}>
-                <span>{row.label}</span>
-                <strong>{formatBytes(row.value)}</strong>
-              </li>
-            ))}
-          </ol>
+          {topPorts.isError ? (
+            <QueryErrorState error={topPorts.error} title="端口排行加载失败" compact />
+          ) : topPorts.data?.rows.length ? (
+            <ol className="top-list">
+              {topPorts.data.rows.slice(0, 5).map((row) => (
+                <li key={row.label}>
+                  <span>{row.label}</span>
+                  <strong>{formatBytes(row.value)}</strong>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <EmptyState title="暂无端口数据" description="当前时间范围没有命中的端口排行。" />
+          )}
         </section>
       </section>
     </div>

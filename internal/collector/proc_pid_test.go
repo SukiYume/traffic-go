@@ -80,6 +80,37 @@ func TestProcessResolverNegativeCacheAvoidsRepeatedScans(t *testing.T) {
 	}
 }
 
+func TestProcessResolverScanFailureDoesNotWriteNegativeCache(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	resolver := newProcessResolver("/proc")
+	resolver.now = func() time.Time { return now }
+	resolver.lastFullScan = now
+
+	scanCalls := 0
+	resolver.scan = func(context.Context) (map[uint64]model.ProcessInfo, bool) {
+		scanCalls++
+		return nil, false
+	}
+
+	requested := map[uint64]struct{}{99: {}}
+	first := resolver.Resolve(context.Background(), requested)
+	if len(first) != 0 || scanCalls != 1 {
+		t.Fatalf("expected first scan failure without results, got results=%v scans=%d", first, scanCalls)
+	}
+	if _, exists := resolver.negativeCache[99]; exists {
+		t.Fatalf("did not expect negative cache entry on scan failure")
+	}
+
+	now = now.Add(time.Second)
+	second := resolver.Resolve(context.Background(), requested)
+	if len(second) != 0 || scanCalls != 2 {
+		t.Fatalf("expected immediate retry after scan failure, got results=%v scans=%d", second, scanCalls)
+	}
+	if _, exists := resolver.negativeCache[99]; exists {
+		t.Fatalf("did not expect negative cache entry after repeated scan failure")
+	}
+}
+
 func processInfo(pid int, comm string) model.ProcessInfo {
 	return model.ProcessInfo{
 		PID:  pid,

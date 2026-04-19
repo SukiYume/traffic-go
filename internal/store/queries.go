@@ -31,9 +31,9 @@ func usageSourceInfo(source string) sourceInfo {
 func forwardSourceInfo(source string) sourceInfo {
 	switch source {
 	case DataSourceHour:
-		return sourceInfo{Table: dataSourceHourForward, TimeCol: "hour_ts", DataLabel: dataSourceHourForward}
+		return sourceInfo{Table: DataSourceHourForward, TimeCol: "hour_ts", DataLabel: DataSourceHourForward}
 	default:
-		return sourceInfo{Table: dataSourceMinuteForward, TimeCol: "minute_ts", DataLabel: dataSourceMinuteForward}
+		return sourceInfo{Table: DataSourceMinuteForward, TimeCol: "minute_ts", DataLabel: DataSourceMinuteForward}
 	}
 }
 
@@ -101,6 +101,34 @@ func trimPage[T any](records []T, limit int, timeBucket func(T) int64, rowID fun
 	}
 	last := records[limit-1]
 	return records[:limit], EncodeCursor(timeBucket(last), rowID(last))
+}
+
+func countRows(ctx context.Context, db *sql.DB, statement string, args []any, label string) (int, error) {
+	var totalRows int
+	if err := db.QueryRowContext(ctx, statement, args...).Scan(&totalRows); err != nil {
+		return 0, fmt.Errorf("count %s: %w", label, err)
+	}
+	return totalRows, nil
+}
+
+func appendOffsetPagination(builder *strings.Builder, args *[]any, orderClause string, page int, pageSize int) {
+	resolvedPage := clampPage(page)
+	resolvedPageSize := clampPageSize(pageSize)
+	offset := (resolvedPage - 1) * resolvedPageSize
+	builder.WriteString(orderClause)
+	builder.WriteString(" LIMIT ? OFFSET ?")
+	*args = append(*args, resolvedPageSize, offset)
+}
+
+func appendCursorPagination(builder *strings.Builder, args *[]any, timeCol string, cursorTS int64, cursorRowID int64, limit int) int {
+	if cursorTS > 0 {
+		builder.WriteString(fmt.Sprintf(" AND (%s < ? OR (%s = ? AND rowid < ?))", timeCol, timeCol))
+		*args = append(*args, cursorTS, cursorTS, cursorRowID)
+	}
+	resolvedLimit := clampLimit(limit)
+	builder.WriteString(fmt.Sprintf(" ORDER BY %s DESC, rowid DESC LIMIT ?", timeCol))
+	*args = append(*args, resolvedLimit+1)
+	return resolvedLimit
 }
 
 func (s *Store) QueryOverview(ctx context.Context, start, end time.Time, source string) (model.OverviewStats, error) {
@@ -259,16 +287,11 @@ WHERE %s >= ? AND %s < ?
 	appendUsageFiltersDetailed(&builder, &args, query, source == DataSourceHour)
 	appendUsageFiltersDetailed(&countBuilder, &countArgs, query, source == DataSourceHour)
 	if query.UsePage {
-		var totalRows int
-		if err := s.db.QueryRowContext(ctx, countBuilder.String(), countArgs...).Scan(&totalRows); err != nil {
-			return nil, "", 0, fmt.Errorf("count usage: %w", err)
+		totalRows, err := countRows(ctx, s.db, countBuilder.String(), countArgs, "usage")
+		if err != nil {
+			return nil, "", 0, err
 		}
-		pageSize := clampPageSize(query.PageSize)
-		page := clampPage(query.Page)
-		offset := (page - 1) * pageSize
-		builder.WriteString(usageOrderClause(source, query.SortBy, query.SortOrder, info.TimeCol))
-		builder.WriteString(" LIMIT ? OFFSET ?")
-		args = append(args, pageSize, offset)
+		appendOffsetPagination(&builder, &args, usageOrderClause(source, query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize)
 
 		rows, err := s.db.QueryContext(ctx, builder.String(), args...)
 		if err != nil {
@@ -282,13 +305,7 @@ WHERE %s >= ? AND %s < ?
 		}
 		return records, "", totalRows, nil
 	}
-	if query.CursorTS > 0 {
-		builder.WriteString(fmt.Sprintf(" AND (%s < ? OR (%s = ? AND rowid < ?))", info.TimeCol, info.TimeCol))
-		args = append(args, query.CursorTS, query.CursorTS, query.CursorRowID)
-	}
-	limit := clampLimit(query.Limit)
-	builder.WriteString(fmt.Sprintf(" ORDER BY %s DESC, rowid DESC LIMIT ?", info.TimeCol))
-	args = append(args, limit+1)
+	limit := appendCursorPagination(&builder, &args, info.TimeCol, query.CursorTS, query.CursorRowID, query.Limit)
 
 	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
 	if err != nil {
@@ -352,7 +369,7 @@ func scanUsageRows(rows *sql.Rows, dataSource string) ([]model.UsageRecord, erro
 	return records, nil
 }
 
-func (s *Store) QueryTopProcesses(ctx context.Context, start, end time.Time, source string, sortBy, sortOrder string, limit, offset int) ([]model.ProcessSummary, int, error) {
+func (s *Store) QueryTopProcesses(ctx context.Context, start, end time.Time, source string, groupBy, sortBy, sortOrder string, limit, offset int) ([]model.ProcessSummary, int, error) {
 	info := usageSourceInfo(source)
 	pageSize := clampPageSize(limit)
 	pageOffset := offset
@@ -360,11 +377,16 @@ func (s *Store) QueryTopProcesses(ctx context.Context, start, end time.Time, sou
 		pageOffset = 0
 	}
 
-	groupBy := "comm"
-	selectExpr := "NULL AS pid, comm, NULL AS exe"
-	if source != DataSourceHour {
-		groupBy = "pid, comm, exe"
-		selectExpr = "pid, comm, exe"
+	resolvedGroupBy := "pid"
+	if source == DataSourceHour || strings.EqualFold(groupBy, "comm") {
+		resolvedGroupBy = "comm"
+	}
+
+	groupExpr := "pid, comm, exe"
+	selectExpr := "pid, comm, exe"
+	if resolvedGroupBy == "comm" {
+		groupExpr = "comm"
+		selectExpr = "NULL AS pid, comm, NULL AS exe"
 	}
 
 	countSQL := fmt.Sprintf(`
@@ -373,7 +395,7 @@ SELECT COUNT(*) FROM (
     FROM %s
     WHERE %s >= ? AND %s < ?
     GROUP BY %s
-)`, info.Table, info.TimeCol, info.TimeCol, groupBy)
+)`, info.Table, info.TimeCol, info.TimeCol, groupExpr)
 	var totalRows int
 	if err := s.db.QueryRowContext(ctx, countSQL, start.Unix(), end.Unix()).Scan(&totalRows); err != nil {
 		return nil, 0, fmt.Errorf("count top processes: %w", err)
@@ -381,6 +403,8 @@ SELECT COUNT(*) FROM (
 
 	sortExpr := "(SUM(bytes_up) + SUM(bytes_down))"
 	switch sortBy {
+	case "bytes_total", "total", "":
+		// Default total sort expression.
 	case "bytes_up":
 		sortExpr = "SUM(bytes_up)"
 	case "bytes_down":
@@ -390,7 +414,7 @@ SELECT COUNT(*) FROM (
 	case "comm":
 		sortExpr = "comm COLLATE NOCASE"
 	case "pid":
-		if source != DataSourceHour {
+		if resolvedGroupBy == "pid" {
 			sortExpr = "pid"
 		}
 	}
@@ -406,7 +430,7 @@ WHERE %s >= ? AND %s < ?
 GROUP BY %s
 ORDER BY %s %s, comm COLLATE NOCASE ASC
 LIMIT ? OFFSET ?
-`, selectExpr, info.Table, info.TimeCol, info.TimeCol, groupBy, sortExpr, order), start.Unix(), end.Unix(), pageSize, pageOffset)
+`, selectExpr, info.Table, info.TimeCol, info.TimeCol, groupExpr, sortExpr, order), start.Unix(), end.Unix(), pageSize, pageOffset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query top processes: %w", err)
 	}
@@ -457,6 +481,8 @@ func (s *Store) QueryTopRemotes(ctx context.Context, start, end time.Time, sourc
 
 	sortExpr := "(SUM(bytes_up) + SUM(bytes_down))"
 	switch sortBy {
+	case "bytes_total", "total", "":
+		// Default total sort expression.
 	case "bytes_up":
 		sortExpr = "SUM(bytes_up)"
 	case "bytes_down":
@@ -574,16 +600,11 @@ WHERE %s >= ? AND %s < ?
 		countArgs = append(countArgs, query.OrigDstIP)
 	}
 	if query.UsePage {
-		var totalRows int
-		if err := s.db.QueryRowContext(ctx, countBuilder.String(), countArgs...).Scan(&totalRows); err != nil {
-			return nil, "", 0, fmt.Errorf("count forward usage: %w", err)
+		totalRows, err := countRows(ctx, s.db, countBuilder.String(), countArgs, "forward usage")
+		if err != nil {
+			return nil, "", 0, err
 		}
-		pageSize := clampPageSize(query.PageSize)
-		page := clampPage(query.Page)
-		offset := (page - 1) * pageSize
-		builder.WriteString(forwardOrderClause(query.SortBy, query.SortOrder, info.TimeCol))
-		builder.WriteString(" LIMIT ? OFFSET ?")
-		args = append(args, pageSize, offset)
+		appendOffsetPagination(&builder, &args, forwardOrderClause(query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize)
 
 		rows, err := s.db.QueryContext(ctx, builder.String(), args...)
 		if err != nil {
@@ -597,13 +618,7 @@ WHERE %s >= ? AND %s < ?
 		}
 		return records, "", totalRows, nil
 	}
-	if query.CursorTS > 0 {
-		builder.WriteString(fmt.Sprintf(" AND (%s < ? OR (%s = ? AND rowid < ?))", info.TimeCol, info.TimeCol))
-		args = append(args, query.CursorTS, query.CursorTS, query.CursorRowID)
-	}
-	limit := clampLimit(query.Limit)
-	builder.WriteString(fmt.Sprintf(" ORDER BY %s DESC, rowid DESC LIMIT ?", info.TimeCol))
-	args = append(args, limit+1)
+	limit := appendCursorPagination(&builder, &args, info.TimeCol, query.CursorTS, query.CursorRowID, query.Limit)
 
 	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
 	if err != nil {

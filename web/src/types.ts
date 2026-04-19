@@ -9,6 +9,7 @@ export type UsageSortKey = 'minuteTs' | 'bytesUp' | 'bytesDown' | 'bytesTotal' |
 export type ForwardSortKey = 'minuteTs' | 'bytesOrig' | 'bytesReply' | 'bytesTotal' | 'flowCount' | 'origSrc' | 'origDst';
 export type RemoteSortKey = 'remoteIp' | 'direction' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount';
 export type ProcessSortKey = 'comm' | 'pid' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount';
+export type ProcessGroupBy = 'pid' | 'comm';
 
 export interface OverviewStats {
   bytesUp: number;
@@ -108,6 +109,19 @@ export interface UsageQuery {
   sortOrder?: SortOrder;
 }
 
+export interface ForwardUsageQuery {
+  range: RangeKey;
+  origSrcIp?: string;
+  origDstIp?: string;
+  proto?: string;
+  cursor?: string;
+  limit?: number;
+  page?: number;
+  pageSize?: number;
+  sortBy?: ForwardSortKey;
+  sortOrder?: SortOrder;
+}
+
 export interface PaginationMeta {
   page: number;
   pageSize: number;
@@ -134,16 +148,38 @@ export interface UsageExplainPeer {
   flowCount: number;
 }
 
+export interface UsageExplainChain {
+  chainId?: string | null;
+  sourceIp: string | null;
+  targetIp: string | null;
+  targetHost: string | null;
+  targetHostNormalized?: string | null;
+  targetPort: number | null;
+  localPort: number | null;
+  bytesTotal: number;
+  flowCount: number;
+  evidenceCount: number;
+  evidence: string;
+  evidenceSource?: string | null;
+  sampleFingerprint?: string | null;
+  sampleMessage?: string | null;
+  sampleTime?: number | null;
+  confidence: ExplainConfidence;
+}
+
 export interface UsageExplainNginxRequest {
   time: number;
   method: string;
   host: string | null;
+  hostNormalized?: string | null;
   path: string;
   status: number;
   count: number;
+  clientIp?: string | null;
   referer: string | null;
   userAgent: string | null;
   bot: string | null;
+  sampleFingerprint?: string | null;
 }
 
 export interface UsageExplain {
@@ -151,6 +187,7 @@ export interface UsageExplain {
   confidence: ExplainConfidence;
   sourceIps: string[];
   targetIps: string[];
+  chains: UsageExplainChain[];
   relatedPeers: UsageExplainPeer[];
   nginxRequests: UsageExplainNginxRequest[];
   notes: string[];
@@ -207,10 +244,10 @@ export interface TrafficApiClient {
   getOverview(range: RangeKey): Promise<OverviewStats>;
   getTimeSeries(range: RangeKey, groupBy?: GroupBy, filters?: TimeSeriesFilters): Promise<TimeSeriesResponse>;
   getUsage(query: UsageQuery): Promise<UsageResponse>;
-  getUsageExplain(row: UsageRow): Promise<UsageExplain>;
-  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder }): Promise<ProcessSummaryResponse>;
+  getUsageExplain(row: UsageRow, options?: { dataSource?: DataSource; allowScan?: boolean }): Promise<UsageExplain>;
+  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy }): Promise<ProcessSummaryResponse>;
   getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean }): Promise<RemoteSummaryResponse>;
   getTopPorts(range: RangeKey): Promise<TopResponse>;
   getProcesses(): Promise<ProcessesResponse>;
-  getForwardUsage(query: UsageQuery): Promise<ForwardUsageResponse>;
+  getForwardUsage(query: ForwardUsageQuery): Promise<ForwardUsageResponse>;
 }

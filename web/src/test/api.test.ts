@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createHttpClient, shouldUseMockApi } from '../api';
+import { createHttpClient, normalizeUsageSortKey, shouldUseMockApi } from '../api';
 
 const fetchMock = vi.fn<typeof fetch>();
 
@@ -195,7 +195,13 @@ describe('http api client', () => {
       );
 
     const client = createHttpClient();
-    const processes = await client.getTopProcesses('24h', { page: 1, pageSize: 5, sortBy: 'bytesTotal', sortOrder: 'desc' });
+    const processes = await client.getTopProcesses('24h', {
+      page: 1,
+      pageSize: 5,
+      sortBy: 'bytesTotal',
+      sortOrder: 'desc',
+      groupBy: 'comm',
+    });
     const remotes = await client.getTopRemotes('24h', {
       page: 2,
       pageSize: 10,
@@ -206,16 +212,133 @@ describe('http api client', () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      '/api/v1/top/processes?range=24h&page=1&page_size=5&sort_by=total&sort_order=desc',
+      '/api/v1/top/processes?range=24h&page=1&page_size=5&sort_by=bytes_total&sort_order=desc&group_by=comm',
       expect.any(Object),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      '/api/v1/top/remotes?range=24h&page=2&page_size=10&sort_by=total&sort_order=desc&direction=in',
+      '/api/v1/top/remotes?range=24h&page=2&page_size=10&sort_by=bytes_total&sort_order=desc&direction=in',
       expect.any(Object),
     );
     expect(processes.rows[0]).toMatchObject({ pid: 1045, comm: 'nginx', totalBytes: 480 });
     expect(remotes.rows[0]).toMatchObject({ direction: 'in', remoteIp: '203.0.113.24', totalBytes: 480 });
+  });
+
+  it('preserves empty process names in hourly process summaries', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data_source: 'usage_1h',
+          page: 1,
+          page_size: 25,
+          total_rows: 1,
+          data: [
+            {
+              pid: null,
+              comm: '',
+              exe: null,
+              bytes_up: 120,
+              bytes_down: 360,
+              flow_count: 3,
+            },
+          ],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    const response = await client.getTopProcesses('90d', { groupBy: 'comm' });
+
+    expect(response.dataSource).toBe('usage_1h');
+    expect(response.rows[0]).toMatchObject({
+      pid: null,
+      comm: '',
+      exe: null,
+      totalBytes: 480,
+    });
+  });
+
+  it('includes the loopback flag in remote summary queries when requested', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data_source: 'usage_1m',
+          page: 1,
+          page_size: 10,
+          total_rows: 1,
+          data: [
+            { direction: 'out', remote_ip: '127.0.0.1', bytes_up: 120, bytes_down: 360, flow_count: 3 },
+          ],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    await client.getTopRemotes('24h', {
+      page: 1,
+      pageSize: 10,
+      includeLoopback: true,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/top/remotes?range=24h&page=1&page_size=10&sort_by=bytes_total&include_loopback=1',
+      expect.any(Object),
+    );
+  });
+
+  it('maps forward filters to backend query params', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data_source: 'usage_1m_forward',
+          next_cursor: null,
+          page: 1,
+          page_size: 10,
+          total_rows: 1,
+          data: [
+            {
+              time_bucket: 1710000000,
+              proto: 'tcp',
+              orig_src_ip: '10.0.0.2',
+              orig_dst_ip: '1.1.1.1',
+              orig_sport: 51122,
+              orig_dport: 443,
+              bytes_orig: 120,
+              bytes_reply: 360,
+              pkts_orig: 4,
+              pkts_reply: 8,
+              flow_count: 1,
+            },
+          ],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    const response = await client.getForwardUsage({
+      range: '24h',
+      proto: 'tcp',
+      origSrcIp: '10.0.0.2',
+      origDstIp: '1.1.1.1',
+      page: 1,
+      pageSize: 10,
+      sortBy: 'bytesTotal',
+      sortOrder: 'desc',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/forward/usage?range=24h&proto=tcp&orig_src_ip=10.0.0.2&orig_dst_ip=1.1.1.1&page=1&page_size=10&sort_by=bytes_total&sort_order=desc',
+      expect.any(Object),
+    );
+    expect(response.rows[0]).toMatchObject({
+      origSrc: '10.0.0.2',
+      origDst: '1.1.1.1',
+      bytesOrig: 120,
+      bytesReply: 360,
+    });
   });
 
   it('requests usage explain endpoint and decodes nested fields', async () => {
@@ -228,6 +351,26 @@ describe('http api client', () => {
             confidence: 'medium',
             source_ips: ['203.0.113.24'],
             target_ips: ['142.250.72.14'],
+            chains: [
+              {
+                chain_id: 'usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|142.250.72.14|chatgpt.com|443',
+                source_ip: '203.0.113.24',
+                target_ip: '142.250.72.14',
+                target_host: 'chatgpt.com',
+                target_host_normalized: 'chatgpt.com',
+                target_port: 443,
+                local_port: 47920,
+                bytes_total: 8062000,
+                flow_count: 4,
+                evidence_count: 3,
+                evidence: 'ss-log',
+                evidence_source: 'ss',
+                sample_fingerprint: 'fp-1',
+                sample_message: 'relay connect',
+                sample_time: 1710000012,
+                confidence: 'high',
+              },
+            ],
             related_peers: [
               {
                 direction: 'out',
@@ -262,10 +405,10 @@ describe('http api client', () => {
       pktsUp: 1,
       pktsDown: 2,
       flowCount: 1,
-    });
+    }, { dataSource: 'usage_1h' });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage/explain?ts=1710000000&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443',
+      '/api/v1/usage/explain?ts=1710000000&data_source=usage_1h&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443',
       expect.any(Object),
     );
     expect(result).toMatchObject({
@@ -274,6 +417,22 @@ describe('http api client', () => {
       sourceIps: ['203.0.113.24'],
       targetIps: ['142.250.72.14'],
       notes: ['Shadowsocks 只能做同进程同时间窗关联。'],
+    });
+    expect(result.chains[0]).toMatchObject({
+      chainId: 'usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|142.250.72.14|chatgpt.com|443',
+      sourceIp: '203.0.113.24',
+      targetIp: '142.250.72.14',
+      targetHost: 'chatgpt.com',
+      targetHostNormalized: 'chatgpt.com',
+      targetPort: 443,
+      localPort: 47920,
+      evidenceCount: 3,
+      evidence: 'ss-log',
+      evidenceSource: 'ss',
+      sampleFingerprint: 'fp-1',
+      sampleMessage: 'relay connect',
+      sampleTime: 1710000012,
+      confidence: 'high',
     });
     expect(result.relatedPeers[0]).toMatchObject({
       direction: 'out',
@@ -298,12 +457,15 @@ describe('http api client', () => {
                 time: 1710000000,
                 method: 'GET',
                 host: 'paris.escape.ac.cn',
+                host_normalized: 'paris.escape.ac.cn',
                 path: '/apod/2023/12/AstroPH-2023-12',
                 status: 200,
                 count: 3,
+                client_ip: '127.0.0.1',
                 referer: 'https://paris.escape.ac.cn/sitemap.xml',
                 user_agent: 'Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)',
                 bot: 'GPTBot',
+                sample_fingerprint: 'nginx-fp-1',
               },
             ],
             notes: ['访问端识别：GPTBot(3)'],
@@ -334,7 +496,10 @@ describe('http api client', () => {
       path: '/apod/2023/12/AstroPH-2023-12',
       count: 3,
       bot: 'GPTBot',
+      clientIp: '127.0.0.1',
+      hostNormalized: 'paris.escape.ac.cn',
       referer: 'https://paris.escape.ac.cn/sitemap.xml',
+      sampleFingerprint: 'nginx-fp-1',
     });
   });
 
@@ -342,5 +507,15 @@ describe('http api client', () => {
     expect(shouldUseMockApi(undefined)).toBe(false);
     expect(shouldUseMockApi('0')).toBe(false);
     expect(shouldUseMockApi('1')).toBe(true);
+  });
+});
+
+describe('normalizeUsageSortKey', () => {
+  it('falls back to minuteTs for unknown values', () => {
+    expect(normalizeUsageSortKey('bogus')).toBe('minuteTs');
+  });
+
+  it('keeps supported sort keys unchanged', () => {
+    expect(normalizeUsageSortKey('bytesTotal')).toBe('bytesTotal');
   });
 });

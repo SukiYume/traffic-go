@@ -8,7 +8,7 @@ import {
   type OnChangeFn,
   type SortingState,
 } from '@tanstack/react-table';
-import type { ReactNode } from 'react';
+import type { KeyboardEvent, ReactNode } from 'react';
 import { formatNumber } from '../utils';
 
 type PaginationState = {
@@ -37,6 +37,11 @@ function columnMetaToClassName(meta: TableColumnMeta | undefined, target: 'heade
   return filtered.length ? filtered.join(' ') : undefined;
 }
 
+function isInteractiveTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest('button, a, input, select, textarea, summary, [role="button"]'));
+}
+
 export function DataTable<TData>({
   columns,
   data,
@@ -51,6 +56,9 @@ export function DataTable<TData>({
   isRowSelected,
   expandedRowIndex,
   onExpandRow,
+  expandedRowKey,
+  onExpandRowKeyChange,
+  getExpandedRowKey,
   renderExpandedRow,
 }: {
   columns: ColumnDef<TData, any>[];
@@ -66,6 +74,9 @@ export function DataTable<TData>({
   isRowSelected?: (row: TData) => boolean;
   expandedRowIndex?: number | null;
   onExpandRow?: (index: number | null) => void;
+  expandedRowKey?: string | null;
+  onExpandRowKeyChange?: (key: string | null) => void;
+  getExpandedRowKey?: (row: TData) => string;
   renderExpandedRow?: (row: TData) => ReactNode;
 }) {
   const table = useReactTable({
@@ -117,25 +128,48 @@ export function DataTable<TData>({
             {table.getRowModel().rows.length ? (
               table.getRowModel().rows.map((row) => {
                 const rowIndex = Number(row.id);
-                const isExpanded = expandedRowIndex === rowIndex && renderExpandedRow != null;
-                const handleClick = renderExpandedRow && onExpandRow
+                const rowExpansionKey = getExpandedRowKey?.(row.original);
+                const canExpandByKey = renderExpandedRow != null && onExpandRowKeyChange != null && rowExpansionKey != null;
+                const isExpanded = renderExpandedRow != null
+                  ? canExpandByKey
+                    ? expandedRowKey === rowExpansionKey
+                    : expandedRowIndex === rowIndex
+                  : false;
+                const handleClick = canExpandByKey
                   ? () => {
                       if (window.getSelection()?.toString()) return;
-                      onExpandRow(isExpanded ? null : rowIndex);
+                      onExpandRowKeyChange(isExpanded ? null : rowExpansionKey);
                     }
-                  : onRowClick
+                  : renderExpandedRow && onExpandRow
                     ? () => {
                         if (window.getSelection()?.toString()) return;
-                        onRowClick(row.original);
+                        onExpandRow(isExpanded ? null : rowIndex);
                       }
-                    : undefined;
+                    : onRowClick
+                      ? () => {
+                          if (window.getSelection()?.toString()) return;
+                          onRowClick(row.original);
+                        }
+                      : undefined;
+                const handleKeyDown = handleClick
+                  ? (event: KeyboardEvent<HTMLTableRowElement>) => {
+                      if (event.defaultPrevented || isInteractiveTarget(event.target)) return;
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        handleClick();
+                      }
+                    }
+                  : undefined;
 
                 return (
                   <Fragment key={row.id}>
                     <tr
                       className={isRowSelected?.(row.original) ? 'selected' : isExpanded ? 'selected' : undefined}
                       onClick={handleClick}
+                      onKeyDown={handleKeyDown}
                       style={handleClick ? { cursor: 'pointer' } : undefined}
+                      tabIndex={handleClick ? 0 : undefined}
+                      aria-expanded={renderExpandedRow != null ? isExpanded : undefined}
                     >
                       {row.getVisibleCells().map((cell) => {
                         const meta = (cell.column.columnDef.meta as TableColumnMeta | undefined) ?? undefined;
@@ -149,7 +183,7 @@ export function DataTable<TData>({
                     {isExpanded && (
                       <tr>
                         <td colSpan={columns.length} onClick={(e) => e.stopPropagation()}>
-                          {renderExpandedRow(row.original)}
+                          {renderExpandedRow ? renderExpandedRow(row.original) : null}
                         </td>
                       </tr>
                     )}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"traffic-go/internal/evidence"
 	"traffic-go/internal/model"
 )
 
@@ -51,7 +52,7 @@ func TestListLogFilesFiltersByDateRange(t *testing.T) {
 
 	start := time.Date(2026, 4, 16, 1, 0, 0, 0, time.UTC).Unix()
 	end := time.Date(2026, 4, 16, 1, 20, 0, 0, time.UTC).Unix()
-	files, err := listLogFiles(dir, isShadowsocksLogFileName, start, end, 10)
+	files, err := evidence.ListLogFiles(dir, isShadowsocksLogFileName, start, end, 10)
 	if err != nil {
 		t.Fatalf("list log files: %v", err)
 	}
@@ -169,6 +170,9 @@ func TestParseSSEvidenceLineConnectHost(t *testing.T) {
 	if evidence.Path != "443" {
 		t.Fatalf("expected target port 443 in path, got %+v", evidence)
 	}
+	if evidence.EntryPort != 12096 {
+		t.Fatalf("expected entry port 12096, got %+v", evidence)
+	}
 }
 
 func TestParseSSEvidenceLineUDPCacheMiss(t *testing.T) {
@@ -187,6 +191,38 @@ func TestParseSSEvidenceLineUDPCacheMiss(t *testing.T) {
 	if evidence.ClientIP != "223.104.41.114" {
 		t.Fatalf("expected client ip from udp pair, got %+v", evidence)
 	}
+	if evidence.EntryPort != 12096 {
+		t.Fatalf("expected entry port 12096, got %+v", evidence)
+	}
+}
+
+func TestExtractLogEntryPortPrefersLastBracketedPort(t *testing.T) {
+	line := "Apr 16 20:34:11 217 /usr/local/bin/ss-server[27896]: [12096] connect to chatgpt.com:443"
+	if got := extractLogEntryPort(line); got != 12096 {
+		t.Fatalf("expected entry port 12096, got %d", got)
+	}
+}
+
+func TestIsShadowsocksLogFileNameSupportsSharedDirectoryNames(t *testing.T) {
+	cases := []string{"server.log", "manager.log", "obfs.log", "ss-server.log"}
+	for _, name := range cases {
+		if !isShadowsocksLogFileName(name) {
+			t.Fatalf("expected %s to be treated as shadowsocks log", name)
+		}
+	}
+}
+
+func TestLookupConfiguredProcessLogDirFallsBackToShadowsocksFamily(t *testing.T) {
+	server := newTestServer(t)
+	setProcessLogDir(server, "obfs-server", "/var/log/shadowsocks")
+
+	key, dir, ok := server.lookupConfiguredProcessLogDir("ss-server", "/usr/bin/ss-server")
+	if !ok {
+		t.Fatalf("expected shadowsocks family fallback to succeed")
+	}
+	if key != "obfs-server" || dir != "/var/log/shadowsocks" {
+		t.Fatalf("unexpected fallback match: key=%q dir=%q", key, dir)
+	}
 }
 
 func TestScanEvidenceFilesReturnsScannerError(t *testing.T) {
@@ -197,10 +233,10 @@ func TestScanEvidenceFilesReturnsScannerError(t *testing.T) {
 		t.Fatalf("write oversized log line: %v", err)
 	}
 
-	_, err := scanEvidenceFiles(
+	_, err := evidence.ScanFiles(
 		context.Background(),
 		evidenceSourceSS,
-		[]logFileCandidate{{Path: path}},
+		[]evidence.LogFileCandidate{{Path: path}},
 		func(source string, line string, reference time.Time) (model.LogEvidence, bool) {
 			return model.LogEvidence{}, false
 		},
@@ -219,16 +255,248 @@ func TestScanEvidenceFilesReturnsScannerError(t *testing.T) {
 	}
 }
 
-func TestSSLogDirCandidatesIncludeShadowsocksSubdir(t *testing.T) {
-	dirs := ssLogDirCandidates("/var/log")
-	found := false
-	for _, dir := range dirs {
-		if strings.Contains(strings.ToLower(dir), "shadowsocks") {
-			found = true
-			break
+func TestListLogFilesSupportsGlobPathSpec(t *testing.T) {
+	dir := t.TempDir()
+	inside := filepath.Join(dir, "frps.log-20260416")
+	outside := filepath.Join(dir, "frps.log-20260301")
+	if err := os.WriteFile(inside, []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("write inside file: %v", err)
+	}
+	if err := os.WriteFile(outside, []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+
+	start := time.Date(2026, 4, 16, 1, 0, 0, 0, time.UTC).Unix()
+	end := time.Date(2026, 4, 16, 1, 20, 0, 0, time.UTC).Unix()
+	pathSpec := filepath.Join(dir, "frps*")
+	files, err := evidence.ListLogFiles(pathSpec, isGenericLogFileName, start, end, 10)
+	if err != nil {
+		t.Fatalf("list log files with glob: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(files))
+	}
+	if !strings.Contains(files[0].Path, "20260416") {
+		t.Fatalf("expected in-range file selected, got %s", files[0].Path)
+	}
+}
+
+func TestListLogFilesAppliesNameMatcherToDirectFilePath(t *testing.T) {
+	dir := t.TempDir()
+	notLog := filepath.Join(dir, "frps.txt")
+	if err := os.WriteFile(notLog, []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("write non-log file: %v", err)
+	}
+
+	start := time.Date(2026, 4, 16, 1, 0, 0, 0, time.UTC).Unix()
+	end := time.Date(2026, 4, 16, 1, 20, 0, 0, time.UTC).Unix()
+	files, err := evidence.ListLogFiles(notLog, isGenericLogFileName, start, end, 10)
+	if err != nil {
+		t.Fatalf("list direct non-log file: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("expected direct file path to be filtered by matcher, got %v", files)
+	}
+}
+
+func TestMessageHasExactIP(t *testing.T) {
+	message := `bridge src=11.1.1.10:5000 dst=198.51.100.1:443`
+	if messageHasExactIP(message, "1.1.1.1") {
+		t.Fatalf("did not expect substring IP match")
+	}
+	if !messageHasExactIP(message, "11.1.1.10") {
+		t.Fatalf("expected exact token IP match")
+	}
+}
+
+func TestMergeChainUsageMetricsSkipsAmbiguousHostOnlyFallback(t *testing.T) {
+	remotePort := 443
+	query := usageExplainQuery{
+		Direction:  model.DirectionOut,
+		RemoteIP:   "142.250.72.14",
+		RemotePort: &remotePort,
+	}
+	chains := map[string]chainAgg{
+		"alpha": {
+			SourceIP:   "203.0.113.24",
+			TargetHost: "alpha.example",
+			TargetPort: 443,
+			LocalPort:  12096,
+		},
+		"beta": {
+			SourceIP:   "203.0.113.24",
+			TargetHost: "beta.example",
+			TargetPort: 443,
+			LocalPort:  12096,
+		},
+	}
+	related := []model.UsageRecord{
+		{
+			Direction:  model.DirectionIn,
+			RemoteIP:   "203.0.113.24",
+			LocalPort:  12096,
+			BytesUp:    1024,
+			BytesDown:  4096,
+			FlowCount:  3,
+			RemotePort: &remotePort,
+		},
+		{
+			Direction:  model.DirectionOut,
+			RemoteIP:   "142.250.72.14",
+			LocalPort:  47920,
+			BytesUp:    2048,
+			BytesDown:  8192,
+			FlowCount:  4,
+			RemotePort: &remotePort,
+		},
+	}
+
+	mergeChainUsageMetrics(chains, query, related)
+
+	for key, chain := range chains {
+		if chain.TargetIP != "" {
+			t.Fatalf("expected ambiguous host-only chain %s to keep target ip unresolved, got %+v", key, chain)
+		}
+		if chain.BytesTotal != 0 || chain.FlowCount != 0 {
+			t.Fatalf("expected ambiguous host-only chain %s to avoid duplicated usage totals, got %+v", key, chain)
 		}
 	}
-	if !found {
-		t.Fatalf("expected shadowsocks subdir candidate, got %v", dirs)
+}
+
+func TestMergeChainUsageMetricsHydratesUniqueHostOnlyOutboundChain(t *testing.T) {
+	remotePort := 443
+	query := usageExplainQuery{
+		Direction:  model.DirectionOut,
+		RemoteIP:   "142.250.72.14",
+		RemotePort: &remotePort,
+	}
+	chains := map[string]chainAgg{
+		"alpha": {
+			TargetHost: "chatgpt.com",
+			TargetPort: 443,
+			LocalPort:  12096,
+		},
+	}
+	related := []model.UsageRecord{
+		{
+			Direction:  model.DirectionIn,
+			RemoteIP:   "203.0.113.24",
+			LocalPort:  12096,
+			BytesUp:    1024,
+			BytesDown:  4096,
+			FlowCount:  3,
+			RemotePort: &remotePort,
+		},
+		{
+			Direction:  model.DirectionOut,
+			RemoteIP:   "142.250.72.14",
+			LocalPort:  47920,
+			BytesUp:    2048,
+			BytesDown:  8192,
+			FlowCount:  4,
+			RemotePort: &remotePort,
+		},
+	}
+
+	mergeChainUsageMetrics(chains, query, related)
+
+	chain := chains["alpha"]
+	if chain.TargetIP != "142.250.72.14" {
+		t.Fatalf("expected target ip to be hydrated from outbound usage, got %+v", chain)
+	}
+	if chain.BytesTotal != 10240 || chain.FlowCount != 4 {
+		t.Fatalf("expected outbound usage totals to attach to hydrated chain, got %+v", chain)
+	}
+}
+
+func TestShouldPersistCanonicalChainSkipsWeakZeroMetricCandidates(t *testing.T) {
+	if shouldPersistCanonicalChain(usageExplainChain{
+		TargetHost: "chatgpt.com",
+		TargetPort: nullablePort(443),
+		LocalPort:  nullablePort(12096),
+		BytesTotal: 0,
+		FlowCount:  0,
+		Confidence: "medium",
+		Evidence:   "ss-log",
+		SourceIP:   "",
+		TargetIP:   "",
+	}) {
+		t.Fatalf("expected zero-metric host-only candidate to be skipped")
+	}
+
+	if !shouldPersistCanonicalChain(usageExplainChain{
+		TargetHost: "chatgpt.com",
+		TargetPort: nullablePort(443),
+		LocalPort:  nullablePort(12096),
+		TargetIP:   "142.250.72.14",
+		BytesTotal: 10240,
+		FlowCount:  4,
+		Confidence: "medium",
+		Evidence:   "ss-log",
+	}) {
+		t.Fatalf("expected hydrated chain with traffic totals to be persisted")
+	}
+}
+
+func TestShouldPersistCanonicalChainSkipsUnresolvedHostOnlyCandidates(t *testing.T) {
+	if shouldPersistCanonicalChain(usageExplainChain{
+		SourceIP:   "203.0.113.24",
+		TargetHost: "chatgpt.com",
+		TargetPort: nullablePort(443),
+		LocalPort:  nullablePort(12096),
+		BytesTotal: 4096,
+		FlowCount:  2,
+		Confidence: "high",
+		Evidence:   "ss-log",
+	}) {
+		t.Fatalf("expected host-only chain without target ip to stay ephemeral")
+	}
+}
+
+func TestMergeExplainChainsPrefersRicherIncomingChain(t *testing.T) {
+	existing := []usageExplainChain{
+		{
+			ChainID:       "usage_chain_1m|a",
+			SourceIP:      "203.0.113.24",
+			TargetIP:      "142.250.72.14",
+			TargetPort:    nullablePort(443),
+			LocalPort:     nullablePort(12096),
+			BytesTotal:    1024,
+			FlowCount:     1,
+			EvidenceCount: 1,
+			Evidence:      "分钟链路记录",
+			Confidence:    "low",
+		},
+	}
+	incoming := []usageExplainChain{
+		{
+			ChainID:              "usage_chain_1h|b",
+			SourceIP:             "203.0.113.24",
+			TargetIP:             "142.250.72.14",
+			TargetHost:           "chatgpt.com",
+			TargetHostNormalized: "chatgpt.com",
+			TargetPort:           nullablePort(443),
+			LocalPort:            nullablePort(12096),
+			BytesTotal:           8192,
+			FlowCount:            4,
+			EvidenceCount:        3,
+			Evidence:             "小时链路记录",
+			EvidenceSource:       "ss-log",
+			SampleFingerprint:    "fp-1",
+			SampleMessage:        "connect to chatgpt.com:443",
+			SampleTime:           1713232800,
+			Confidence:           "high",
+		},
+	}
+
+	merged := mergeExplainChains(existing, incoming, 0)
+	if len(merged) != 1 {
+		t.Fatalf("expected merged chain count 1, got %+v", merged)
+	}
+	if merged[0].TargetHost != "chatgpt.com" || merged[0].Confidence != "high" {
+		t.Fatalf("expected richer incoming chain to win, got %+v", merged[0])
+	}
+	if merged[0].BytesTotal != 8192 || merged[0].FlowCount != 4 || merged[0].EvidenceCount != 3 {
+		t.Fatalf("expected merged metrics to keep richer chain totals, got %+v", merged[0])
 	}
 }

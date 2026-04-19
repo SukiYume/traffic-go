@@ -7,16 +7,44 @@
 
 # Change the port here if the default local listen address conflicts with another service.
 listen: "127.0.0.1:18080"
-# install-centos7.sh rewrites this to ${INSTALL_ROOT}/traffic.db during install.
+# install-centos7.sh rewrites this to /var/lib/traffic-go/traffic.db during install.
 db_path: ./traffic.db
 tick_interval: 2s
 log_level: info
-nginx_log_dir: /var/log/nginx
-ss_log_dir: /var/log/shadowsocks
+
+# Process-specific log directories for usage/explain log correlation.
+# Keys are process names (comm/exe basename, case-insensitive).
+# No built-in defaults: only configured process keys are searched.
+# Values support both directory paths and glob file patterns.
+# For shadowsocks-libev + simple-obfs on CentOS7, a practical setup is:
+#   /var/log/shadowsocks/server.log
+#   /var/log/shadowsocks/manager.log
+#   /var/log/shadowsocks/obfs.log
+process_log_dirs:
+  nginx: /var/log/nginx
+  ss-server: /var/log/shadowsocks
+  ss-manager: /var/log/shadowsocks
+  obfs-server: /var/log/shadowsocks
+  frps: /root/frp_0630/frps*
+  # rustdesk: /var/log/rustdesk
+
+# Legacy compatibility keys (optional).
+# If process_log_dirs already contains nginx/ss-server, those entries win.
+# nginx_log_dir: /var/log/nginx
+# ss_log_dir: /var/log/shadowsocks
 
 retention:
   flows_days: 30
   hourly_days: 180
   # Queries longer than flows_days automatically fall back to hourly aggregates
   # and lose pid/exe-level filtering.
+
+prefetch:
+  enabled: true
+  interval: 1m
+  evidence_lookback: 20m
+  chain_lookback: 20m
+  scan_budget: 8s
+  max_scan_files: 6
+  max_scan_lines_per_file: 250000
 # Hourly cleanup and weekly vacuum are built in and are not configurable here.

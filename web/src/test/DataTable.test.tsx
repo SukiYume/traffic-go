@@ -71,4 +71,43 @@ describe('DataTable row expansion', () => {
     );
     expect(screen.queryByText('should-not-show')).not.toBeInTheDocument();
   });
+
+  it('supports key-based expansion state for paginated tables', async () => {
+    const user = userEvent.setup();
+    const onExpandRowKeyChange = vi.fn();
+    render(
+      <DataTable
+        columns={columns}
+        data={data}
+        expandedRowKey={null}
+        onExpandRowKeyChange={onExpandRowKeyChange}
+        getExpandedRowKey={(row) => row.name}
+        renderExpandedRow={() => <div>detail</div>}
+      />, 
+    );
+
+    const rows = screen.getAllByRole('row');
+    await user.click(rows[2]);
+    expect(onExpandRowKeyChange).toHaveBeenCalledWith('beta');
+  });
+
+  it('supports keyboard activation for expandable rows', async () => {
+    const user = userEvent.setup();
+    const onExpandRow = vi.fn();
+    render(
+      <DataTable
+        columns={columns}
+        data={data}
+        expandedRowIndex={null}
+        onExpandRow={onExpandRow}
+        renderExpandedRow={() => <div>detail</div>}
+      />,
+    );
+
+    const rows = screen.getAllByRole('row');
+    rows[1].focus();
+    expect(rows[1]).toHaveAttribute('tabindex', '0');
+    await user.keyboard('{Enter}');
+    expect(onExpandRow).toHaveBeenCalledWith(0);
+  });
 });

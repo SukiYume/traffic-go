@@ -6,21 +6,55 @@ import { ChartPanel } from '../components/ChartPanel';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { DataTable } from '../components/DataTable';
 import { EmptyState } from '../components/EmptyState';
+import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
-import type { ProcessSummaryRow, RangeKey } from '../types';
+import { normalizeRangeKey } from '../ranges';
+import type { ProcessGroupBy, ProcessSortKey, ProcessSummaryRow, RangeKey } from '../types';
 import { clampText, displayExecutableName, executableName, formatBytes, rangeLabel, safeText } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
+const pageSize = 25;
 const columnHelper = createColumnHelper<ProcessSummaryRow>();
+
+function processRowKey(row: Pick<ProcessSummaryRow, 'pid' | 'comm' | 'exe'>) {
+  return `${row.pid ?? 'none'}-${row.comm ?? ''}-${row.exe ?? ''}`;
+}
+
+function buildProcessSeriesFilters(row: ProcessSummaryRow | null) {
+  if (!row) {
+    return undefined;
+  }
+  if (row.pid !== null) {
+    return {
+      comm: row.comm ?? undefined,
+      pid: row.pid,
+      exe: row.exe ?? undefined,
+    };
+  }
+  const filters: { comm?: string; exe?: string } = {};
+  if (row.comm?.trim()) {
+    filters.comm = row.comm;
+  }
+  if (row.exe?.trim()) {
+    filters.exe = row.exe;
+  }
+  return Object.keys(filters).length ? filters : undefined;
+}
+
+function toProcessSortKey(value: string | undefined): ProcessSortKey {
+  const candidates: ProcessSortKey[] = ['comm', 'pid', 'bytesUp', 'bytesDown', 'bytesTotal', 'flowCount'];
+  return candidates.includes(value as ProcessSortKey) ? (value as ProcessSortKey) : 'bytesTotal';
+}
 
 export function ProcessesPage() {
   const api = useApiClient();
   const [params, setParams] = useSearchParams();
-  const range = (params.get('range') as RangeKey | null) ?? defaultRange;
+  const range = normalizeRangeKey(params.get('range'), defaultRange);
+  const [page, setPage] = useState(1);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [sorting, setSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
-  const [groupBy, setGroupBy] = useState<'pid' | 'comm'>('pid');
+  const [groupBy, setGroupBy] = useState<ProcessGroupBy>('pid');
 
   const setRange = (next: RangeKey) => {
     const nextParams = new URLSearchParams(params);
@@ -28,13 +62,32 @@ export function ProcessesPage() {
     setParams(nextParams, { replace: true });
   };
 
+  const currentSort = sorting[0];
   const query = useQuery({
-    queryKey: ['process-summaries', range],
-    queryFn: () => api.getTopProcesses(range, { page: 1, pageSize: 100, sortBy: 'bytesTotal', sortOrder: 'desc' }),
+    queryKey: ['process-summaries', range, groupBy, page, currentSort?.id, currentSort?.desc],
+    queryFn: () =>
+      api.getTopProcesses(range, {
+        page,
+        pageSize,
+        groupBy,
+        sortBy: toProcessSortKey(currentSort?.id),
+        sortOrder: currentSort?.desc ? 'desc' : 'asc',
+      }),
   });
 
-  const rawRows = query.data?.rows ?? [];
+  const rows = query.data?.rows ?? [];
   const showPIDColumn = groupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
+  const showExeColumn = groupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
+
+  useEffect(() => {
+    setPage(1);
+  }, [range, groupBy, sorting]);
+
+  useEffect(() => {
+    if (query.data?.dataSource !== 'usage_1h') return;
+    if (groupBy === 'comm') return;
+    setGroupBy('comm');
+  }, [query.data?.dataSource, groupBy]);
 
   useEffect(() => {
     if (!showPIDColumn && sorting[0]?.id === 'pid') {
@@ -42,34 +95,11 @@ export function ProcessesPage() {
     }
   }, [showPIDColumn, sorting]);
 
-  const rows = useMemo(() => {
-    if (groupBy === 'pid' || query.data?.dataSource === 'usage_1h') return rawRows;
-    const map = new Map<string, ProcessSummaryRow>();
-    for (const row of rawRows) {
-      const key = row.comm ?? '未知';
-      const existing = map.get(key);
-      if (!existing) {
-        map.set(key, { ...row, pid: null, exe: null });
-      } else {
-        existing.bytesUp += row.bytesUp;
-        existing.bytesDown += row.bytesDown;
-        existing.totalBytes += row.totalBytes;
-        existing.flowCount += row.flowCount;
-      }
-    }
-    return Array.from(map.values()).sort((a, b) => {
-      const sortColumn = sorting[0];
-      if (!sortColumn) return b.totalBytes - a.totalBytes;
-      const vA = a[sortColumn.id as keyof ProcessSummaryRow] as number;
-      const vB = b[sortColumn.id as keyof ProcessSummaryRow] as number;
-      return sortColumn.desc ? vB - vA : vA - vB;
-    });
-  }, [rawRows, groupBy, sorting, query.data?.dataSource]);
   const selectedProcess = useMemo(() => {
     if (!rows.length) return null;
     const fallback = rows[0];
     if (!selectedKey) return fallback;
-    return rows.find((row) => `${row.pid ?? 'none'}-${row.comm ?? ''}-${row.exe ?? ''}` === selectedKey) ?? fallback;
+    return rows.find((row) => processRowKey(row) === selectedKey) ?? fallback;
   }, [rows, selectedKey]);
 
   useEffect(() => {
@@ -79,27 +109,22 @@ export function ProcessesPage() {
     }
     if (!selectedProcess) {
       const fallback = rows[0];
-      setSelectedKey(`${fallback.pid ?? 'none'}-${fallback.comm ?? ''}-${fallback.exe ?? ''}`);
+      setSelectedKey(processRowKey(fallback));
     }
   }, [rows, selectedProcess]);
 
+  const selectedSeriesFilters = useMemo(() => buildProcessSeriesFilters(selectedProcess), [selectedProcess]);
+  const canQuerySeries = Boolean(selectedSeriesFilters);
+
   const series = useQuery({
-    queryKey: ['process-series', range, selectedProcess?.pid, selectedProcess?.comm],
-    queryFn: () =>
-      api.getTimeSeries(
-        range,
-        'direction',
-        selectedProcess
-          ? selectedProcess.pid !== null
-            ? {
-                comm: selectedProcess.comm ?? undefined,
-                pid: selectedProcess.pid,
-                exe: selectedProcess.exe ?? undefined,
-              }
-            : { comm: selectedProcess.comm ?? undefined }
-          : undefined,
-      ),
-    enabled: Boolean(selectedProcess),
+    queryKey: ['process-series', range, selectedProcess ? processRowKey(selectedProcess) : null],
+    queryFn: () => {
+      if (!selectedSeriesFilters) {
+        throw new Error('missing process series filters');
+      }
+      return api.getTimeSeries(range, 'direction', selectedSeriesFilters);
+    },
+    enabled: canQuerySeries,
   });
 
   const columns = useMemo(
@@ -121,17 +146,21 @@ export function ProcessesPage() {
             }),
           ]
         : []),
-      columnHelper.accessor('exe', {
-        id: 'exe',
-        header: 'EXE',
-        enableSorting: false,
-        meta: { className: 'col-exe', nowrap: true },
-        cell: (info) => {
-          const raw = info.getValue();
-          const cmd = executableName(raw);
-          return <span title={cmd ?? undefined}>{clampText(displayExecutableName(raw), 36)}</span>;
-        },
-      }),
+      ...(showExeColumn
+        ? [
+            columnHelper.accessor('exe', {
+              id: 'exe',
+              header: 'EXE',
+              enableSorting: false,
+              meta: { className: 'col-exe', nowrap: true },
+              cell: (info) => {
+                const raw = info.getValue();
+                const cmd = executableName(raw);
+                return <span title={cmd ?? undefined}>{clampText(displayExecutableName(raw), 36)}</span>;
+              },
+            }),
+          ]
+        : []),
       columnHelper.accessor('bytesUp', {
         id: 'bytesUp',
         header: '上行',
@@ -151,7 +180,7 @@ export function ProcessesPage() {
         cell: (info) => formatBytes(info.getValue()),
       }),
     ],
-    [showPIDColumn],
+    [showExeColumn, showPIDColumn],
   );
 
   const processesTableClassName = showPIDColumn
@@ -190,7 +219,9 @@ export function ProcessesPage() {
         </section>
       )}
 
-      {rows.length ? (
+      {query.isError && !rows.length ? (
+        <QueryErrorState error={query.error} title="进程聚合加载失败" />
+      ) : rows.length ? (
         <DataTable
           columns={columns}
           data={rows}
@@ -198,21 +229,34 @@ export function ProcessesPage() {
           tableClassName={processesTableClassName}
           sorting={sorting}
           onSortingChange={setSorting}
-          onRowClick={(row) => setSelectedKey(`${row.pid ?? 'none'}-${row.comm ?? ''}-${row.exe ?? ''}`)}
-          isRowSelected={(row) => `${row.pid ?? 'none'}-${row.comm ?? ''}-${row.exe ?? ''}` === selectedKey}
+          manualSorting
+          onRowClick={(row) => setSelectedKey(processRowKey(row))}
+          isRowSelected={(row) => processRowKey(row) === selectedKey}
+          pagination={{
+            page: query.data?.page ?? 1,
+            pageSize: query.data?.pageSize ?? pageSize,
+            totalRows: query.data?.totalRows ?? 0,
+            onPageChange: setPage,
+          }}
           emptyText="当前时间范围没有进程聚合结果。"
         />
       ) : (
         <EmptyState title="暂无进程聚合" description="当前时间范围没有可以展示的进程流量。" />
       )}
 
-      {selectedProcess && series.data ? (
+      {selectedProcess && !canQuerySeries ? (
+        <EmptyState title="无法绘制趋势" description="这条小时聚合记录缺少稳定进程名，无法定位到单个进程趋势。" />
+      ) : selectedProcess && series.isError ? (
+        <QueryErrorState error={series.error} title="进程趋势加载失败" />
+      ) : selectedProcess && series.data ? (
         <ChartPanel
           points={series.data.points}
           range={range}
           title={`流量趋势 · ${safeText(selectedProcess.comm)}`}
           subtitle={selectedProcess.pid !== null ? `PID ${selectedProcess.pid} · ${displayExecutableName(selectedProcess.exe)}` : '当前窗口已降级为按进程名聚合'}
         />
+      ) : selectedProcess && canQuerySeries ? (
+        <EmptyState title="趋势加载中" description="正在获取该进程的时间趋势。" />
       ) : null}
     </div>
   );

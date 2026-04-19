@@ -30,6 +30,7 @@ func (t tuple) key() string {
 type socketEntry struct {
 	Inode     uint64
 	Connected bool
+	Present   bool
 }
 
 type socketIndex struct {
@@ -42,6 +43,70 @@ func localTupleKey(proto string, localIP string, localPort int) string {
 }
 
 func ReadSocketIndex(procFS string) (socketIndex, error) {
+	index := socketIndex{
+		ByTuple: make(map[string]socketEntry),
+		ByLocal: make(map[string]socketEntry),
+	}
+	roots := socketFileRoots(procFS)
+	for _, root := range roots {
+		if err := readSocketRoot(index, root); err != nil {
+			return socketIndex{}, err
+		}
+	}
+	return index, nil
+}
+
+func socketFileRoots(procFS string) []string {
+	roots := make([]string, 0, 8)
+	seen := make(map[string]struct{})
+
+	addRoot := func(root string, key string) {
+		root = filepath.Clean(root)
+		if root == "." || root == "" {
+			return
+		}
+		if key == "" {
+			key = root
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		info, err := os.Stat(root)
+		if err != nil || !info.IsDir() {
+			return
+		}
+		seen[key] = struct{}{}
+		roots = append(roots, root)
+	}
+
+	baseNSKey := ""
+	if target, err := os.Readlink(filepath.Join(procFS, "self", "ns", "net")); err == nil && strings.TrimSpace(target) != "" {
+		baseNSKey = target
+	}
+	addRoot(filepath.Join(procFS, "net"), baseNSKey)
+
+	entries, err := os.ReadDir(procFS)
+	if err != nil {
+		return roots
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		netRoot := filepath.Join(procFS, entry.Name(), "net")
+		nsKey := ""
+		if target, err := os.Readlink(filepath.Join(procFS, entry.Name(), "ns", "net")); err == nil && strings.TrimSpace(target) != "" {
+			nsKey = target
+		}
+		addRoot(netRoot, nsKey)
+	}
+	return roots
+}
+
+func readSocketRoot(index socketIndex, root string) error {
 	files := []struct {
 		name  string
 		proto string
@@ -52,41 +117,49 @@ func ReadSocketIndex(procFS string) (socketIndex, error) {
 		{"udp6", "udp"},
 	}
 
-	index := socketIndex{
-		ByTuple: make(map[string]socketEntry),
-		ByLocal: make(map[string]socketEntry),
-	}
 	for _, item := range files {
-		entries, err := readSocketFile(filepath.Join(procFS, "net", item.name), item.proto)
+		entries, err := readSocketFile(filepath.Join(root, item.name), item.proto)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return socketIndex{}, err
+			return err
 		}
 		for _, entry := range entries {
-			index.ByTuple[entry.Tuple.key()] = socketEntry{
+			recordSocketTuple(index.ByTuple, entry.Tuple.key(), socketEntry{
 				Inode:     entry.Inode,
 				Connected: entry.Connected,
-			}
+				Present:   true,
+			})
 			if entry.Connected {
 				continue
 			}
-			key := localTupleKey(entry.Tuple.Proto, entry.Tuple.LocalIP, entry.Tuple.LocalPort)
-			existing, ok := index.ByLocal[key]
-			switch {
-			case !ok:
-				index.ByLocal[key] = socketEntry{Inode: entry.Inode, Connected: false}
-			case existing.Inode == 0:
-				// Already known ambiguous, keep it unresolved.
-			case existing.Inode != entry.Inode:
-				// Multiple sockets share same local endpoint (e.g. SO_REUSEPORT),
-				// mark as ambiguous to avoid false process attribution.
-				index.ByLocal[key] = socketEntry{Inode: 0, Connected: false}
-			}
+			recordSocketTuple(index.ByLocal, localTupleKey(entry.Tuple.Proto, entry.Tuple.LocalIP, entry.Tuple.LocalPort), socketEntry{
+				Inode:     entry.Inode,
+				Connected: false,
+				Present:   true,
+			})
 		}
 	}
-	return index, nil
+	return nil
+}
+
+func recordSocketTuple(index map[string]socketEntry, key string, entry socketEntry) {
+	existing, ok := index[key]
+	switch {
+	case !ok:
+		index[key] = entry
+	case existing.Inode == entry.Inode:
+		existing.Present = true
+		existing.Connected = existing.Connected || entry.Connected
+		index[key] = existing
+	default:
+		index[key] = socketEntry{
+			Inode:     0,
+			Connected: existing.Connected || entry.Connected,
+			Present:   true,
+		}
+	}
 }
 
 type parsedSocketEntry struct {

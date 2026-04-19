@@ -1,6 +1,8 @@
 import { NavLink, useLocation } from 'react-router-dom';
 import { useEffect, useMemo, type ReactNode } from 'react';
 import clsx from 'clsx';
+import { withAppBase } from '../base-path';
+import { isRangeKey } from '../ranges';
 
 const links = [
   { to: '/', label: 'Dashboard' },
@@ -20,7 +22,7 @@ const canonicalQueryAllowlist: Record<string, string[]> = {
   '/usage': ['range', 'comm', 'pid', 'exe', 'remoteIp', 'localPort', 'direction', 'proto', 'attribution'],
   '/processes': ['range'],
   '/remotes': ['range', 'direction', 'include_loopback'],
-  '/forward': ['range', 'comm', 'pid', 'exe', 'remoteIp', 'localPort', 'direction', 'proto'],
+  '/forward': ['range', 'origSrcIp', 'origDstIp', 'proto'],
 };
 
 const defaultRouteMeta: RouteMeta = {
@@ -91,12 +93,17 @@ function buildCanonicalUrl(pathnameRaw: string, searchRaw: string) {
   for (const key of allowlist) {
     const value = sourceParams.get(key);
     if (value && value.trim()) {
-      canonicalParams.set(key, value.trim());
+      const normalized = value.trim();
+      if (key === 'range' && !isRangeKey(normalized)) {
+        continue;
+      }
+      canonicalParams.set(key, normalized);
     }
   }
 
   const query = canonicalParams.toString();
-  const pathWithQuery = query ? `${pathname}?${query}` : pathname;
+  const deployedPath = withAppBase(pathname);
+  const pathWithQuery = query ? `${deployedPath}?${query}` : deployedPath;
   return `${window.location.origin}${pathWithQuery}`;
 }
 

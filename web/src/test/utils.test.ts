@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { displayExecutableName, executableName, serviceNameForPort } from '../utils';
+import {
+  dataSourceAutoNote,
+  dataSourceDescription,
+  dataSourceLabel,
+  displayExecutableName,
+  executableName,
+  minuteDimensionsUnavailable,
+  serviceNameForPort,
+} from '../utils';
 
 describe('serviceNameForPort', () => {
   it('returns null for null port', () => {
@@ -60,5 +68,20 @@ describe('executableName', () => {
 describe('displayExecutableName', () => {
   it('returns fallback for empty input', () => {
     expect(displayExecutableName(undefined)).toBe('未知');
+  });
+});
+
+describe('data source metadata', () => {
+  it('keeps hourly and minute source semantics aligned', () => {
+    expect(dataSourceLabel('usage_1h')).toBe('小时聚合');
+    expect(dataSourceDescription('usage_1h')).toContain('按小时聚合');
+    expect(dataSourceAutoNote('usage_1h')).toContain('小时聚合历史');
+    expect(minuteDimensionsUnavailable('usage_1h')).toBe(true);
+  });
+
+  it('keeps forward minute sources distinct from usage minute sources', () => {
+    expect(dataSourceLabel('usage_1m_forward')).toBe('分钟转发明细');
+    expect(dataSourceAutoNote('usage_1m_forward')).toContain('分钟转发明细');
+    expect(minuteDimensionsUnavailable('usage_1m_forward')).toBe(false);
   });
 });

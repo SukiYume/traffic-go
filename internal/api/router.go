@@ -16,23 +16,32 @@ type runtimeProvider interface {
 }
 
 type Server struct {
-	store       *store.Store
-	runtime     runtimeProvider
-	logger      *log.Logger
-	static      fs.FS
-	nginxLogDir string
-	ssLogDir    string
+	store          *store.Store
+	runtime        runtimeProvider
+	logger         *log.Logger
+	static         fs.FS
+	processLogDirs map[string]string
 }
 
-func NewServer(trafficStore *store.Store, runtime runtimeProvider, logger *log.Logger, static fs.FS, nginxLogDir string, ssLogDir string) *Server {
+func NewServer(trafficStore *store.Store, runtime runtimeProvider, logger *log.Logger, static fs.FS, processLogDirs map[string]string) *Server {
 	return &Server{
-		store:       trafficStore,
-		runtime:     runtime,
-		logger:      logger,
-		static:      static,
-		nginxLogDir: nginxLogDir,
-		ssLogDir:    ssLogDir,
+		store:          trafficStore,
+		runtime:        runtime,
+		logger:         logger,
+		static:         static,
+		processLogDirs: cloneStringMap(processLogDirs),
 	}
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
 }
 
 func (s *Server) Handler() http.Handler {

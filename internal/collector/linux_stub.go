@@ -16,6 +16,21 @@ type mockCollector struct {
 	logger *log.Logger
 }
 
+type noopCollector struct{}
+
+func (n *noopCollector) Start(ctx context.Context) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (n *noopCollector) ActiveProcesses() []model.ProcessListItem {
+	return nil
+}
+
+func (n *noopCollector) ActiveStats() model.ActiveStats {
+	return model.ActiveStats{}
+}
+
 func (m *mockCollector) Start(ctx context.Context) error {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
