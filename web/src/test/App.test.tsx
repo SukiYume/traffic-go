@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "../App";
@@ -12,7 +12,7 @@ import { ProcessesPage } from "../pages/ProcessesPage";
 import { RemotesPage } from "../pages/RemotesPage";
 import { UsagePage } from "../pages/UsagePage";
 import { DashboardPage } from "../pages/DashboardPage";
-import type { TrafficApiClient } from "../types";
+import type { ProcessGroupBy, TrafficApiClient } from "../types";
 
 function renderWithProviders(
   path: string,
@@ -108,6 +108,48 @@ describe("traffic-go web ui", () => {
     expect(
       screen.queryByText("当前是小时聚合数据，不支持细粒度关联分析。"),
     ).not.toBeInTheDocument();
+  });
+
+  it("uses the real hourly bucket span when rendering average rate", async () => {
+    const user = userEvent.setup();
+    renderWithProviders("/usage?range=90d", <UsagePage />);
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+
+    const remoteIp = await screen.findByRole("button", { name: "203.0.113.24" });
+    const row = remoteIp.closest("tr");
+    if (!row) {
+      throw new Error("expected hourly usage row for 203.0.113.24");
+    }
+    await user.click(row);
+
+    expect(
+      await screen.findByText((_, element) =>
+        element?.textContent === "↑ 51.0 B/s · ↓ 344 B/s",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("offers an on-demand deep scan path from the usage explain panel", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const explainCalls: Array<{ dataSource?: string; allowScan?: boolean }> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsageExplain(row, options) {
+        explainCalls.push(options ?? {});
+        return base.getUsageExplain(row, options);
+      },
+    };
+
+    renderWithProviders("/usage", <UsagePage />, client);
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+
+    const rows = await screen.findAllByRole("row");
+    await user.click(rows[1]);
+    expect(await screen.findByRole("button", { name: "尝试深度扫描日志" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "尝试深度扫描日志" }));
+
+    expect(explainCalls.some((call) => call.allowScan === true)).toBe(true);
   });
 
   it("clears minute-only filters when the backend downgrades usage to hourly data", async () => {
@@ -227,6 +269,26 @@ describe("traffic-go web ui", () => {
   it("renders the processes investigation page", async () => {
     renderWithProviders("/processes", <ProcessesPage />);
     expect(await screen.findByText("进程聚合")).toBeInTheDocument();
+  });
+
+  it("does not issue a redundant pid-group request on the initial 90d processes load", async () => {
+    const base = createMockApiClient();
+    const processCalls: ProcessGroupBy[] = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getTopProcesses(range, options) {
+        processCalls.push(options?.groupBy ?? 'pid');
+        return base.getTopProcesses(range, options);
+      },
+    };
+
+    renderWithProviders("/processes?range=90d", <ProcessesPage />, client);
+    expect(await screen.findByText("进程聚合")).toBeInTheDocument();
+    expect(await screen.findByText("ss-server")).toBeInTheDocument();
+    expect(screen.queryByText("按 PID 聚合")).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(processCalls).toEqual(["comm"]);
+    });
   });
 
   it("selects the first process row by default so the chart matches the highlighted row", async () => {

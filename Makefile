@@ -45,15 +45,8 @@ sync-frontend: build-frontend
 	rm -rf internal/embed/dist/*
 	cp -R $(WEB_DIR)/dist/. internal/embed/dist/
 
-release-linux: test clean-release sync-frontend
-	mkdir -p $(RELEASE_DIR)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build -o $(RELEASE_DIR)/$(APP_NAME) ./cmd/$(APP_NAME)
-	cp deploy/config.example.yaml $(RELEASE_DIR)/config.yaml
-	cp deploy/config.example.yaml $(RELEASE_DIR)/config.example.yaml
-	cp deploy/install-centos7.sh $(RELEASE_DIR)/install-centos7.sh
-	cp deploy/traffic-go.service $(RELEASE_DIR)/traffic-go.service
-	chmod +x $(RELEASE_DIR)/install-centos7.sh
-	tar -C $(RELEASE_DIR) -czf $(ARCHIVE) .
+release-linux:
+	APP_NAME=$(APP_NAME) GO=$(GO) NPM=$(NPM) WEB_DIR=$(WEB_DIR) RELEASE_ROOT=$(RELEASE_ROOT) bash deploy/package-release.sh
 
 run:
 	$(GO) run ./cmd/$(APP_NAME) -config $(CONFIG)

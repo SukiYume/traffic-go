@@ -659,6 +659,84 @@ func TestFlushCurrentBucketsCountsFlowOnlyOnFirstObservedMinute(t *testing.T) {
 	}
 }
 
+func TestFlushCurrentBucketsSkipsZeroContributionRows(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
+
+	trafficStore, err := store.Open(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = trafficStore.Close()
+	})
+
+	minute := time.Date(2026, 4, 17, 12, 34, 0, 0, time.UTC)
+	service := &Service{
+		store:          trafficStore,
+		currentMinute:  minute,
+		buckets:        make(map[model.UsageKey]*bucketState),
+		forwardBuckets: make(map[model.ForwardUsageKey]*bucketState),
+		usageFlowOwner: make(map[uint64]model.UsageKey),
+		fwdFlowOwner:   make(map[uint64]model.ForwardUsageKey),
+	}
+
+	usageSnapshot := model.FlowSnapshot{
+		Proto:       "tcp",
+		Direction:   model.DirectionOut,
+		PID:         2255,
+		Comm:        "ss-server",
+		Exe:         "/usr/local/bin/ss-server",
+		LocalPort:   8388,
+		RemoteIP:    "203.0.113.8",
+		RemotePort:  443,
+		Attribution: model.AttributionExact,
+	}
+	service.addUsage(7001, usageSnapshot, deltaPair{}, false)
+
+	forwardClassified := classifiedFlow{
+		Proto:       "tcp",
+		OrigSrcIP:   "10.0.0.2",
+		OrigDstIP:   "203.0.113.8",
+		OrigSrcPort: 51000,
+		OrigDstPort: 443,
+	}
+	service.addForwardUsage(7002, forwardClassified, deltaPair{}, false)
+
+	if err := service.flushCurrentBuckets(ctx); err != nil {
+		t.Fatalf("flush zero contribution buckets: %v", err)
+	}
+
+	usageRows, _, usageTotal, err := trafficStore.QueryUsage(ctx, model.UsageQuery{
+		Start:    minute.Add(-time.Minute),
+		End:      minute.Add(time.Minute),
+		UsePage:  true,
+		Page:     1,
+		PageSize: 10,
+	}, store.DataSourceMinute)
+	if err != nil {
+		t.Fatalf("query usage rows: %v", err)
+	}
+	if usageTotal != 0 || len(usageRows) != 0 {
+		t.Fatalf("expected no usage rows for zero contribution buckets, found total=%d rows=%d", usageTotal, len(usageRows))
+	}
+
+	forwardRows, _, forwardTotal, err := trafficStore.QueryForwardUsage(ctx, model.ForwardQuery{
+		Start:    minute.Add(-time.Minute),
+		End:      minute.Add(time.Minute),
+		UsePage:  true,
+		Page:     1,
+		PageSize: 10,
+	}, store.DataSourceMinuteForward)
+	if err != nil {
+		t.Fatalf("query forward rows: %v", err)
+	}
+	if forwardTotal != 0 || len(forwardRows) != 0 {
+		t.Fatalf("expected no forward rows for zero contribution buckets, found total=%d rows=%d", forwardTotal, len(forwardRows))
+	}
+}
+
 func TestAttachSocketMetadataFallsBackWhenTupleEntryHasNoInode(t *testing.T) {
 	classified := classifiedFlow{
 		Proto:      "tcp",

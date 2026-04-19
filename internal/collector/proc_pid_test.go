@@ -80,6 +80,59 @@ func TestProcessResolverNegativeCacheAvoidsRepeatedScans(t *testing.T) {
 	}
 }
 
+func TestProcessResolverReusesConfirmedCachedOwnershipWithoutFullScan(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	resolver := newProcessResolver("/proc")
+	resolver.now = func() time.Time { return now }
+	resolver.lastFullScan = now
+	resolver.cache[55] = processInfo(100, "ss-server")
+	resolver.pidSockets = func(pid int) (map[uint64]struct{}, bool) {
+		if pid != 100 {
+			t.Fatalf("unexpected pid verification request: %d", pid)
+		}
+		return map[uint64]struct{}{55: {}}, true
+	}
+	resolver.scan = func(context.Context) (map[uint64]model.ProcessInfo, bool) {
+		t.Fatalf("did not expect a full scan when cached ownership is still valid")
+		return nil, false
+	}
+
+	resolved := resolver.Resolve(context.Background(), map[uint64]struct{}{55: {}})
+	if resolved[55].PID != 100 {
+		t.Fatalf("expected cached process info to be reused, got %+v", resolved[55])
+	}
+}
+
+func TestProcessResolverRescansWhenCachedInodeOwnershipChanges(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	resolver := newProcessResolver("/proc")
+	resolver.now = func() time.Time { return now }
+	resolver.lastFullScan = now
+	resolver.cache[55] = processInfo(100, "ss-server")
+	resolver.pidSockets = func(pid int) (map[uint64]struct{}, bool) {
+		if pid != 100 {
+			t.Fatalf("unexpected pid verification request: %d", pid)
+		}
+		return map[uint64]struct{}{77: {}}, true
+	}
+
+	scanCalls := 0
+	resolver.scan = func(context.Context) (map[uint64]model.ProcessInfo, bool) {
+		scanCalls++
+		return map[uint64]model.ProcessInfo{
+			55: processInfo(200, "nginx"),
+		}, true
+	}
+
+	resolved := resolver.Resolve(context.Background(), map[uint64]struct{}{55: {}})
+	if scanCalls != 1 {
+		t.Fatalf("expected a full scan after cached inode ownership changed, got %d scans", scanCalls)
+	}
+	if resolved[55].PID != 200 {
+		t.Fatalf("expected refreshed process info for reused inode, got %+v", resolved[55])
+	}
+}
+
 func TestProcessResolverScanFailureDoesNotWriteNegativeCache(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	resolver := newProcessResolver("/proc")

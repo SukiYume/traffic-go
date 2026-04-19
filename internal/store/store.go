@@ -76,6 +76,12 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.ensureLogEvidenceColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.pruneZeroUsageRows(ctx); err != nil {
+		return err
+	}
+	if err := s.seedDirtyChainHours(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -116,6 +122,37 @@ func (s *Store) ensureLogEvidenceColumns(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate log_evidence: %w", err)
 		}
+	}
+	return nil
+}
+
+func (s *Store) pruneZeroUsageRows(ctx context.Context) error {
+	statements := []string{
+		`DELETE FROM usage_1m WHERE bytes_up = 0 AND bytes_down = 0 AND pkts_up = 0 AND pkts_down = 0 AND flow_count = 0`,
+		`DELETE FROM usage_1h WHERE bytes_up = 0 AND bytes_down = 0 AND pkts_up = 0 AND pkts_down = 0 AND flow_count = 0`,
+		`DELETE FROM usage_1m_forward WHERE bytes_orig = 0 AND bytes_reply = 0 AND pkts_orig = 0 AND pkts_reply = 0 AND flow_count = 0`,
+		`DELETE FROM usage_1h_forward WHERE bytes_orig = 0 AND bytes_reply = 0 AND pkts_orig = 0 AND pkts_reply = 0 AND flow_count = 0`,
+	}
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("prune zero-usage rows: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) seedDirtyChainHours(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO dirty_chain_hours (hour_ts)
+SELECT DISTINCT (minute_ts / 3600) * 3600
+FROM usage_chain_1m
+WHERE minute_ts > 0
+  AND ((minute_ts / 3600) * 3600) NOT IN (
+      SELECT hour_ts FROM usage_chain_1h
+  )
+ON CONFLICT(hour_ts) DO NOTHING
+`); err != nil {
+		return fmt.Errorf("seed dirty chain hours: %w", err)
 	}
 	return nil
 }
@@ -362,6 +399,10 @@ ON CONFLICT(hour_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO
 		return fmt.Errorf("aggregate usage_1h_forward: %w", err)
 	}
 
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dirty_chain_hours WHERE hour_ts = ?`, hourTS); err != nil {
+		return fmt.Errorf("clear dirty chain hour: %w", err)
+	}
+
 	return tx.Commit()
 }
 
@@ -438,6 +479,23 @@ FROM (
     WHERE minute_ts >= ? AND minute_ts < ?
 )
 `, minMinute, before.UTC().Truncate(time.Hour).Unix(), minMinute, before.UTC().Truncate(time.Hour).Unix())
+
+	var value sql.NullInt64
+	if err := row.Scan(&value); err != nil {
+		return time.Time{}, false, err
+	}
+	if !value.Valid {
+		return time.Time{}, false, nil
+	}
+	return time.Unix(value.Int64, 0).UTC(), true, nil
+}
+
+func (s *Store) NextDirtyChainHour(ctx context.Context, before time.Time) (time.Time, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT MIN(hour_ts)
+FROM dirty_chain_hours
+WHERE hour_ts < ?
+`, before.UTC().Truncate(time.Hour).Unix())
 
 	var value sql.NullInt64
 	if err := row.Scan(&value); err != nil {

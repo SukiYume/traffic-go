@@ -41,27 +41,27 @@ export function DashboardPage() {
 
   const overview = useQuery({
     queryKey: ['overview', range],
-    queryFn: () => api.getOverview(range),
+    queryFn: ({ signal }) => api.getOverview(range, { signal }),
   });
   const series = useQuery({
     queryKey: ['series', range, 'direction'],
-    queryFn: () => api.getTimeSeries(range, 'direction'),
+    queryFn: ({ signal }) => api.getTimeSeries(range, 'direction', undefined, { signal }),
   });
   const topProcesses = useQuery({
     queryKey: ['top-processes', range, 'dashboard'],
-    queryFn: () => api.getTopProcesses(range, { page: 1, pageSize: 5, groupBy: 'comm' }),
+    queryFn: ({ signal }) => api.getTopProcesses(range, { page: 1, pageSize: 5, groupBy: 'comm' }, { signal }),
   });
   const topInboundRemotes = useQuery({
     queryKey: ['top-remotes', range, 'in'],
-    queryFn: () => api.getTopRemotes(range, { page: 1, pageSize: 5, direction: 'in' }),
+    queryFn: ({ signal }) => api.getTopRemotes(range, { page: 1, pageSize: 5, direction: 'in', includeLoopback: true }, { signal }),
   });
   const topOutboundRemotes = useQuery({
     queryKey: ['top-remotes', range, 'out'],
-    queryFn: () => api.getTopRemotes(range, { page: 1, pageSize: 5, direction: 'out' }),
+    queryFn: ({ signal }) => api.getTopRemotes(range, { page: 1, pageSize: 5, direction: 'out', includeLoopback: true }, { signal }),
   });
   const topPorts = useQuery({
     queryKey: ['top-ports', range],
-    queryFn: () => api.getTopPorts(range),
+    queryFn: ({ signal }) => api.getTopPorts(range, { signal }),
   });
 
   const cards = overview.data

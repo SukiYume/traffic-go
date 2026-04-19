@@ -50,7 +50,8 @@ export function ProcessesPage() {
   const [page, setPage] = useState(1);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [sorting, setSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
-  const [groupBy, setGroupBy] = useState<ProcessGroupBy>('pid');
+  const [groupBy, setGroupBy] = useState<ProcessGroupBy>(() => (range === '90d' ? 'comm' : 'pid'));
+  const effectiveGroupBy: ProcessGroupBy = range === '90d' ? 'comm' : groupBy;
 
   const setRange = (next: RangeKey) => {
     const nextParams = new URLSearchParams(params);
@@ -60,25 +61,25 @@ export function ProcessesPage() {
 
   const currentSort = sorting[0];
   const query = useQuery({
-    queryKey: ['process-summaries', range, groupBy, page, currentSort?.id, currentSort?.desc],
-    queryFn: () =>
+    queryKey: ['process-summaries', range, effectiveGroupBy, page, currentSort?.id, currentSort?.desc],
+    queryFn: ({ signal }) =>
       api.getTopProcesses(range, {
         page,
         pageSize,
-        groupBy,
+        groupBy: effectiveGroupBy,
         sortBy: normalizeProcessSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
-      }),
+      }, { signal }),
     placeholderData: keepPreviousData,
   });
 
   const rows = query.data?.rows ?? [];
-  const showPIDColumn = groupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
-  const showExeColumn = groupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
+  const showPIDColumn = effectiveGroupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
+  const showExeColumn = effectiveGroupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
 
   useEffect(() => {
     setPage(1);
-  }, [range, groupBy, sorting]);
+  }, [range, effectiveGroupBy, sorting]);
 
   useEffect(() => {
     if (query.data?.dataSource !== 'usage_1h') return;
@@ -113,11 +114,11 @@ export function ProcessesPage() {
 
   const series = useQuery({
     queryKey: ['process-series', range, selectedProcess ? processRowKey(selectedProcess) : null],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       if (!selectedSeriesFilters) {
         throw new Error('missing process series filters');
       }
-      return api.getTimeSeries(range, 'direction', selectedSeriesFilters);
+      return api.getTimeSeries(range, 'direction', selectedSeriesFilters, { signal });
     },
     enabled: canQuerySeries,
   });
@@ -203,7 +204,7 @@ export function ProcessesPage() {
         <RangeSelect value={range} onChange={setRange} />
       </header>
 
-      {query.data?.dataSource !== 'usage_1h' && (
+      {query.data?.dataSource !== 'usage_1h' && range !== '90d' && (
         <section className="segmented-control" aria-label="聚合方式">
           <button type="button" className={groupBy === 'pid' ? 'chip active' : 'chip'} onClick={() => setGroupBy('pid')}>
             按 PID 聚合

@@ -434,14 +434,17 @@ func (s *Service) addUsage(ctid uint64, snapshot model.FlowSnapshot, delta delta
 	}
 
 	state := s.buckets[key]
-	if state == nil {
-		state = newBucketState()
-		s.buckets[key] = state
+	ensureState := func() *bucketState {
+		if state == nil {
+			state = newBucketState()
+			s.buckets[key] = state
+		}
+		return state
 	}
 
 	if previousForwardKey, ok := s.fwdFlowOwner[ctid]; ok {
 		if previousForwardState := s.forwardBuckets[previousForwardKey]; previousForwardState != nil {
-			state.applyContribution(ctid, previousForwardState.detachFlow(ctid))
+			ensureState().applyContribution(ctid, previousForwardState.detachFlow(ctid))
 			if previousForwardState.empty() {
 				delete(s.forwardBuckets, previousForwardKey)
 			}
@@ -453,7 +456,7 @@ func (s *Service) addUsage(ctid uint64, snapshot model.FlowSnapshot, delta delta
 		// bytes/packets and one-time flow_count to the new bucket instead of
 		// counting it again.
 		if previousUsageState := s.buckets[previousUsageKey]; previousUsageState != nil {
-			state.applyContribution(ctid, previousUsageState.detachFlow(ctid))
+			ensureState().applyContribution(ctid, previousUsageState.detachFlow(ctid))
 			if previousUsageState.empty() {
 				delete(s.buckets, previousUsageKey)
 			}
@@ -464,7 +467,9 @@ func (s *Service) addUsage(ctid uint64, snapshot model.FlowSnapshot, delta delta
 	if countFlow {
 		contribution.flowCount = 1
 	}
-	state.applyContribution(ctid, contribution)
+	if !contribution.isZero() {
+		ensureState().applyContribution(ctid, contribution)
+	}
 	s.usageFlowOwner[ctid] = key
 }
 
@@ -481,14 +486,17 @@ func (s *Service) addForwardUsage(ctid uint64, classified classifiedFlow, delta 
 	}
 
 	state := s.forwardBuckets[key]
-	if state == nil {
-		state = newBucketState()
-		s.forwardBuckets[key] = state
+	ensureState := func() *bucketState {
+		if state == nil {
+			state = newBucketState()
+			s.forwardBuckets[key] = state
+		}
+		return state
 	}
 
 	if previousUsageKey, ok := s.usageFlowOwner[ctid]; ok {
 		if previousUsageState := s.buckets[previousUsageKey]; previousUsageState != nil {
-			state.applyContribution(ctid, previousUsageState.detachFlow(ctid))
+			ensureState().applyContribution(ctid, previousUsageState.detachFlow(ctid))
 			if previousUsageState.empty() {
 				delete(s.buckets, previousUsageKey)
 			}
@@ -497,7 +505,7 @@ func (s *Service) addForwardUsage(ctid uint64, classified classifiedFlow, delta 
 	}
 	if previousForwardKey, ok := s.fwdFlowOwner[ctid]; ok && previousForwardKey != key {
 		if previousForwardState := s.forwardBuckets[previousForwardKey]; previousForwardState != nil {
-			state.applyContribution(ctid, previousForwardState.detachFlow(ctid))
+			ensureState().applyContribution(ctid, previousForwardState.detachFlow(ctid))
 			if previousForwardState.empty() {
 				delete(s.forwardBuckets, previousForwardKey)
 			}
@@ -508,7 +516,9 @@ func (s *Service) addForwardUsage(ctid uint64, classified classifiedFlow, delta 
 	if countFlow {
 		contribution.flowCount = 1
 	}
-	state.applyContribution(ctid, contribution)
+	if !contribution.isZero() {
+		ensureState().applyContribution(ctid, contribution)
+	}
 	s.fwdFlowOwner[ctid] = key
 }
 
@@ -523,6 +533,9 @@ func (s *Service) flushCurrentBuckets(ctx context.Context) error {
 
 	usage := make(map[model.UsageKey]model.UsageDelta, len(s.buckets))
 	for key, state := range s.buckets {
+		if state == nil || state.empty() {
+			continue
+		}
 		usage[key] = model.UsageDelta{
 			BytesUp:   state.bytesUp,
 			BytesDown: state.bytesDown,
@@ -534,6 +547,9 @@ func (s *Service) flushCurrentBuckets(ctx context.Context) error {
 
 	forward := make(map[model.ForwardUsageKey]model.UsageDelta, len(s.forwardBuckets))
 	for key, state := range s.forwardBuckets {
+		if state == nil || state.empty() {
+			continue
+		}
 		forward[key] = model.UsageDelta{
 			BytesUp:   state.bytesUp,
 			BytesDown: state.bytesDown,

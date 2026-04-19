@@ -240,14 +240,18 @@ export interface ProcessesResponse {
   processes: ProcessOption[];
 }
 
+export interface ApiRequestOptions {
+  signal?: AbortSignal;
+}
+
 export interface TrafficApiClient {
-  getOverview(range: RangeKey): Promise<OverviewStats>;
-  getTimeSeries(range: RangeKey, groupBy?: GroupBy, filters?: TimeSeriesFilters): Promise<TimeSeriesResponse>;
-  getUsage(query: UsageQuery): Promise<UsageResponse>;
-  getUsageExplain(row: UsageRow, options?: { dataSource?: DataSource; allowScan?: boolean }): Promise<UsageExplain>;
-  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy }): Promise<ProcessSummaryResponse>;
-  getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean }): Promise<RemoteSummaryResponse>;
-  getTopPorts(range: RangeKey): Promise<TopResponse>;
-  getProcesses(): Promise<ProcessesResponse>;
-  getForwardUsage(query: ForwardUsageQuery): Promise<ForwardUsageResponse>;
+  getOverview(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<OverviewStats>;
+  getTimeSeries(range: RangeKey, groupBy?: GroupBy, filters?: TimeSeriesFilters, requestOptions?: ApiRequestOptions): Promise<TimeSeriesResponse>;
+  getUsage(query: UsageQuery, requestOptions?: ApiRequestOptions): Promise<UsageResponse>;
+  getUsageExplain(row: UsageRow, options?: { dataSource?: DataSource; allowScan?: boolean }, requestOptions?: ApiRequestOptions): Promise<UsageExplain>;
+  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy }, requestOptions?: ApiRequestOptions): Promise<ProcessSummaryResponse>;
+  getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean }, requestOptions?: ApiRequestOptions): Promise<RemoteSummaryResponse>;
+  getTopPorts(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<TopResponse>;
+  getProcesses(requestOptions?: ApiRequestOptions): Promise<ProcessesResponse>;
+  getForwardUsage(query: ForwardUsageQuery, requestOptions?: ApiRequestOptions): Promise<ForwardUsageResponse>;
 }

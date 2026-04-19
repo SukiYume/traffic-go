@@ -18,6 +18,7 @@ import type {
   TimeSeriesResponse,
   TopResponse,
   TrafficApiClient,
+  ApiRequestOptions,
   UsageExplain,
   UsageQuery,
   UsageResponse,
@@ -351,9 +352,10 @@ export function isDimensionUnavailableError(error: unknown) {
   return error instanceof ApiError && error.code === 'dimension_unavailable';
 }
 
-async function requestJson<T>(path: string, decode: (raw: unknown) => T): Promise<T> {
+async function requestJson<T>(path: string, decode: (raw: unknown) => T, options?: ApiRequestOptions): Promise<T> {
   const response = await fetch(path, {
     headers: { Accept: 'application/json' },
+    signal: options?.signal,
   });
   if (!response.ok) {
     let payload: RawErrorResponse | null = null;
@@ -583,36 +585,37 @@ function decodeForwardUsage(raw: unknown): ForwardUsageResponse {
 
 export function createHttpClient(): TrafficApiClient {
   return {
-    getOverview(range) {
-      return requestJson(withAppBase(`/api/v1/stats/overview${buildQuery([['range', range]])}`), decodeOverview);
+    getOverview(range, requestOptions) {
+      return requestJson(withAppBase(`/api/v1/stats/overview${buildQuery([['range', range]])}`), decodeOverview, requestOptions);
     },
-    getTimeSeries(range, groupBy: GroupBy = 'direction', filters) {
+    getTimeSeries(range, groupBy: GroupBy = 'direction', filters, requestOptions) {
       const bucket = RANGE_TO_BUCKET[range];
       return requestJson(
         withAppBase(`/api/v1/stats/timeseries${buildTimeSeriesQuery(range, bucket, groupBy, filters)}`),
         (raw) => decodeTimeSeries(raw, bucket),
+        requestOptions,
       );
     },
-    getUsage(query: UsageQuery) {
-      return requestJson(withAppBase(`/api/v1/usage${buildUsageQuery(query)}`), decodeUsage);
+    getUsage(query: UsageQuery, requestOptions) {
+      return requestJson(withAppBase(`/api/v1/usage${buildUsageQuery(query)}`), decodeUsage, requestOptions);
     },
-    getUsageExplain(row: UsageRow, options) {
-      return requestJson(withAppBase(`/api/v1/usage/explain${buildUsageExplainQuery(row, options)}`), decodeUsageExplain);
+    getUsageExplain(row: UsageRow, options, requestOptions) {
+      return requestJson(withAppBase(`/api/v1/usage/explain${buildUsageExplainQuery(row, options)}`), decodeUsageExplain, requestOptions);
     },
-    getTopProcesses(range, options) {
-      return requestJson(withAppBase(`/api/v1/top/processes${buildTopProcessesQuery(range, options)}`), decodeProcessSummary);
+    getTopProcesses(range, options, requestOptions) {
+      return requestJson(withAppBase(`/api/v1/top/processes${buildTopProcessesQuery(range, options)}`), decodeProcessSummary, requestOptions);
     },
-    getTopRemotes(range, options) {
-      return requestJson(withAppBase(`/api/v1/top/remotes${buildTopRemotesQuery(range, options)}`), decodeRemoteSummary);
+    getTopRemotes(range, options, requestOptions) {
+      return requestJson(withAppBase(`/api/v1/top/remotes${buildTopRemotesQuery(range, options)}`), decodeRemoteSummary, requestOptions);
     },
-    getTopPorts(range) {
-      return requestJson(withAppBase(`/api/v1/top/ports${buildQuery([['range', range], ['by', 'total']])}`), decodeTop);
+    getTopPorts(range, requestOptions) {
+      return requestJson(withAppBase(`/api/v1/top/ports${buildQuery([['range', range], ['by', 'total']])}`), decodeTop, requestOptions);
     },
-    getProcesses() {
-      return requestJson(withAppBase('/api/v1/processes'), decodeProcesses);
+    getProcesses(requestOptions) {
+      return requestJson(withAppBase('/api/v1/processes'), decodeProcesses, requestOptions);
     },
-    getForwardUsage(query: ForwardUsageQuery) {
-      return requestJson(withAppBase(`/api/v1/forward/usage${buildForwardQuery(query)}`), decodeForwardUsage);
+    getForwardUsage(query: ForwardUsageQuery, requestOptions) {
+      return requestJson(withAppBase(`/api/v1/forward/usage${buildForwardQuery(query)}`), decodeForwardUsage, requestOptions);
     },
   };
 }

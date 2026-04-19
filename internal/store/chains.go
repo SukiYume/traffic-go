@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -50,6 +51,8 @@ func (s *Store) UpsertUsageChains(ctx context.Context, records []model.UsageChai
 	}
 	defer tx.Rollback()
 
+	dirtyHours := make(map[int64]struct{}, len(records))
+
 	stmt, err := tx.PrepareContext(ctx, `
 INSERT INTO usage_chain_1m (
     minute_ts, chain_id, pid, comm, exe, source_ip, entry_port, target_ip, target_host, target_host_normalized,
@@ -83,6 +86,7 @@ ON CONFLICT(chain_id) DO UPDATE SET
 
 	for _, record := range records {
 		record = normalizeUsageChainRecord(record, DataSourceMinuteChain)
+		dirtyHours[timeBucketToHour(record.TimeBucket)] = struct{}{}
 		if _, err := stmt.ExecContext(
 			ctx,
 			record.TimeBucket,
@@ -110,7 +114,29 @@ ON CONFLICT(chain_id) DO UPDATE SET
 		}
 	}
 
+	if err := upsertDirtyHours(ctx, tx, dirtyHours); err != nil {
+		return err
+	}
+
 	return tx.Commit()
+}
+
+func upsertDirtyHours(ctx context.Context, tx interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, hours map[int64]struct{}) error {
+	for hourTS := range hours {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO dirty_chain_hours (hour_ts) VALUES (?)
+ON CONFLICT(hour_ts) DO NOTHING
+`, hourTS); err != nil {
+			return fmt.Errorf("mark dirty chain hour: %w", err)
+		}
+	}
+	return nil
+}
+
+func timeBucketToHour(bucketTS int64) int64 {
+	return (bucketTS / 3600) * 3600
 }
 
 func (s *Store) QueryUsageChainsForProcess(ctx context.Context, bucketTS int64, pid *int, comm string, exe string, source string) ([]model.UsageChainRecord, error) {

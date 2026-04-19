@@ -178,3 +178,61 @@ func TestRunPrefetchWarmsConfiguredProcessLogs(t *testing.T) {
 		t.Fatalf("expected prefetched chain rows, got %+v", chains)
 	}
 }
+
+func TestRunAggregationReplaysDirtyBackfilledChainHours(t *testing.T) {
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
+
+	application, err := New(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = application.Close()
+	})
+
+	ctx := context.Background()
+	lateMinute := time.Date(2026, 4, 16, 2, 8, 0, 0, time.UTC)
+	pid := 1088
+	exe := "/usr/bin/ss-server"
+	entryPort := 12096
+	targetPort := 443
+
+	if err := application.store.SetLastAggregatedHour(ctx, lateMinute.Add(4*time.Hour).Truncate(time.Hour)); err != nil {
+		t.Fatalf("set aggregation cursor: %v", err)
+	}
+
+	if err := application.store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        lateMinute.Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "chatgpt.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        4096,
+			FlowCount:         3,
+			EvidenceCount:     2,
+			EvidenceSource:    "ss-log",
+			Confidence:        "high",
+			SampleFingerprint: "chain-fp-1",
+			SampleMessage:     "sample",
+			SampleTime:        lateMinute.Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert late chain: %v", err)
+	}
+
+	application.runAggregation(ctx)
+
+	rows, err := application.store.QueryUsageChainsForProcess(ctx, lateMinute.Truncate(time.Hour).Unix(), &pid, "ss-server", exe, store.DataSourceHourChain)
+	if err != nil {
+		t.Fatalf("query aggregated dirty chains: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected one replayable hourly chain row, got %+v", rows)
+	}
+}

@@ -309,7 +309,7 @@ func TestMessageHasExactIP(t *testing.T) {
 	}
 }
 
-func TestMergeChainUsageMetricsSkipsAmbiguousHostOnlyFallback(t *testing.T) {
+func TestMergeChainUsageMetricsAnchorsAmbiguousHostOnlyOutboundChainsToQueriedRemote(t *testing.T) {
 	remotePort := 443
 	query := usageExplainQuery{
 		Direction:  model.DirectionOut,
@@ -354,11 +354,11 @@ func TestMergeChainUsageMetricsSkipsAmbiguousHostOnlyFallback(t *testing.T) {
 	mergeChainUsageMetrics(chains, query, related)
 
 	for key, chain := range chains {
-		if chain.TargetIP != "" {
-			t.Fatalf("expected ambiguous host-only chain %s to keep target ip unresolved, got %+v", key, chain)
+		if chain.TargetIP != "142.250.72.14" {
+			t.Fatalf("expected ambiguous host-only chain %s to anchor to the queried target ip, got %+v", key, chain)
 		}
-		if chain.BytesTotal != 0 || chain.FlowCount != 0 {
-			t.Fatalf("expected ambiguous host-only chain %s to avoid duplicated usage totals, got %+v", key, chain)
+		if chain.BytesTotal != 10240 || chain.FlowCount != 4 {
+			t.Fatalf("expected ambiguous host-only chain %s to reuse the queried outbound totals, got %+v", key, chain)
 		}
 	}
 }

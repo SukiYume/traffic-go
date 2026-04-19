@@ -143,6 +143,67 @@ func TestNextPendingAggregationHourIncludesForwardOnlyMinutes(t *testing.T) {
 	}
 }
 
+func TestUpsertUsageChainsMarksDirtyHourOutsideAggregationCursor(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	lateMinute := time.Date(2026, 4, 15, 2, 10, 0, 0, time.UTC)
+	laterHour := lateMinute.Add(4 * time.Hour).Truncate(time.Hour)
+	pid := 1088
+	exe := "/usr/bin/ss-server"
+	entryPort := 12096
+	targetPort := 443
+
+	if err := store.SetLastAggregatedHour(ctx, laterHour); err != nil {
+		t.Fatalf("set aggregation cursor: %v", err)
+	}
+
+	if err := store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        lateMinute.Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "chatgpt.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        4096,
+			FlowCount:         3,
+			EvidenceCount:     2,
+			EvidenceSource:    "ss-log",
+			Confidence:        "high",
+			SampleFingerprint: "chain-fp-1",
+			SampleMessage:     "sample",
+			SampleTime:        lateMinute.Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert usage chains: %v", err)
+	}
+
+	dirtyHour, ok, err := store.NextDirtyChainHour(ctx, laterHour.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("next dirty chain hour: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected late chain backfill to mark a dirty hour")
+	}
+	if !dirtyHour.Equal(lateMinute.Truncate(time.Hour)) {
+		t.Fatalf("unexpected dirty chain hour: got %s want %s", dirtyHour, lateMinute.Truncate(time.Hour))
+	}
+
+	if err := store.AggregateHour(ctx, dirtyHour); err != nil {
+		t.Fatalf("aggregate dirty chain hour: %v", err)
+	}
+
+	if _, ok, err := store.NextDirtyChainHour(ctx, laterHour.Add(2*time.Hour)); err != nil {
+		t.Fatalf("query dirty chain hour after aggregate: %v", err)
+	} else if ok {
+		t.Fatalf("expected dirty chain hour to be cleared after aggregation")
+	}
+}
+
 func TestQueryTimeseriesUsesTimeColumnForBucketing(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -483,6 +544,60 @@ CREATE INDEX IF NOT EXISTS idx_log_evidence_created_at ON log_evidence (created_
 	}
 	if count != 1 {
 		t.Fatalf("expected idx_log_evidence_host_port to exist, found %d", count)
+	}
+}
+
+func TestMigratePrunesHistoricalZeroUsageRows(t *testing.T) {
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
+
+	db, err := sql.Open("sqlite", cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	if _, err := db.Exec(schemaSQL); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO usage_1m (
+	minute_ts, proto, direction, pid, comm, exe, local_port, remote_ip, remote_port, attribution,
+	bytes_up, bytes_down, pkts_up, pkts_down, flow_count
+) VALUES
+	(1710000000, 'tcp', 'out', 0, '', '', 0, '203.0.113.8', 443, 'unknown', 0, 0, 0, 0, 0),
+	(1710000060, 'tcp', 'out', 1088, 'ss-server', '/usr/bin/ss-server', 8388, '203.0.113.9', 443, 'exact', 10, 20, 1, 2, 1);
+INSERT INTO usage_1m_forward (
+	minute_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport,
+	bytes_orig, bytes_reply, pkts_orig, pkts_reply, flow_count
+) VALUES
+	(1710000000, 'tcp', '10.0.0.2', '203.0.113.8', 51000, 443, 0, 0, 0, 0, 0),
+	(1710000060, 'tcp', '10.0.0.3', '203.0.113.9', 51001, 443, 10, 20, 1, 2, 1);
+`); err != nil {
+		t.Fatalf("seed zero usage rows: %v", err)
+	}
+	_ = db.Close()
+
+	store, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	var usageRows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_1m`).Scan(&usageRows); err != nil {
+		t.Fatalf("count usage rows after migrate: %v", err)
+	}
+	if usageRows != 1 {
+		t.Fatalf("expected zero-valued usage rows to be pruned, found %d rows", usageRows)
+	}
+
+	var forwardRows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_1m_forward`).Scan(&forwardRows); err != nil {
+		t.Fatalf("count forward rows after migrate: %v", err)
+	}
+	if forwardRows != 1 {
+		t.Fatalf("expected zero-valued forward rows to be pruned, found %d rows", forwardRows)
 	}
 }
 

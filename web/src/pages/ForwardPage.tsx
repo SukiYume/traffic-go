@@ -59,7 +59,7 @@ export function ForwardPage() {
   const currentSort = sorting[0];
   const query = useQuery({
     queryKey: ['forward', range, filters.origSrcIp, filters.origDstIp, filters.proto, page, currentSort?.id, currentSort?.desc],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       api.getForwardUsage({
         range,
         proto: filters.proto,
@@ -69,7 +69,7 @@ export function ForwardPage() {
         pageSize,
         sortBy: normalizeForwardSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
-      }),
+      }, { signal }),
     placeholderData: keepPreviousData,
   });
 

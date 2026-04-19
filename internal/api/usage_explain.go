@@ -314,24 +314,23 @@ func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usage
 			processName = "ss-server"
 		}
 		lookupName, logDir, ok := s.lookupConfiguredProcessLogDir(query.Comm, query.Exe)
-		if ok {
-			if lookupName != "" {
-				processName = lookupName
+		if lookupName != "" {
+			processName = lookupName
+		}
+		logDirs := s.lookupConfiguredProcessLogDirs(query.Comm, query.Exe)
+		if len(logDirs) == 0 && strings.TrimSpace(logDir) != "" {
+			logDirs = []string{logDir}
+		}
+		if allowCachedEvidence {
+			s.addCurrentTupleNote(&response, query)
+			if err := s.enrichShadowsocksFromLogs(ctx, &response, query, bucketTS, logDirs, related, allowFileScan); err != nil {
+				appendNoteUnique(&response.Notes, fmt.Sprintf("SS 日志检索失败：%v", err))
 			}
-			logDirs := s.lookupConfiguredProcessLogDirs(query.Comm, query.Exe)
-			if len(logDirs) == 0 && strings.TrimSpace(logDir) != "" {
-				logDirs = []string{logDir}
-			}
-			if allowCachedEvidence {
-				s.addCurrentTupleNote(&response, query)
-				if err := s.enrichShadowsocksFromLogs(ctx, &response, query, bucketTS, logDirs, related, allowFileScan); err != nil {
-					appendNoteUnique(&response.Notes, fmt.Sprintf("SS 日志检索失败：%v", err))
-				}
-			} else {
-				appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
+			if !ok {
+				appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志目录，当前仅回放已缓存证据，无法同步扫描文件。", processName))
 			}
 		} else {
-			appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志路径，已跳过日志检索。", processName))
+			appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
 		}
 		appendNoteUnique(&response.Notes, "Shadowsocks 使用加密与复用，日志关联是候选推断，不保证来源与目标一一对应。")
 	} else if isNginxProcess(query.Comm, query.Exe) {
@@ -340,40 +339,38 @@ func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usage
 			processName = "nginx"
 		}
 		lookupName, logDir, ok := s.lookupConfiguredProcessLogDir(query.Comm, query.Exe)
-		if ok {
-			if lookupName != "" {
-				processName = lookupName
+		if lookupName != "" {
+			processName = lookupName
+		}
+		if allowCachedEvidence {
+			s.addCurrentTupleNote(&response, query)
+			if err := s.enrichNginxFromLogs(ctx, &response, query.RemoteIP, bucketTS, logDir, allowFileScan); err != nil {
+				appendNoteUnique(&response.Notes, fmt.Sprintf("Nginx 日志检索失败：%v", err))
 			}
-			if allowCachedEvidence {
-				s.addCurrentTupleNote(&response, query)
-				if err := s.enrichNginxFromLogs(ctx, &response, query.RemoteIP, bucketTS, logDir, allowFileScan); err != nil {
-					appendNoteUnique(&response.Notes, fmt.Sprintf("Nginx 日志检索失败：%v", err))
-				}
-			} else {
-				appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
+			if !ok {
+				appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志目录，当前仅回放已缓存证据，无法同步扫描文件。", processName))
 			}
 		} else {
-			appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志路径，已跳过日志检索。", processName))
+			appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
 		}
 		appendNoteUnique(&response.Notes, "HTTP/HTTPS 网页路径优先来自 access.log 关联；仅靠 conntrack 无法直接提取 URI。")
 	} else {
 		processName := processIdentityKey(query.Comm, query.Exe)
 		if processName != "" {
 			lookupName, logDir, ok := s.lookupConfiguredProcessLogDir(query.Comm, query.Exe)
-			if ok {
-				if lookupName != "" {
-					processName = lookupName
+			if lookupName != "" {
+				processName = lookupName
+			}
+			if allowCachedEvidence {
+				s.addCurrentTupleNote(&response, query)
+				if err := s.enrichGenericProcessFromLogs(ctx, &response, query, bucketTS, related, processName, logDir, allowFileScan); err != nil {
+					appendNoteUnique(&response.Notes, fmt.Sprintf("%s 日志检索失败：%v", processName, err))
 				}
-				if allowCachedEvidence {
-					s.addCurrentTupleNote(&response, query)
-					if err := s.enrichGenericProcessFromLogs(ctx, &response, query, bucketTS, related, processName, logDir, allowFileScan); err != nil {
-						appendNoteUnique(&response.Notes, fmt.Sprintf("%s 日志检索失败：%v", processName, err))
-					}
-				} else {
-					appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
+				if !ok {
+					appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志目录，当前仅回放已缓存证据，无法同步扫描文件。", processName))
 				}
 			} else {
-				appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志路径，已跳过日志检索。", processName))
+				appendNoteUnique(&response.Notes, "未提供 data_source，已跳过日志缓存回放；如需即时文件扫描请显式传入 scan=1。")
 			}
 		}
 	}
@@ -548,10 +545,10 @@ func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplain
 	}
 	if len(rows) == 0 {
 		if !allowFileScan {
-			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", resolvedLogDir(logDir, "")))
+			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", resolvedLogDir(logDir, "缓存证据库")))
 			return nil
 		}
-		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志中未匹配到该来源 IP。", resolvedLogDir(logDir, "")))
+		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志中未匹配到该来源 IP。", resolvedLogDir(logDir, "缓存证据库")))
 		return nil
 	}
 
@@ -628,7 +625,7 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 	for _, note := range notes {
 		appendNoteUnique(&response.Notes, note)
 	}
-	configuredDir := formatResolvedLogDirs(logDirs)
+	configuredDir := fallbackText(formatResolvedLogDirs(logDirs), "缓存证据库")
 	if len(rows) == 0 {
 		if !allowFileScan {
 			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", configuredDir))
@@ -783,10 +780,10 @@ func (s *Server) enrichGenericProcessFromLogs(
 	}
 	if len(rows) == 0 {
 		if !allowFileScan {
-			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", resolvedLogDir(logDir, "")))
+			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", resolvedLogDir(logDir, "缓存证据库")))
 			return nil
 		}
-		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 中未命中 %s 相关日志。", resolvedLogDir(logDir, ""), processName))
+		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 中未命中 %s 相关日志。", resolvedLogDir(logDir, "缓存证据库"), processName))
 		return nil
 	}
 
@@ -874,7 +871,25 @@ func (s *Server) lookupOrScanEvidenceAcrossDirs(
 ) ([]model.LogEvidence, []string, error) {
 	uniqueDirs := uniqueNonEmptyStrings(logDirs)
 	if len(uniqueDirs) == 0 {
-		return nil, nil, nil
+		rows, note, err := s.lookupOrScanEvidence(
+			ctx,
+			source,
+			"",
+			bucketTS,
+			limit,
+			false,
+			matcher,
+			queryHints,
+			fileNameMatcher,
+			parser,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		if note == "" {
+			return rows, nil, nil
+		}
+		return rows, []string{note}, nil
 	}
 
 	rows := make([]model.LogEvidence, 0, limit)
@@ -2041,7 +2056,6 @@ func mergeChainUsageMetrics(chains map[string]chainAgg, query usageExplainQuery,
 
 	byTargetPort := make(map[string]usageTotals)
 	bySourceEntry := make(map[string]usageTotals)
-	hostOnlyCandidates := make(map[string]int)
 	sourceEntryCandidates := make(map[string]int)
 	for _, row := range related {
 		if row.Direction == model.DirectionIn && row.RemoteIP != "" && row.LocalPort > 0 {
@@ -2071,20 +2085,19 @@ func mergeChainUsageMetrics(chains map[string]chainAgg, query usageExplainQuery,
 		if chain.SourceIP != "" && chain.LocalPort > 0 {
 			sourceEntryCandidates[fmt.Sprintf("%s|%d", chain.SourceIP, chain.LocalPort)]++
 		}
-		if chain.TargetIP == "" && chain.TargetPort > 0 {
-			hostOnlyCandidates[fmt.Sprintf("%d|%d", chain.LocalPort, chain.TargetPort)]++
-		}
 	}
 
 	for key, chain := range chains {
-		if chain.TargetIP == "" && query.Direction == model.DirectionOut && strings.TrimSpace(query.RemoteIP) != "" {
-			candidateKey := fmt.Sprintf("%d|%d", chain.LocalPort, chain.TargetPort)
-			if hostOnlyCandidates[candidateKey] == 1 && (query.RemotePort == nil || chain.TargetPort <= 0 || *query.RemotePort == chain.TargetPort) {
-				chain.TargetIP = strings.TrimSpace(query.RemoteIP)
-			}
-		}
 		if chain.TargetPort <= 0 && query.RemotePort != nil {
 			chain.TargetPort = *query.RemotePort
+		}
+		// Busy proxy minutes often fan out one entry port to many host-only log
+		// candidates. We still anchor those candidates to the queried outbound
+		// remote IP so replay can show the same host list after minute retention.
+		if chain.TargetIP == "" && query.Direction == model.DirectionOut && strings.TrimSpace(query.RemoteIP) != "" {
+			if query.RemotePort == nil || chain.TargetPort <= 0 || *query.RemotePort == chain.TargetPort {
+				chain.TargetIP = strings.TrimSpace(query.RemoteIP)
+			}
 		}
 		port := chain.TargetPort
 		lookupKey := fmt.Sprintf("%s|%d", chain.TargetIP, port)
@@ -2094,21 +2107,6 @@ func mergeChainUsageMetrics(chains map[string]chainAgg, query usageExplainQuery,
 			chain.Confidence = explainChainConfidence(chain.SourceIP, chain.TargetIP)
 			chains[key] = chain
 			continue
-		}
-		if query.Direction == model.DirectionOut && strings.TrimSpace(query.RemoteIP) != "" {
-			candidateKey := fmt.Sprintf("%d|%d", chain.LocalPort, chain.TargetPort)
-			if hostOnlyCandidates[candidateKey] != 1 {
-				continue
-			}
-			anchorKey := fmt.Sprintf("%s|%d", strings.TrimSpace(query.RemoteIP), port)
-			if totals, ok := byTargetPort[anchorKey]; ok {
-				chain.TargetIP = strings.TrimSpace(query.RemoteIP)
-				chain.BytesTotal = totals.bytes
-				chain.FlowCount = totals.flows
-				chain.Confidence = explainChainConfidence(chain.SourceIP, chain.TargetIP)
-				chains[key] = chain
-				continue
-			}
 		}
 		if chain.SourceIP != "" && chain.LocalPort > 0 {
 			sourceKey := fmt.Sprintf("%s|%d", chain.SourceIP, chain.LocalPort)

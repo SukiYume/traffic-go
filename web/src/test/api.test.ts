@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHttpClient, normalizeUsageSortKey, shouldUseMockApi } from '../api';
+import { createMockApiClient } from '../data/mock';
 
 const fetchMock = vi.fn<typeof fetch>();
 
@@ -28,7 +29,7 @@ describe('http api client', () => {
               comm: 'ss-server',
               exe: '/usr/bin/ss-server',
               local_port: 8388,
-              remote_ip: '1.1.1.1',
+              remote_ip: '198.51.100.53',
               remote_port: 443,
               attribution: 'exact',
               bytes_up: 120,
@@ -45,7 +46,7 @@ describe('http api client', () => {
     const client = createHttpClient();
     const response = await client.getUsage({
       range: '24h',
-      remoteIp: '1.1.1.1',
+      remoteIp: '198.51.100.53',
       localPort: '8388',
       page: 2,
       pageSize: 10,
@@ -54,19 +55,46 @@ describe('http api client', () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage?range=24h&remote_ip=1.1.1.1&local_port=8388&page=2&page_size=10&sort_by=bytes_total&sort_order=desc',
+      '/api/v1/usage?range=24h&remote_ip=198.51.100.53&local_port=8388&page=2&page_size=10&sort_by=bytes_total&sort_order=desc',
       expect.any(Object),
     );
     expect(response.rows[0]).toMatchObject({
       minuteTs: 1710000000,
       localPort: 8388,
-      remoteIp: '1.1.1.1',
+      remoteIp: '198.51.100.53',
       bytesUp: 120,
       bytesDown: 360,
     });
     expect(response.nextCursor).toBe('next-1');
     expect(response.page).toBe(2);
     expect(response.totalRows).toBe(21);
+  });
+
+  it('passes AbortSignal through to fetch so superseded queries can be cancelled', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data_source: 'usage_1m',
+          next_cursor: null,
+          page: 1,
+          page_size: 1,
+          total_rows: 1,
+          data: [],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    const controller = new AbortController();
+    await client.getUsage({ range: '24h' }, { signal: controller.signal });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/usage?range=24h',
+      expect.objectContaining({
+        signal: controller.signal,
+      }),
+    );
   });
 
   it('decodes overview and aggregates timeseries buckets from backend payloads', async () => {
@@ -138,7 +166,7 @@ describe('http api client', () => {
               comm: 'ss-server',
               exe: null,
               local_port: 8388,
-              remote_ip: '1.1.1.1',
+              remote_ip: '198.51.100.53',
               remote_port: null,
               attribution: null,
               bytes_up: 120,
@@ -303,7 +331,7 @@ describe('http api client', () => {
               time_bucket: 1710000000,
               proto: 'tcp',
               orig_src_ip: '10.0.0.2',
-              orig_dst_ip: '1.1.1.1',
+              orig_dst_ip: '203.0.113.53',
               orig_sport: 51122,
               orig_dport: 443,
               bytes_orig: 120,
@@ -322,7 +350,7 @@ describe('http api client', () => {
       range: '24h',
       proto: 'tcp',
       origSrcIp: '10.0.0.2',
-      origDstIp: '1.1.1.1',
+      origDstIp: '203.0.113.53',
       page: 1,
       pageSize: 10,
       sortBy: 'bytesTotal',
@@ -330,12 +358,12 @@ describe('http api client', () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/forward/usage?range=24h&proto=tcp&orig_src_ip=10.0.0.2&orig_dst_ip=1.1.1.1&page=1&page_size=10&sort_by=bytes_total&sort_order=desc',
+      '/api/v1/forward/usage?range=24h&proto=tcp&orig_src_ip=10.0.0.2&orig_dst_ip=203.0.113.53&page=1&page_size=10&sort_by=bytes_total&sort_order=desc',
       expect.any(Object),
     );
     expect(response.rows[0]).toMatchObject({
       origSrc: '10.0.0.2',
-      origDst: '1.1.1.1',
+      origDst: '203.0.113.53',
       bytesOrig: 120,
       bytesReply: 360,
     });
@@ -350,14 +378,14 @@ describe('http api client', () => {
             process: 'ss-server (/usr/bin/ss-server)',
             confidence: 'medium',
             source_ips: ['203.0.113.24'],
-            target_ips: ['142.250.72.14'],
+            target_ips: ['198.51.100.44'],
             chains: [
               {
-                chain_id: 'usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|142.250.72.14|chatgpt.com|443',
+                chain_id: 'usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|198.51.100.44|api.example.test|443',
                 source_ip: '203.0.113.24',
-                target_ip: '142.250.72.14',
-                target_host: 'chatgpt.com',
-                target_host_normalized: 'chatgpt.com',
+                target_ip: '198.51.100.44',
+                target_host: 'api.example.test',
+                target_host_normalized: 'api.example.test',
                 target_port: 443,
                 local_port: 47920,
                 bytes_total: 8062000,
@@ -374,7 +402,7 @@ describe('http api client', () => {
             related_peers: [
               {
                 direction: 'out',
-                remote_ip: '142.250.72.14',
+                remote_ip: '198.51.100.44',
                 remote_port: 443,
                 local_port: 47920,
                 bytes_total: 8062000,
@@ -397,7 +425,7 @@ describe('http api client', () => {
       comm: 'ss-server',
       exe: '/usr/bin/ss-server',
       localPort: 47920,
-      remoteIp: '142.250.72.14',
+      remoteIp: '198.51.100.44',
       remotePort: 443,
       attribution: 'exact',
       bytesUp: 100,
@@ -408,22 +436,22 @@ describe('http api client', () => {
     }, { dataSource: 'usage_1h' });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage/explain?ts=1710000000&data_source=usage_1h&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443',
+      '/api/v1/usage/explain?ts=1710000000&data_source=usage_1h&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443',
       expect.any(Object),
     );
     expect(result).toMatchObject({
       process: 'ss-server (/usr/bin/ss-server)',
       confidence: 'medium',
       sourceIps: ['203.0.113.24'],
-      targetIps: ['142.250.72.14'],
+      targetIps: ['198.51.100.44'],
       notes: ['Shadowsocks 只能做同进程同时间窗关联。'],
     });
     expect(result.chains[0]).toMatchObject({
-      chainId: 'usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|142.250.72.14|chatgpt.com|443',
+      chainId: 'usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|198.51.100.44|api.example.test|443',
       sourceIp: '203.0.113.24',
-      targetIp: '142.250.72.14',
-      targetHost: 'chatgpt.com',
-      targetHostNormalized: 'chatgpt.com',
+      targetIp: '198.51.100.44',
+      targetHost: 'api.example.test',
+      targetHostNormalized: 'api.example.test',
       targetPort: 443,
       localPort: 47920,
       evidenceCount: 3,
@@ -436,7 +464,7 @@ describe('http api client', () => {
     });
     expect(result.relatedPeers[0]).toMatchObject({
       direction: 'out',
-      remoteIp: '142.250.72.14',
+      remoteIp: '198.51.100.44',
       remotePort: 443,
       localPort: 47920,
       bytesTotal: 8062000,
@@ -449,20 +477,20 @@ describe('http api client', () => {
           data: {
             process: 'nginx (/usr/sbin/nginx)',
             confidence: 'high',
-            source_ips: ['74.7.227.153'],
+            source_ips: ['198.51.100.42'],
             target_ips: ['127.0.0.1'],
             related_peers: [],
             nginx_requests: [
               {
                 time: 1710000000,
                 method: 'GET',
-                host: 'paris.escape.ac.cn',
-                host_normalized: 'paris.escape.ac.cn',
+                host: 'crawler.example.test',
+                host_normalized: 'crawler.example.test',
                 path: '/apod/2023/12/AstroPH-2023-12',
                 status: 200,
                 count: 3,
                 client_ip: '127.0.0.1',
-                referer: 'https://paris.escape.ac.cn/sitemap.xml',
+                referer: 'https://crawler.example.test/sitemap.xml',
                 user_agent: 'Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)',
                 bot: 'GPTBot',
                 sample_fingerprint: 'nginx-fp-1',
@@ -482,7 +510,7 @@ describe('http api client', () => {
       comm: 'nginx',
       exe: '/usr/sbin/nginx',
       localPort: 443,
-      remoteIp: '74.7.227.153',
+      remoteIp: '198.51.100.42',
       remotePort: 36892,
       attribution: 'exact',
       bytesUp: 10,
@@ -497,16 +525,79 @@ describe('http api client', () => {
       count: 3,
       bot: 'GPTBot',
       clientIp: '127.0.0.1',
-      hostNormalized: 'paris.escape.ac.cn',
-      referer: 'https://paris.escape.ac.cn/sitemap.xml',
+      hostNormalized: 'crawler.example.test',
+      referer: 'https://crawler.example.test/sitemap.xml',
       sampleFingerprint: 'nginx-fp-1',
     });
+  });
+
+  it('includes the scan flag when on-demand explain scanning is requested', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            process: 'ss-server (/usr/bin/ss-server)',
+            confidence: 'low',
+            source_ips: [],
+            target_ips: [],
+            chains: [],
+            related_peers: [],
+            nginx_requests: [],
+            notes: [],
+          },
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    await client.getUsageExplain(
+      {
+        minuteTs: 1710000000,
+        proto: 'tcp',
+        direction: 'out',
+        pid: 1088,
+        comm: 'ss-server',
+        exe: '/usr/bin/ss-server',
+        localPort: 47920,
+        remoteIp: '198.51.100.44',
+        remotePort: 443,
+        attribution: 'exact',
+        bytesUp: 100,
+        bytesDown: 200,
+        pktsUp: 1,
+        pktsDown: 2,
+        flowCount: 1,
+      },
+      { dataSource: 'usage_1m', allowScan: true },
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/usage/explain?ts=1710000000&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443&scan=1',
+      expect.any(Object),
+    );
   });
 
   it('uses mock api only when explicitly enabled', () => {
     expect(shouldUseMockApi(undefined)).toBe(false);
     expect(shouldUseMockApi('0')).toBe(false);
     expect(shouldUseMockApi('1')).toBe(true);
+  });
+});
+
+describe('mock api client', () => {
+  it('matches basename exe filters and clamps page sizes like the backend', async () => {
+    const client = createMockApiClient();
+    const usage = await client.getUsage({
+      range: '24h',
+      exe: 'ss-server',
+      page: 1,
+      pageSize: 999,
+    });
+
+    expect(usage.rows.length).toBeGreaterThan(0);
+    expect(usage.pageSize).toBe(200);
+    expect(usage.rows.every((row) => row.exe?.includes('ss-server') ?? false)).toBe(true);
   });
 });
 

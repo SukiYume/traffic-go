@@ -20,6 +20,7 @@ type processResolver struct {
 	procFS        string
 	now           func() time.Time
 	scan          func(context.Context) (map[uint64]model.ProcessInfo, bool)
+	pidSockets    func(int) (map[uint64]struct{}, bool)
 	positiveTTL   time.Duration
 	negativeTTL   time.Duration
 	lastFullScan  time.Time
@@ -48,11 +49,20 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 	}
 	scanDue := r.fullScanDue(now)
 	missing := make(map[uint64]struct{})
+	ownedSockets := make(map[int]map[uint64]struct{})
+	ownedSocketsLoaded := make(map[int]bool)
 	for inode := range requested {
 		if !scanDue {
 			if cached, ok := r.cache[inode]; ok {
-				resolved[inode] = cached
-				continue
+				// Confirm the cached PID still owns the socket inode before we
+				// trust a stale positive-cache hit. Linux can recycle socket
+				// inodes quickly, and using the old mapping would misattribute
+				// short-lived connections to the wrong process.
+				if r.cachedOwnershipValid(ownedSockets, ownedSocketsLoaded, cached.PID, inode) {
+					resolved[inode] = cached
+					continue
+				}
+				delete(r.cache, inode)
 			}
 		}
 		if expiry, ok := r.negativeCache[inode]; ok && expiry.After(now) {
@@ -102,12 +112,43 @@ func (r *processResolver) fullScanDue(now time.Time) bool {
 	return r.lastFullScan.IsZero() || now.Sub(r.lastFullScan) >= r.positiveTTL
 }
 
+func (r *processResolver) cachedOwnershipValid(ownedSockets map[int]map[uint64]struct{}, loaded map[int]bool, pid int, inode uint64) bool {
+	if pid <= 0 {
+		return false
+	}
+	if !loaded[pid] {
+		loadSockets := r.pidSockets
+		if loadSockets == nil {
+			loadSockets = r.readProcessSocketInodes
+		}
+		sockets, ok := loadSockets(pid)
+		loaded[pid] = true
+		if !ok {
+			return false
+		}
+		ownedSockets[pid] = sockets
+	}
+	sockets, ok := ownedSockets[pid]
+	if !ok {
+		return false
+	}
+	_, exists := sockets[inode]
+	return exists
+}
+
 func (r *processResolver) purgeExpiredNegativeEntries(now time.Time) {
 	for inode, expiry := range r.negativeCache {
 		if !expiry.After(now) {
 			delete(r.negativeCache, inode)
 		}
 	}
+}
+
+func (r *processResolver) readProcessSocketInodes(pid int) (map[uint64]struct{}, bool) {
+	if pid <= 0 {
+		return nil, false
+	}
+	return readSocketInodesFromFDDir(filepath.Join(r.procFS, strconv.Itoa(pid), "fd"))
 }
 
 func (r *processResolver) scanProcSockets(ctx context.Context) (map[uint64]model.ProcessInfo, bool) {
@@ -130,8 +171,8 @@ func (r *processResolver) scanProcSockets(ctx context.Context) (map[uint64]model
 		}
 
 		fdDir := filepath.Join(r.procFS, entry.Name(), "fd")
-		fdEntries, err := os.ReadDir(fdDir)
-		if err != nil {
+		inodes, ok := readSocketInodesFromFDDir(fdDir)
+		if !ok || len(inodes) == 0 {
 			continue
 		}
 
@@ -141,16 +182,7 @@ func (r *processResolver) scanProcSockets(ctx context.Context) (map[uint64]model
 			loaded bool
 		)
 
-		for _, fdEntry := range fdEntries {
-			target, err := os.Readlink(filepath.Join(fdDir, fdEntry.Name()))
-			if err != nil || !strings.HasPrefix(target, "socket:[") || !strings.HasSuffix(target, "]") {
-				continue
-			}
-			inodeValue := strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")
-			inode, err := strconv.ParseUint(inodeValue, 10, 64)
-			if err != nil {
-				continue
-			}
+		for inode := range inodes {
 			if !loaded {
 				comm = readProcessComm(r.procFS, entry.Name())
 				exe = readProcessExe(r.procFS, entry.Name())
@@ -165,6 +197,38 @@ func (r *processResolver) scanProcSockets(ctx context.Context) (map[uint64]model
 	}
 
 	return cache, true
+}
+
+func readSocketInodesFromFDDir(fdDir string) (map[uint64]struct{}, bool) {
+	fdEntries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil, false
+	}
+	inodes := make(map[uint64]struct{})
+	for _, fdEntry := range fdEntries {
+		target, err := os.Readlink(filepath.Join(fdDir, fdEntry.Name()))
+		if err != nil {
+			continue
+		}
+		inode, ok := parseSocketInode(target)
+		if !ok {
+			continue
+		}
+		inodes[inode] = struct{}{}
+	}
+	return inodes, true
+}
+
+func parseSocketInode(target string) (uint64, bool) {
+	if !strings.HasPrefix(target, "socket:[") || !strings.HasSuffix(target, "]") {
+		return 0, false
+	}
+	inodeValue := strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")
+	inode, err := strconv.ParseUint(inodeValue, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return inode, true
 }
 
 func readProcessComm(procFS, pid string) string {

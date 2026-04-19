@@ -24,6 +24,7 @@ import type {
   UsageExplain,
 } from '../types';
 import { RANGE_TO_BUCKET } from '../ranges';
+import { executableName } from '../utils';
 
 const BASE_TS = 1_735_689_600;
 const MINUTE = 60;
@@ -38,18 +39,18 @@ const PROCESSES: ProcessOption[] = [
 
 const USAGE_ROWS: UsageRow[] = [
   { minuteTs: BASE_TS - 720, proto: 'tcp', direction: 'in', pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', localPort: 8388, remoteIp: '203.0.113.24', remotePort: 52144, attribution: 'exact', bytesUp: 182_000, bytesDown: 1_240_000, pktsUp: 320, pktsDown: 960, flowCount: 3 },
-  { minuteTs: BASE_TS - 660, proto: 'tcp', direction: 'out', pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', localPort: 47920, remoteIp: '142.250.72.14', remotePort: 443, attribution: 'exact', bytesUp: 1_918_000, bytesDown: 6_144_000, pktsUp: 980, pktsDown: 1_620, flowCount: 4 },
-  { minuteTs: BASE_TS - 600, proto: 'udp', direction: 'out', pid: null, comm: null, exe: null, localPort: 53011, remoteIp: '8.8.8.8', remotePort: 53, attribution: 'unknown', bytesUp: 18_432, bytesDown: 32_768, pktsUp: 20, pktsDown: 24, flowCount: 1 },
-  { minuteTs: BASE_TS - 540, proto: 'tcp', direction: 'out', pid: 2041, comm: 'v2ray', exe: '/opt/v2ray/v2ray', localPort: 55712, remoteIp: '104.16.132.229', remotePort: 443, attribution: 'exact', bytesUp: 4_230_144, bytesDown: 14_742_528, pktsUp: 1_024, pktsDown: 2_448, flowCount: 2 },
+  { minuteTs: BASE_TS - 660, proto: 'tcp', direction: 'out', pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', localPort: 47920, remoteIp: '198.51.100.44', remotePort: 443, attribution: 'exact', bytesUp: 1_918_000, bytesDown: 6_144_000, pktsUp: 980, pktsDown: 1_620, flowCount: 4 },
+  { minuteTs: BASE_TS - 600, proto: 'udp', direction: 'out', pid: null, comm: null, exe: null, localPort: 53011, remoteIp: '203.0.113.53', remotePort: 53, attribution: 'unknown', bytesUp: 18_432, bytesDown: 32_768, pktsUp: 20, pktsDown: 24, flowCount: 1 },
+  { minuteTs: BASE_TS - 540, proto: 'tcp', direction: 'out', pid: 2041, comm: 'v2ray', exe: '/opt/v2ray/v2ray', localPort: 55712, remoteIp: '192.0.2.25', remotePort: 443, attribution: 'exact', bytesUp: 4_230_144, bytesDown: 14_742_528, pktsUp: 1_024, pktsDown: 2_448, flowCount: 2 },
   { minuteTs: BASE_TS - 480, proto: 'tcp', direction: 'in', pid: 3312, comm: 'nginx', exe: '/usr/sbin/nginx', localPort: 80, remoteIp: '198.51.100.17', remotePort: 41220, attribution: 'exact', bytesUp: 122_880, bytesDown: 896_000, pktsUp: 250, pktsDown: 530, flowCount: 5 },
-  { minuteTs: BASE_TS - 420, proto: 'tcp', direction: 'out', pid: 4920, comm: 'dockerd', exe: '/usr/bin/dockerd', localPort: 41688, remoteIp: '93.184.216.34', remotePort: 443, attribution: 'exact', bytesUp: 512_000, bytesDown: 1_024_000, pktsUp: 400, pktsDown: 420, flowCount: 1 },
-  { minuteTs: BASE_TS - 360, proto: 'udp', direction: 'out', pid: null, comm: null, exe: null, localPort: 5353, remoteIp: '1.1.1.1', remotePort: 443, attribution: 'unknown', bytesUp: 91_136, bytesDown: 142_336, pktsUp: 88, pktsDown: 96, flowCount: 2 },
-  { minuteTs: BASE_TS - 300, proto: 'tcp', direction: 'out', pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', localPort: 51234, remoteIp: '172.217.160.110', remotePort: 443, attribution: 'exact', bytesUp: 2_987_520, bytesDown: 9_437_184, pktsUp: 1_420, pktsDown: 2_928, flowCount: 5 },
+  { minuteTs: BASE_TS - 420, proto: 'tcp', direction: 'out', pid: 4920, comm: 'dockerd', exe: '/usr/bin/dockerd', localPort: 41688, remoteIp: '203.0.113.88', remotePort: 443, attribution: 'exact', bytesUp: 512_000, bytesDown: 1_024_000, pktsUp: 400, pktsDown: 420, flowCount: 1 },
+  { minuteTs: BASE_TS - 360, proto: 'udp', direction: 'out', pid: null, comm: null, exe: null, localPort: 5353, remoteIp: '192.0.2.53', remotePort: 443, attribution: 'unknown', bytesUp: 91_136, bytesDown: 142_336, pktsUp: 88, pktsDown: 96, flowCount: 2 },
+  { minuteTs: BASE_TS - 300, proto: 'tcp', direction: 'out', pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', localPort: 51234, remoteIp: '198.51.100.118', remotePort: 443, attribution: 'exact', bytesUp: 2_987_520, bytesDown: 9_437_184, pktsUp: 1_420, pktsDown: 2_928, flowCount: 5 },
 ];
 
 const FORWARD_ROWS: ForwardUsageRow[] = [
-  { minuteTs: BASE_TS - 600, proto: 'tcp', origSrc: '10.0.0.2', origDst: '1.1.1.1', origSport: 51122, origDport: 443, bytesOrig: 4_096_000, bytesReply: 11_468_800, pktsOrig: 1_120, pktsReply: 1_980, flowCount: 2 },
-  { minuteTs: BASE_TS - 420, proto: 'tcp', origSrc: '10.0.0.3', origDst: '8.8.8.8', origSport: 53201, origDport: 443, bytesOrig: 2_457_600, bytesReply: 7_782_400, pktsOrig: 640, pktsReply: 1_220, flowCount: 1 },
+  { minuteTs: BASE_TS - 600, proto: 'tcp', origSrc: '10.0.0.2', origDst: '198.51.100.53', origSport: 51122, origDport: 443, bytesOrig: 4_096_000, bytesReply: 11_468_800, pktsOrig: 1_120, pktsReply: 1_980, flowCount: 2 },
+  { minuteTs: BASE_TS - 420, proto: 'tcp', origSrc: '10.0.0.3', origDst: '203.0.113.53', origSport: 53201, origDport: 443, bytesOrig: 2_457_600, bytesReply: 7_782_400, pktsOrig: 640, pktsReply: 1_220, flowCount: 1 },
 ];
 
 function rangeToMinutes(range: RangeKey) {
@@ -94,7 +95,13 @@ function filterUsage(query: UsageQuery, rows: UsageRow[]) {
   return rows.filter((row) => {
     if (query.comm && row.comm !== query.comm) return false;
     if (query.pid && row.pid !== Number(query.pid)) return false;
-    if (query.exe && row.exe !== query.exe) return false;
+    if (query.exe) {
+      const filter = query.exe.trim();
+      const rowExe = row.exe?.trim() ?? '';
+      if (rowExe !== filter && executableName(rowExe) !== executableName(filter)) {
+        return false;
+      }
+    }
     if (query.remoteIp && row.remoteIp !== query.remoteIp) return false;
     if (query.localPort && row.localPort !== Number(query.localPort)) return false;
     if (query.direction && row.direction !== query.direction) return false;
@@ -312,7 +319,7 @@ function sortRemoteRows(
 
 function paginate<T>(rows: T[], page = 1, pageSize = 50) {
   const safePage = Math.max(page, 1);
-  const safePageSize = Math.max(1, pageSize);
+  const safePageSize = Math.min(Math.max(1, pageSize), 200);
   const start = (safePage - 1) * safePageSize;
   return {
     rows: rows.slice(start, start + safePageSize),
@@ -450,7 +457,7 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
           {
             sourceIp: sourceIps[0] ?? null,
             targetIp: targetIps[0] ?? null,
-            targetHost: row.remotePort === 443 ? 'chatgpt.com' : null,
+            targetHost: row.remotePort === 443 ? 'api.example.test' : null,
             targetPort: row.remotePort ?? null,
             localPort: row.localPort ?? null,
             bytesTotal: row.bytesUp + row.bytesDown,

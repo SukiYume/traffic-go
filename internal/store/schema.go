@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS dirty_chain_hours (
+    hour_ts INTEGER NOT NULL PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS log_evidence (
     source TEXT NOT NULL,
     event_ts INTEGER NOT NULL,

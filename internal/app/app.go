@@ -127,6 +127,21 @@ func (a *App) runAggregation(ctx context.Context) {
 		a.logger.Printf("refresh latest completed hour %s failed: %v", latestCompleteHour.Format(time.RFC3339), err)
 	}
 
+	for {
+		dirtyHour, exists, err := a.store.NextDirtyChainHour(ctx, before)
+		if err != nil {
+			a.logger.Printf("scan dirty chain hours failed: %v", err)
+			return
+		}
+		if !exists {
+			break
+		}
+		if err := a.store.AggregateHour(ctx, dirtyHour); err != nil {
+			a.logger.Printf("aggregate dirty chain hour %s failed: %v", dirtyHour.Format(time.RFC3339), err)
+			return
+		}
+	}
+
 	lastHour, ok, err := a.store.LastAggregatedHour(ctx)
 	if err != nil {
 		a.logger.Printf("read aggregation cursor failed: %v", err)

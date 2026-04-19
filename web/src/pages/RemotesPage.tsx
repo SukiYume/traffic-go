@@ -60,7 +60,7 @@ export function RemotesPage() {
   const currentSort = sorting[0];
   const query = useQuery({
     queryKey: ['top-remotes', range, direction, includeLoopback, page, currentSort?.id, currentSort?.desc],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       api.getTopRemotes(range, {
         page,
         pageSize,
@@ -68,7 +68,7 @@ export function RemotesPage() {
         includeLoopback,
         sortBy: normalizeRemoteSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
-      }),
+      }, { signal }),
     placeholderData: keepPreviousData,
   });
 

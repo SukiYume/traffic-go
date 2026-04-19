@@ -585,16 +585,12 @@ func parsePageParams(r *http.Request) (int, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	if page <= 0 {
-		page = 1
-	}
+	page = normalizePositivePage(page)
 	pageSize, err := parseIntWithDefault(r.URL.Query().Get("page_size"), 25, "page_size")
 	if err != nil {
 		return 0, 0, err
 	}
-	if pageSize <= 0 {
-		pageSize = 25
-	}
+	pageSize = normalizePageSize(pageSize)
 	return page, pageSize, nil
 }
 

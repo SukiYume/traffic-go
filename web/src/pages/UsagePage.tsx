@@ -132,6 +132,10 @@ function explainConfidenceLabel(confidence: "low" | "medium" | "high") {
   }[confidence];
 }
 
+function usageBucketSeconds(dataSource?: DataSource) {
+  return dataSource === "usage_1h" ? 3600 : 60;
+}
+
 function UsageExpandPanel({
   row,
   onFilterByIp,
@@ -142,19 +146,22 @@ function UsageExpandPanel({
   dataSource?: DataSource;
 }): ReactNode {
   const api = useApiClient();
+  const [allowScan, setAllowScan] = useState(false);
   const serviceName = serviceNameForPort(row.remotePort, row.proto);
   const portLabel =
     row.remotePort != null
       ? serviceName
-        ? `${row.remotePort} / ${serviceName}`
+      ? `${row.remotePort} / ${serviceName}`
         : String(row.remotePort)
       : "未知";
-  const rateUp = Math.round(row.bytesUp / 60);
-  const rateDown = Math.round(row.bytesDown / 60);
+  const bucketSeconds = usageBucketSeconds(dataSource);
+  const rateUp = Math.round(row.bytesUp / bucketSeconds);
+  const rateDown = Math.round(row.bytesDown / bucketSeconds);
   const analysisHint = processAnalysis(row);
   const explainQuery = useQuery({
     queryKey: [
       "usage-explain",
+      allowScan,
       dataSource,
       row.minuteTs,
       row.proto,
@@ -167,11 +174,12 @@ function UsageExpandPanel({
       row.remotePort,
       row.attribution,
     ],
-    queryFn: () => api.getUsageExplain(row, { dataSource }),
+    queryFn: ({ signal }) => api.getUsageExplain(row, { dataSource, allowScan }, { signal }),
     enabled: dataSource != null,
     staleTime: 30_000,
   });
   const explain = explainQuery.data;
+  const canDeepScan = dataSource === "usage_1m" && !allowScan;
 
   return (
     <div className="row-expand">
@@ -216,11 +224,27 @@ function UsageExpandPanel({
               ? `置信度 ${explainConfidenceLabel(explain.confidence)}`
               : explainQuery.isPending
                 ? "分析中…"
-                : "未命中"}
+              : "未命中"}
           </strong>
         </div>
+        {canDeepScan ? (
+          <div className="row-expand-actions">
+            <button
+              type="button"
+              className="chip"
+              onClick={() => setAllowScan(true)}
+            >
+              尝试深度扫描日志
+            </button>
+          </div>
+        ) : null}
         {explainQuery.isError ? (
           <div className="row-expand-analysis-note">分析失败，请稍后重试。</div>
+        ) : null}
+        {allowScan && explainQuery.isPending ? (
+          <div className="row-expand-analysis-note">
+            正在扫描配置的日志文件并回填更深的关联线索…
+          </div>
         ) : null}
         {explain ? (
           <>
@@ -404,7 +428,7 @@ export function UsagePage() {
       currentSort?.id,
       currentSort?.desc,
     ],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       api.getUsage({
         range,
         ...filters,
@@ -412,12 +436,12 @@ export function UsagePage() {
         pageSize,
         sortBy: normalizeUsageSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? "desc" : "asc",
-      }),
+      }, { signal }),
     placeholderData: keepPreviousData,
   });
   const processes = useQuery({
     queryKey: ["processes"],
-    queryFn: () => api.getProcesses(),
+    queryFn: ({ signal }) => api.getProcesses({ signal }),
   });
 
   useEffect(() => {

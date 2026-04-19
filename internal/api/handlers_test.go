@@ -413,6 +413,96 @@ func TestTopProcessesSupportsGroupByComm(t *testing.T) {
 	}
 }
 
+func TestTopProcessesResponseNormalizesPageMetadata(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
+
+	if err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1045,
+			Comm:        "nginx",
+			Exe:         "/usr/sbin/nginx",
+			LocalPort:   443,
+			RemoteIP:    "203.0.113.24",
+			RemotePort:  41220,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    3,
+			PktsDown:  5,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed top process row: %v", err)
+	}
+
+	start := url.QueryEscape(time.Unix(minute, 0).Add(-time.Minute).UTC().Format(time.RFC3339))
+	end := url.QueryEscape(time.Unix(minute, 0).Add(time.Minute).UTC().Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/top/processes?start=%s&end=%s&page=0&page_size=999", start, end), nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
+		t.Fatalf("expected normalized top-process page metadata, got %s", bodyText)
+	}
+}
+
+func TestTopRemotesResponseNormalizesPageMetadata(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
+
+	if err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1045,
+			Comm:        "nginx",
+			Exe:         "/usr/sbin/nginx",
+			LocalPort:   443,
+			RemoteIP:    "203.0.113.24",
+			RemotePort:  41220,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    3,
+			PktsDown:  5,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed top remote row: %v", err)
+	}
+
+	start := url.QueryEscape(time.Unix(minute, 0).Add(-time.Minute).UTC().Format(time.RFC3339))
+	end := url.QueryEscape(time.Unix(minute, 0).Add(time.Minute).UTC().Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/top/remotes?start=%s&end=%s&page=-1&page_size=999", start, end), nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
+		t.Fatalf("expected normalized top-remote page metadata, got %s", bodyText)
+	}
+}
+
 func TestRunBackgroundPrefetchWarmsEvidenceAndChains(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
@@ -1202,7 +1292,7 @@ func TestUsageExplainUsesConfiguredProcessLogDirForFrps(t *testing.T) {
 	}
 }
 
-func TestUsageExplainSkipsUnconfiguredProcessLogRetrieval(t *testing.T) {
+func TestUsageExplainFallsBackToCachedEvidenceWhenProcessLogDirIsUnconfigured(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	minute := time.Date(2026, 4, 17, 8, 0, 0, 0, time.UTC).Unix()
@@ -1244,8 +1334,8 @@ func TestUsageExplainSkipsUnconfiguredProcessLogRetrieval(t *testing.T) {
 	}
 	body, _ := io.ReadAll(rec.Body)
 	bodyText := string(body)
-	if !strings.Contains(bodyText, `进程 frps 未配置日志路径`) {
-		t.Fatalf("expected skip-log note for unconfigured process: %s", bodyText)
+	if !strings.Contains(bodyText, `进程 frps 未配置日志目录，当前仅回放已缓存证据，无法同步扫描文件。`) {
+		t.Fatalf("expected cached-evidence fallback note for unconfigured process: %s", bodyText)
 	}
 	if strings.Contains(bodyText, `日志命中`) {
 		t.Fatalf("did not expect log hit note for unconfigured process: %s", bodyText)
@@ -1464,9 +1554,8 @@ func TestUsageExplainBuildsShadowsocksChainFromSharedServerAndObfsLogs(t *testin
 	}
 }
 
-func TestUsageExplainReadsLegacyShadowsocksEvidenceSourcesFromCache(t *testing.T) {
+func TestUsageExplainReadsLegacyShadowsocksEvidenceSourcesFromCacheWithoutConfiguredLogDir(t *testing.T) {
 	server := newTestServer(t)
-	setProcessLogDir(server, "obfs-server", "/var/log/shadowsocks")
 
 	now := time.Now().UTC().Truncate(time.Minute)
 	minute := now.Unix()
@@ -1541,6 +1630,9 @@ func TestUsageExplainReadsLegacyShadowsocksEvidenceSourcesFromCache(t *testing.T
 	}
 	if !strings.Contains(bodyText, `SS 日志命中`) || !strings.Contains(bodyText, `SS/obfs 入口日志命中`) {
 		t.Fatalf("expected shadowsocks cache notes in body: %s", bodyText)
+	}
+	if strings.Contains(bodyText, `已跳过日志检索`) {
+		t.Fatalf("expected cached evidence replay without skip note: %s", bodyText)
 	}
 }
 
