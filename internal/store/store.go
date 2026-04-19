@@ -44,6 +44,11 @@ func Open(cfg config.Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// Keep the application on a single SQLite connection so WAL/busy-timeout
+	// settings stay consistent across HTTP queries, collector flushes, and
+	// background maintenance jobs.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	store := &Store{
 		db:        db,
@@ -422,10 +427,17 @@ func (s *Store) NextPendingAggregationHour(ctx context.Context, after *time.Time
 		minMinute = after.UTC().Add(time.Hour).Unix()
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT MIN((minute_ts / 3600) * 3600)
-FROM usage_1m
-WHERE minute_ts >= ? AND minute_ts < ?
-`, minMinute, before.UTC().Truncate(time.Hour).Unix())
+SELECT MIN(hour_ts)
+FROM (
+    SELECT (minute_ts / 3600) * 3600 AS hour_ts
+    FROM usage_1m
+    WHERE minute_ts >= ? AND minute_ts < ?
+    UNION
+    SELECT (minute_ts / 3600) * 3600 AS hour_ts
+    FROM usage_1m_forward
+    WHERE minute_ts >= ? AND minute_ts < ?
+)
+`, minMinute, before.UTC().Truncate(time.Hour).Unix(), minMinute, before.UTC().Truncate(time.Hour).Unix())
 
 	var value sql.NullInt64
 	if err := row.Scan(&value); err != nil {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
 import { useSearchParams } from 'react-router-dom';
 import { DataSourceBadge } from '../components/DataSourceBadge';
@@ -10,7 +10,8 @@ import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
 import { normalizeRangeKey } from '../ranges';
-import type { ForwardSortKey, ForwardUsageRow, RangeKey } from '../types';
+import { normalizeForwardSortKey } from '../sort-keys';
+import type { ForwardUsageRow, RangeKey } from '../types';
 import { formatBytes, formatDateTime, rangeLabel } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
@@ -21,11 +22,6 @@ const protoOptions = [
   { value: 'tcp', label: 'TCP' },
   { value: 'udp', label: 'UDP' },
 ];
-
-function toForwardSortKey(value: string | undefined): ForwardSortKey {
-  const candidates: ForwardSortKey[] = ['minuteTs', 'bytesOrig', 'bytesReply', 'bytesTotal', 'flowCount', 'origSrc', 'origDst'];
-  return candidates.includes(value as ForwardSortKey) ? (value as ForwardSortKey) : 'minuteTs';
-}
 
 export function ForwardPage() {
   const api = useApiClient();
@@ -71,9 +67,10 @@ export function ForwardPage() {
         origDstIp: filters.origDstIp,
         page,
         pageSize,
-        sortBy: toForwardSortKey(currentSort?.id),
+        sortBy: normalizeForwardSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
       }),
+    placeholderData: keepPreviousData,
   });
 
   const columns = useMemo(
@@ -159,8 +156,14 @@ export function ForwardPage() {
         </label>
       </section>
 
+      {query.isError && (query.data?.rows.length ?? 0) > 0 ? (
+        <QueryErrorState error={query.error} title="转发流量刷新失败，当前展示旧结果" compact />
+      ) : null}
+
       {query.isError && !query.data?.rows.length ? (
         <QueryErrorState error={query.error} title="转发流量加载失败" />
+      ) : query.isPending && !query.data ? (
+        <EmptyState title="转发流量加载中" description="正在汇总当前时间范围内的 forward / NAT 流量。" />
       ) : query.data?.rows.length ? (
         <DataTable
           columns={columns}

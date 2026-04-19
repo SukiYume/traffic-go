@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { CustomSelect } from '../components/CustomSelect';
 
@@ -55,6 +55,21 @@ describe('CustomSelect', () => {
     await user.click(screen.getByRole('button'));
     expect(screen.getByRole('listbox')).toBeInTheDocument();
     await user.keyboard('{Escape}');
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+  });
+
+  it('supports keyboard navigation and selection', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<CustomSelect value="" options={OPTIONS} onChange={onChange} />);
+
+    screen.getByRole('button').focus();
+    await user.keyboard('{ArrowDown}');
+    const listbox = screen.getByRole('listbox');
+    await waitFor(() => expect(listbox).toHaveFocus());
+    await user.keyboard('{ArrowDown}{ArrowDown}{Enter}');
+
+    expect(onChange).toHaveBeenCalledWith('out');
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
   });
 });

@@ -32,6 +32,10 @@ function renderWithProviders(
   );
 }
 
+function pendingPromise<T>() {
+  return new Promise<T>(() => {});
+}
+
 describe("traffic-go web ui", () => {
   it("renders dashboard overview", async () => {
     renderWithProviders("/", <DashboardPage />);
@@ -223,6 +227,47 @@ describe("traffic-go web ui", () => {
   it("renders the processes investigation page", async () => {
     renderWithProviders("/processes", <ProcessesPage />);
     expect(await screen.findByText("进程聚合")).toBeInTheDocument();
+  });
+
+  it("selects the first process row by default so the chart matches the highlighted row", async () => {
+    const { container } = renderWithProviders("/processes", <ProcessesPage />);
+    expect(await screen.findByText("进程聚合")).toBeInTheDocument();
+    expect(await screen.findByText("流量趋势 · ss-server")).toBeInTheDocument();
+    expect(container.querySelectorAll("tr.selected")).toHaveLength(1);
+    expect(container.querySelector("tr.selected")).toHaveTextContent("ss-server");
+  });
+
+  it("shows a loading state instead of an empty state on the processes page first load", () => {
+    const base = createMockApiClient();
+    const pendingClient: TrafficApiClient = {
+      ...base,
+      getTopProcesses: () => pendingPromise<Awaited<ReturnType<TrafficApiClient["getTopProcesses"]>>>(),
+    };
+
+    renderWithProviders("/processes", <ProcessesPage />, pendingClient);
+    expect(screen.getByText("进程聚合加载中")).toBeInTheDocument();
+  });
+
+  it("shows a loading state instead of an empty state on the remotes page first load", () => {
+    const base = createMockApiClient();
+    const pendingClient: TrafficApiClient = {
+      ...base,
+      getTopRemotes: () => pendingPromise<Awaited<ReturnType<TrafficApiClient["getTopRemotes"]>>>(),
+    };
+
+    renderWithProviders("/remotes", <RemotesPage />, pendingClient);
+    expect(screen.getByText("对端聚合加载中")).toBeInTheDocument();
+  });
+
+  it("shows a loading state instead of an empty state on the forward page first load", () => {
+    const base = createMockApiClient();
+    const pendingClient: TrafficApiClient = {
+      ...base,
+      getForwardUsage: () => pendingPromise<Awaited<ReturnType<TrafficApiClient["getForwardUsage"]>>>(),
+    };
+
+    renderWithProviders("/forward", <ForwardPage />, pendingClient);
+    expect(screen.getByText("转发流量加载中")).toBeInTheDocument();
   });
 
   it("renders the forward investigation page", async () => {

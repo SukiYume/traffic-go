@@ -132,6 +132,41 @@ func TestClassifyFlowUsesTranslatedReplyTuple(t *testing.T) {
 	}
 }
 
+func TestClassifyFlowPrefersTranslatedReplyTupleOverLocalDestinationShortcut(t *testing.T) {
+	flow := model.ConntrackFlow{
+		Proto:        "tcp",
+		OrigSrcIP:    "203.0.113.24",
+		OrigDstIP:    "198.51.100.10",
+		OrigSrcPort:  52144,
+		OrigDstPort:  443,
+		ReplySrcIP:   "10.88.0.5",
+		ReplyDstIP:   "203.0.113.24",
+		ReplySrcPort: 8388,
+		ReplyDstPort: 52144,
+	}
+	replyTuple := tuple{
+		Proto:      "tcp",
+		LocalIP:    "10.88.0.5",
+		LocalPort:  8388,
+		RemoteIP:   "203.0.113.24",
+		RemotePort: 52144,
+	}
+
+	classified := classifyFlow(flow, map[string]struct{}{
+		"198.51.100.10": {},
+	}, socketIndex{
+		ByTuple: map[string]socketEntry{
+			replyTuple.key(): {Inode: 4321, Connected: true, Present: true},
+		},
+	})
+	if classified.Direction != model.DirectionIn {
+		t.Fatalf("expected translated inbound classification, got %s", classified.Direction)
+	}
+	if classified.LocalIP != "10.88.0.5" || classified.LocalPort != 8388 {
+		t.Fatalf("expected translated reply tuple to win, got %+v", classified)
+	}
+}
+
 func TestUpdateSnapshotUsesHeuristicAttributionForUDPFallback(t *testing.T) {
 	service := &Service{}
 	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)

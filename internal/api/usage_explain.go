@@ -70,6 +70,7 @@ type usageExplainResponse struct {
 	RelatedPeers  []usageExplainPeer         `json:"related_peers"`
 	NginxRequests []usageExplainNginxRequest `json:"nginx_requests"`
 	Notes         []string                   `json:"notes"`
+	StrongMatch   bool                       `json:"-"`
 }
 
 type usageExplainOptions struct {
@@ -563,6 +564,8 @@ func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplain
 	response.NginxRequests = summarizeNginxRequests(rows, maxNginxRequests)
 	if usedLoopbackFallback {
 		appendNoteUnique(&response.Notes, "未直接命中来源 IP，已回退到本机回环来源日志做候选关联。")
+	} else if len(response.NginxRequests) > 0 {
+		response.StrongMatch = true
 	}
 	appendNoteUnique(&response.Notes, fmt.Sprintf("Nginx 日志命中 %d 条，聚合为 %d 组。", len(rows), len(response.NginxRequests)))
 	appendNginxStatusAndAgentNotes(&response.Notes, rows, response.NginxRequests)
@@ -1925,7 +1928,13 @@ func summarizePeers(peers map[string]peerAgg, maxCount int) []usageExplainPeer {
 	}
 	items := make([]peerAgg, 0, len(peers))
 	for _, item := range peers {
+		if item.BytesTotal <= 0 && item.FlowCount <= 0 {
+			continue
+		}
 		items = append(items, item)
+	}
+	if len(items) == 0 {
+		return nil
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].BytesTotal == items[j].BytesTotal {
@@ -2676,6 +2685,9 @@ func nullablePort(port int) *int {
 
 func inferConfidence(response usageExplainResponse) string {
 	if len(response.NginxRequests) > 0 {
+		if !response.StrongMatch {
+			return "medium"
+		}
 		return "high"
 	}
 	if len(response.Chains) > 0 {

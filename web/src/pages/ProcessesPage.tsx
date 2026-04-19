@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
 import { useSearchParams } from 'react-router-dom';
 import { ChartPanel } from '../components/ChartPanel';
@@ -10,7 +10,8 @@ import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
 import { normalizeRangeKey } from '../ranges';
-import type { ProcessGroupBy, ProcessSortKey, ProcessSummaryRow, RangeKey } from '../types';
+import { normalizeProcessSortKey } from '../sort-keys';
+import type { ProcessGroupBy, ProcessSummaryRow, RangeKey } from '../types';
 import { clampText, displayExecutableName, executableName, formatBytes, rangeLabel, safeText } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
@@ -42,11 +43,6 @@ function buildProcessSeriesFilters(row: ProcessSummaryRow | null) {
   return Object.keys(filters).length ? filters : undefined;
 }
 
-function toProcessSortKey(value: string | undefined): ProcessSortKey {
-  const candidates: ProcessSortKey[] = ['comm', 'pid', 'bytesUp', 'bytesDown', 'bytesTotal', 'flowCount'];
-  return candidates.includes(value as ProcessSortKey) ? (value as ProcessSortKey) : 'bytesTotal';
-}
-
 export function ProcessesPage() {
   const api = useApiClient();
   const [params, setParams] = useSearchParams();
@@ -70,9 +66,10 @@ export function ProcessesPage() {
         page,
         pageSize,
         groupBy,
-        sortBy: toProcessSortKey(currentSort?.id),
+        sortBy: normalizeProcessSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
       }),
+    placeholderData: keepPreviousData,
   });
 
   const rows = query.data?.rows ?? [];
@@ -95,23 +92,21 @@ export function ProcessesPage() {
     }
   }, [showPIDColumn, sorting]);
 
-  const selectedProcess = useMemo(() => {
-    if (!rows.length) return null;
-    const fallback = rows[0];
-    if (!selectedKey) return fallback;
-    return rows.find((row) => processRowKey(row) === selectedKey) ?? fallback;
-  }, [rows, selectedKey]);
+  const selectedProcess = useMemo(
+    () => rows.find((row) => processRowKey(row) === selectedKey) ?? null,
+    [rows, selectedKey],
+  );
 
   useEffect(() => {
     if (!rows.length) {
       setSelectedKey(null);
       return;
     }
-    if (!selectedProcess) {
-      const fallback = rows[0];
-      setSelectedKey(processRowKey(fallback));
+    // Keep the table highlight and the chart target on the same source of truth.
+    if (!selectedKey || !rows.some((row) => processRowKey(row) === selectedKey)) {
+      setSelectedKey(processRowKey(rows[0]));
     }
-  }, [rows, selectedProcess]);
+  }, [rows, selectedKey]);
 
   const selectedSeriesFilters = useMemo(() => buildProcessSeriesFilters(selectedProcess), [selectedProcess]);
   const canQuerySeries = Boolean(selectedSeriesFilters);
@@ -219,8 +214,14 @@ export function ProcessesPage() {
         </section>
       )}
 
+      {query.isError && rows.length ? (
+        <QueryErrorState error={query.error} title="进程聚合刷新失败，当前展示旧结果" compact />
+      ) : null}
+
       {query.isError && !rows.length ? (
         <QueryErrorState error={query.error} title="进程聚合加载失败" />
+      ) : query.isPending && !query.data ? (
+        <EmptyState title="进程聚合加载中" description="正在获取当前时间范围内的进程聚合结果。" />
       ) : rows.length ? (
         <DataTable
           columns={columns}

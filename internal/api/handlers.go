@@ -534,8 +534,8 @@ func parseListQueryParams(query url.Values) (listQueryParams, error) {
 
 	params := listQueryParams{
 		Limit:     limit,
-		Page:      page,
-		PageSize:  pageSize,
+		Page:      normalizePositivePage(page),
+		PageSize:  normalizePageSize(pageSize),
 		SortBy:    query.Get("sort_by"),
 		SortOrder: query.Get("sort_order"),
 		UsePage:   query.Has("page") || query.Has("page_size"),
@@ -549,6 +549,24 @@ func parseListQueryParams(query url.Values) (listQueryParams, error) {
 		params.CursorRowID = rowID
 	}
 	return params, nil
+}
+
+func normalizePositivePage(value int) int {
+	if value <= 0 {
+		return 1
+	}
+	return value
+}
+
+func normalizePageSize(value int) int {
+	switch {
+	case value <= 0:
+		return 50
+	case value > 200:
+		return 200
+	default:
+		return value
+	}
 }
 
 func parseIntWithDefault(value string, fallback int, field string) (int, error) {

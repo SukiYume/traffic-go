@@ -257,6 +257,92 @@ func TestForwardUsageReturnsForwardDataSourceLabel(t *testing.T) {
 	}
 }
 
+func TestUsageResponseNormalizesPageMetadata(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
+
+	if err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1045,
+			Comm:        "nginx",
+			Exe:         "/usr/sbin/nginx",
+			LocalPort:   443,
+			RemoteIP:    "203.0.113.24",
+			RemotePort:  41220,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    3,
+			PktsDown:  5,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed usage row: %v", err)
+	}
+
+	start := url.QueryEscape(time.Unix(minute, 0).Add(-time.Minute).UTC().Format(time.RFC3339))
+	end := url.QueryEscape(time.Unix(minute, 0).Add(time.Minute).UTC().Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/usage?start=%s&end=%s&page=0&page_size=999", start, end), nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
+		t.Fatalf("expected normalized page metadata, got %s", bodyText)
+	}
+}
+
+func TestForwardUsageResponseNormalizesPageMetadata(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
+
+	if err := server.store.FlushMinute(ctx, minute, nil, map[model.ForwardUsageKey]model.UsageDelta{
+		{
+			MinuteTS:  minute,
+			Proto:     "tcp",
+			OrigSrcIP: "10.0.0.2",
+			OrigDstIP: "1.1.1.1",
+			OrigSPort: 51000,
+			OrigDPort: 443,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    3,
+			PktsDown:  5,
+			FlowCount: 1,
+		},
+	}); err != nil {
+		t.Fatalf("seed forward row: %v", err)
+	}
+
+	start := url.QueryEscape(time.Unix(minute, 0).Add(-time.Minute).UTC().Format(time.RFC3339))
+	end := url.QueryEscape(time.Unix(minute, 0).Add(time.Minute).UTC().Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/forward/usage?start=%s&end=%s&page=-1&page_size=999", start, end), nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
+		t.Fatalf("expected normalized forward page metadata, got %s", bodyText)
+	}
+}
+
 func TestTopProcessesSupportsGroupByComm(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()

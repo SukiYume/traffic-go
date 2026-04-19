@@ -500,3 +500,49 @@ func TestMergeExplainChainsPrefersRicherIncomingChain(t *testing.T) {
 		t.Fatalf("expected merged metrics to keep richer chain totals, got %+v", merged[0])
 	}
 }
+
+func TestSummarizePeersSkipsZeroMetricCandidates(t *testing.T) {
+	peers := summarizePeers(map[string]peerAgg{
+		"zero": {
+			Direction:  model.DirectionOut,
+			RemoteIP:   "127.0.0.1",
+			RemotePort: 18080,
+			LocalPort:  59692,
+		},
+		"real": {
+			Direction:  model.DirectionIn,
+			RemoteIP:   "203.0.113.24",
+			RemotePort: 52144,
+			LocalPort:  8388,
+			BytesTotal: 4096,
+			FlowCount:  2,
+		},
+	}, 8)
+	if len(peers) != 1 {
+		t.Fatalf("expected only non-zero peers to remain, got %+v", peers)
+	}
+	if peers[0].RemoteIP != "203.0.113.24" {
+		t.Fatalf("unexpected peer kept after filtering: %+v", peers[0])
+	}
+}
+
+func TestInferConfidenceDowngradesLoopbackFallbackNginxHits(t *testing.T) {
+	confidence := inferConfidence(usageExplainResponse{
+		NginxRequests: []usageExplainNginxRequest{
+			{Path: "/traffic", Count: 1},
+		},
+	})
+	if confidence != "medium" {
+		t.Fatalf("expected fallback-only nginx evidence to be medium confidence, got %s", confidence)
+	}
+
+	confidence = inferConfidence(usageExplainResponse{
+		NginxRequests: []usageExplainNginxRequest{
+			{Path: "/traffic", Count: 1},
+		},
+		StrongMatch: true,
+	})
+	if confidence != "high" {
+		t.Fatalf("expected direct nginx evidence to remain high confidence, got %s", confidence)
+	}
+}

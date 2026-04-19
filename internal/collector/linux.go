@@ -46,6 +46,14 @@ func classifyFlow(flow model.ConntrackFlow, localIPs map[string]struct{}, socket
 	if _, ok := localIPs[flow.OrigSrcIP]; ok {
 		return classifyAsLocal(flow.Proto, model.DirectionOut, outTuple, socketEntry{})
 	}
+	if sock, ok := sockets.ByTuple[replyTuple.key()]; ok && sock.Present {
+		// DNAT/REDIRECT traffic may already target a local address in the
+		// original tuple while the real process is only visible on the
+		// translated reply tuple. Prefer that socket before falling back to
+		// the raw destination IP shortcut so attribution follows the actual
+		// local endpoint.
+		return classifyAsLocal(flow.Proto, model.DirectionIn, replyTuple, sock)
+	}
 	if _, ok := localIPs[flow.OrigDstIP]; ok {
 		return classifyAsLocal(flow.Proto, model.DirectionIn, inTuple, socketEntry{})
 	}
@@ -54,11 +62,6 @@ func classifyFlow(flow model.ConntrackFlow, localIPs map[string]struct{}, socket
 	}
 	if sock, ok := sockets.ByTuple[inTuple.key()]; ok && sock.Present {
 		return classifyAsLocal(flow.Proto, model.DirectionIn, inTuple, sock)
-	}
-	if sock, ok := sockets.ByTuple[replyTuple.key()]; ok && sock.Present {
-		// DNAT/REDIRECT traffic can expose the real local socket only via the
-		// translated reply tuple. Treat it as inbound traffic to that process.
-		return classifyAsLocal(flow.Proto, model.DirectionIn, replyTuple, sock)
 	}
 	return classifiedFlow{
 		Proto:       flow.Proto,

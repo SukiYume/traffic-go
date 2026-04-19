@@ -168,7 +168,7 @@ export function Layout({ children }: { children: ReactNode }) {
         </nav>
         <div className="sidebar-note">
           <strong>范围规则</strong>
-          <span>超过 30 天时会切到小时聚合，PID / EXE 会自动失效。</span>
+          <span>超过分钟明细保留窗口时会切到小时聚合，PID / EXE 会自动失效。</span>
         </div>
       </aside>
       <main className="content">{children}</main>

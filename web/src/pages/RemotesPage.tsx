@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { DataSourceBadge } from '../components/DataSourceBadge';
@@ -9,17 +9,13 @@ import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
 import { normalizeRangeKey } from '../ranges';
-import type { RangeKey, RemoteSortKey, RemoteSummaryRow } from '../types';
+import { normalizeRemoteSortKey } from '../sort-keys';
+import type { RangeKey, RemoteSummaryRow } from '../types';
 import { directionLabel, formatBytes, rangeLabel, safeText } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
 const pageSize = 25;
 const columnHelper = createColumnHelper<RemoteSummaryRow>();
-
-function toRemoteSortKey(value: string | undefined): RemoteSortKey {
-  const candidates: RemoteSortKey[] = ['remoteIp', 'direction', 'bytesUp', 'bytesDown', 'bytesTotal', 'flowCount'];
-  return candidates.includes(value as RemoteSortKey) ? (value as RemoteSortKey) : 'bytesTotal';
-}
 
 export function RemotesPage() {
   const api = useApiClient();
@@ -70,9 +66,10 @@ export function RemotesPage() {
         pageSize,
         direction: direction || undefined,
         includeLoopback,
-        sortBy: toRemoteSortKey(currentSort?.id),
+        sortBy: normalizeRemoteSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
       }),
+    placeholderData: keepPreviousData,
   });
 
   const columns = useMemo(
@@ -152,8 +149,14 @@ export function RemotesPage() {
         </button>
       </section>
 
+      {query.isError && (query.data?.rows.length ?? 0) > 0 ? (
+        <QueryErrorState error={query.error} title="对端聚合刷新失败，当前展示旧结果" compact />
+      ) : null}
+
       {query.isError && !query.data?.rows.length ? (
         <QueryErrorState error={query.error} title="对端聚合加载失败" />
+      ) : query.isPending && !query.data ? (
+        <EmptyState title="对端聚合加载中" description="正在聚合当前时间范围内的对端 IP 数据。" />
       ) : query.data?.rows.length ? (
         <DataTable
           columns={columns}

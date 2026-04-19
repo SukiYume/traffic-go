@@ -27,6 +27,13 @@ import type {
 import { withAppBase } from './base-path';
 import { createMockApiClient } from './data/mock';
 import { RANGE_TO_BUCKET } from './ranges';
+import {
+  forwardSortParam,
+  normalizeUsageSortKey,
+  processSortParam,
+  remoteSortParam,
+  usageSortParam,
+} from './sort-keys';
 
 type QueryValue = string | number | boolean | undefined | null;
 type ListQueryOptions<SortKey extends string> = {
@@ -218,74 +225,6 @@ function buildQuery(entries: Array<[string, QueryValue]>) {
   return query ? `?${query}` : '';
 }
 
-const usageSortKeys: UsageSortKey[] = [
-  'minuteTs',
-  'bytesUp',
-  'bytesDown',
-  'bytesTotal',
-  'flowCount',
-  'remoteIp',
-  'direction',
-  'localPort',
-  'comm',
-  'pid',
-];
-
-export function normalizeUsageSortKey(value?: string): UsageSortKey {
-  return usageSortKeys.includes(value as UsageSortKey)
-    ? (value as UsageSortKey)
-    : 'minuteTs';
-}
-
-function usageSortKey(value?: UsageSortKey) {
-  return {
-    minuteTs: undefined,
-    bytesUp: 'bytes_up',
-    bytesDown: 'bytes_down',
-    bytesTotal: 'bytes_total',
-    flowCount: 'flow_count',
-    remoteIp: 'remote_ip',
-    direction: 'direction',
-    localPort: 'local_port',
-    comm: 'comm',
-    pid: 'pid',
-  }[value ?? 'minuteTs'];
-}
-
-function forwardSortKey(value?: ForwardSortKey) {
-  return {
-    minuteTs: undefined,
-    bytesOrig: 'bytes_orig',
-    bytesReply: 'bytes_reply',
-    bytesTotal: 'bytes_total',
-    flowCount: 'flow_count',
-    origSrc: 'orig_src_ip',
-    origDst: 'orig_dst_ip',
-  }[value ?? 'minuteTs'];
-}
-
-function processSortKey(value?: ProcessSortKey) {
-  return {
-    comm: 'comm',
-    pid: 'pid',
-    bytesUp: 'bytes_up',
-    bytesDown: 'bytes_down',
-    bytesTotal: 'bytes_total',
-    flowCount: 'flow_count',
-  }[value ?? 'bytesTotal'];
-}
-
-function remoteSortKey(value?: RemoteSortKey) {
-  return {
-    remoteIp: 'remote_ip',
-    direction: 'direction',
-    bytesUp: 'bytes_up',
-    bytesDown: 'bytes_down',
-    bytesTotal: 'bytes_total',
-    flowCount: 'flow_count',
-  }[value ?? 'bytesTotal'];
-}
-
 function appendListQuery<SortKey extends string>(
   entries: Array<[string, QueryValue]>,
   options: ListQueryOptions<SortKey>,
@@ -317,7 +256,7 @@ function buildUsageQuery(query: UsageQuery) {
         ['attribution', query.attribution],
       ],
       query,
-      usageSortKey(query.sortBy),
+      usageSortParam(query.sortBy),
     ),
   );
 }
@@ -332,7 +271,7 @@ function buildForwardQuery(query: ForwardUsageQuery) {
         ['orig_dst_ip', query.origDstIp],
       ],
       query,
-      forwardSortKey(query.sortBy),
+      forwardSortParam(query.sortBy),
     ),
   );
 }
@@ -361,7 +300,7 @@ function buildTopProcessesQuery(
     ['range', range],
     ['page', options?.page ?? undefined],
     ['page_size', options?.pageSize ?? undefined],
-    ['sort_by', processSortKey(options?.sortBy)],
+    ['sort_by', processSortParam(options?.sortBy)],
     ['sort_order', options?.sortOrder ?? undefined],
     ['group_by', options?.groupBy],
   ]);
@@ -375,7 +314,7 @@ function buildTopRemotesQuery(
     ['range', range],
     ['page', options?.page ?? undefined],
     ['page_size', options?.pageSize ?? undefined],
-    ['sort_by', remoteSortKey(options?.sortBy)],
+    ['sort_by', remoteSortParam(options?.sortBy)],
     ['sort_order', options?.sortOrder ?? undefined],
     ['direction', options?.direction],
     ['include_loopback', options?.includeLoopback ? 1 : undefined],
@@ -690,3 +629,4 @@ export function createAppApiClient(): TrafficApiClient {
 }
 
 export { RANGE_TO_BUCKET };
+export { normalizeUsageSortKey };

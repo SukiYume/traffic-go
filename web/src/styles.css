@@ -1458,6 +1458,11 @@ button {
   color: #fff;
 }
 
+.custom-select-option.active {
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+}
+
 .custom-select-option.selected {
   background: rgba(56, 189, 248, 0.1);
   color: var(--accent-primary);

@@ -49,7 +49,7 @@ export function DashboardPage() {
   });
   const topProcesses = useQuery({
     queryKey: ['top-processes', range, 'dashboard'],
-    queryFn: () => api.getTopProcesses(range, { page: 1, pageSize: 5 }),
+    queryFn: () => api.getTopProcesses(range, { page: 1, pageSize: 5, groupBy: 'comm' }),
   });
   const topInboundRemotes = useQuery({
     queryKey: ['top-remotes', range, 'in'],

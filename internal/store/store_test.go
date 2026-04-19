@@ -44,6 +44,13 @@ func TestResolveUsageSource(t *testing.T) {
 	}
 }
 
+func TestOpenUsesSingleSQLiteConnection(t *testing.T) {
+	store := newTestStore(t)
+	if store.db.Stats().MaxOpenConnections != 1 {
+		t.Fatalf("expected sqlite store to use one open connection, got %+v", store.db.Stats())
+	}
+}
+
 func TestFlushAndAggregate(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -95,6 +102,44 @@ func TestFlushAndAggregate(t *testing.T) {
 	}
 	if len(top) != 1 || top[0].Comm != "curl" {
 		t.Fatalf("unexpected top rows: %+v", top)
+	}
+}
+
+func TestNextPendingAggregationHourIncludesForwardOnlyMinutes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	minute := time.Date(2026, 4, 15, 2, 10, 0, 0, time.UTC).Unix()
+	err := store.FlushMinute(ctx, minute, nil, map[model.ForwardUsageKey]model.UsageDelta{
+		{
+			MinuteTS:  minute,
+			Proto:     "tcp",
+			OrigSrcIP: "10.0.0.2",
+			OrigDstIP: "1.1.1.1",
+			OrigSPort: 51122,
+			OrigDPort: 443,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    4,
+			PktsDown:  8,
+			FlowCount: 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("flush forward minute: %v", err)
+	}
+
+	nextHour, ok, err := store.NextPendingAggregationHour(ctx, nil, time.Unix(minute, 0).Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("next pending aggregation hour: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected forward-only minute to schedule aggregation")
+	}
+	expectedHour := time.Unix(minute, 0).UTC().Truncate(time.Hour)
+	if !nextHour.Equal(expectedHour) {
+		t.Fatalf("unexpected next pending hour: got %s want %s", nextHour, expectedHour)
 	}
 }
 

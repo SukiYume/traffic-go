@@ -97,13 +97,15 @@ make test-frontend
 make build-frontend
 make sync-frontend
 make build
+make release-linux
 make run
 make dev-web
 ```
 
 其中：
 
-- `make build` 会先构建前端，再把 `web/dist/` 同步到 `internal/embed/dist/`，最后编译 Go 二进制。
+- `make build` 会先同步前端到 `internal/embed/dist/`，再编译当前平台二进制，不会重复跑一次前端构建。
+- `make release-linux` 会先跑前后端测试，再生成 `linux/amd64` 发布目录和压缩包。
 - 如果你直接用 `go run` 启动后端，想看到最新前端，需要先执行 `make sync-frontend`。
 
 ## 从 Windows 打 Linux 包
@@ -116,10 +118,11 @@ bash deploy/build-linux-gitbash.sh
 
 脚本会：
 
+- 先运行前后端测试，避免把未验证版本直接打包。
 - 构建前端。
 - 同步内嵌静态资源。
 - 交叉编译 `linux/amd64` 二进制。
-- 产出安装包和压缩包。
+- 清理旧发布目录并重新产出安装包和压缩包。
 
 输出位置：
 
