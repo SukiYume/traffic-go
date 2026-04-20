@@ -29,10 +29,17 @@ export interface TimeSeriesPoint {
   label: string;
 }
 
+export interface TimeSeriesGroup {
+  key: string;
+  points: TimeSeriesPoint[];
+}
+
 export interface TimeSeriesResponse {
   dataSource: DataSource;
   bucket: BucketKey;
+  groupBy: GroupBy;
   points: TimeSeriesPoint[];
+  groups: TimeSeriesGroup[];
 }
 
 export interface TimeSeriesFilters {
@@ -88,7 +95,6 @@ export interface ProcessOption {
   pid: number;
   comm: string;
   exe: string;
-  totalBytes: number;
 }
 
 export interface UsageQuery {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
 import { useSearchParams, useNavigate } from 'react-router-dom';
@@ -11,6 +11,7 @@ import { useApiClient } from '../api-context';
 import { normalizeRangeKey } from '../ranges';
 import { normalizeRemoteSortKey } from '../sort-keys';
 import type { RangeKey, RemoteSummaryRow } from '../types';
+import { useResettingPage } from '../useResettingPage';
 import { directionLabel, formatBytes, rangeLabel, safeText } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
@@ -24,7 +25,6 @@ export function RemotesPage() {
   const range = normalizeRangeKey(params.get('range'), defaultRange);
   const direction = (params.get('direction') as 'in' | 'out' | null) ?? '';
   const includeLoopback = params.get('include_loopback') === '1';
-  const [page, setPage] = useState(1);
   const [sorting, setSorting] = useState<SortingState>([{ id: 'bytesTotal', desc: true }]);
 
   const setRange = (next: RangeKey) => {
@@ -53,11 +53,9 @@ export function RemotesPage() {
     setParams(nextParams, { replace: true });
   };
 
-  useEffect(() => {
-    setPage(1);
-  }, [range, direction, includeLoopback, sorting]);
-
   const currentSort = sorting[0];
+  const pageResetKey = JSON.stringify([range, direction, includeLoopback, currentSort?.id ?? null, currentSort?.desc ?? null]);
+  const [page, setPage] = useResettingPage(pageResetKey);
   const query = useQuery({
     queryKey: ['top-remotes', range, direction, includeLoopback, page, currentSort?.id, currentSort?.desc],
     queryFn: ({ signal }) =>

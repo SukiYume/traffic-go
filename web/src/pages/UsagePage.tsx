@@ -13,6 +13,7 @@ import { isDimensionUnavailableError, normalizeUsageSortKey } from "../api";
 import { useApiClient } from "../api-context";
 import { normalizeRangeKey } from "../ranges";
 import type { DataSource, RangeKey, UsageRow } from "../types";
+import { useResettingPage } from "../useResettingPage";
 import {
   attributionDescription,
   clampText,
@@ -397,7 +398,6 @@ function UsageExpandPanel({
 export function UsagePage() {
   const api = useApiClient();
   const { range, filters, setRange, setFilters } = useUsageFilters();
-  const [page, setPage] = useState(1);
   const [sorting, setSorting] = useState<SortingState>([
     { id: "minuteTs", desc: true },
   ]);
@@ -406,12 +406,17 @@ export function UsagePage() {
   // Serialize filters to a stable string so this effect only fires when filter
   // values actually change, not on every render (filters object is recreated each render).
   const filtersKey = JSON.stringify(filters);
+  const pageResetKey = JSON.stringify([
+    range,
+    filtersKey,
+    sorting[0]?.id ?? null,
+    sorting[0]?.desc ?? null,
+  ]);
+  const [page, setPage] = useResettingPage(pageResetKey);
 
   useEffect(() => {
-    setPage(1);
     setExpandedRowKey(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [range, filtersKey, sorting]);
+  }, [pageResetKey]);
 
   useEffect(() => {
     setExpandedRowKey(null);

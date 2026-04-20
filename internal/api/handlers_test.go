@@ -1743,6 +1743,82 @@ func TestUsageExplainReplaysHourlyPersistedChains(t *testing.T) {
 	}
 }
 
+func TestUsageExplainFallsBackAcrossPersistedChainSourcesAfterFiltering(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	hour := time.Date(2026, 4, 16, 8, 0, 0, 0, time.UTC)
+	pid := 1088
+	exe := "/usr/bin/ss-server"
+	entryPort := 12096
+	targetPort := 443
+
+	if err := server.store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        hour.Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "203.0.113.99",
+			TargetHost:        "elsewhere.example",
+			TargetPort:        &targetPort,
+			BytesTotal:        1024,
+			FlowCount:         1,
+			EvidenceCount:     1,
+			EvidenceSource:    "ss-log",
+			Confidence:        "high",
+			SampleFingerprint: "minute-irrelevant",
+			SampleMessage:     "connect to elsewhere.example:443",
+			SampleTime:        hour.Unix(),
+		},
+		{
+			TimeBucket:        hour.Add(8 * time.Minute).Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "chatgpt.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        4096,
+			FlowCount:         3,
+			EvidenceCount:     2,
+			EvidenceSource:    "ss-log",
+			Confidence:        "high",
+			SampleFingerprint: "hour-relevant",
+			SampleMessage:     "connect to chatgpt.com:443",
+			SampleTime:        hour.Add(8 * time.Minute).Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert persisted chains: %v", err)
+	}
+	if err := server.store.AggregateHour(ctx, hour.Add(8*time.Minute)); err != nil {
+		t.Fatalf("aggregate hour: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=12096&remote_ip=142.250.72.14&remote_port=443", hour.Unix()),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"chain_id":"usage_chain_1h|`) {
+		t.Fatalf("expected explain to fall back to filtered hourly persisted chain: %s", bodyText)
+	}
+	if strings.Contains(bodyText, `elsewhere.example`) {
+		t.Fatalf("did not expect unrelated minute chain to block later fallback: %s", bodyText)
+	}
+}
+
 func TestUsageExplainDoesNotReplayPersistedOutboundChainOnlyBySharedTargetPort(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
@@ -1794,6 +1870,57 @@ func TestUsageExplainDoesNotReplayPersistedOutboundChainOnlyBySharedTargetPort(t
 	}
 }
 
+func TestUsageExplainDoesNotReplayPersistedOutboundChainWithMismatchedLocalPort(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 18, 12, 8, 0, 0, time.UTC)
+	pid := 1088
+	exe := "/usr/bin/ss-server"
+	entryPort := 12096
+	targetPort := 443
+
+	if err := server.store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        minute.Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "chatgpt.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        4096,
+			FlowCount:         2,
+			EvidenceCount:     1,
+			EvidenceSource:    "ss-log",
+			Confidence:        "high",
+			SampleFingerprint: "fp-wrong-entry-port",
+			SampleMessage:     "connect to chatgpt.com:443",
+			SampleTime:        minute.Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert mismatched local-port persisted chain: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443", minute.Unix()),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if strings.Contains(bodyText, `"target_ip":"142.250.72.14"`) || strings.Contains(bodyText, `chatgpt.com`) {
+		t.Fatalf("did not expect persisted outbound chain replay with mismatched local port: %s", bodyText)
+	}
+}
+
 func TestUsageExplainDoesNotReplayPersistedInboundChainOnlyBySharedEntryPort(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
@@ -1842,6 +1969,74 @@ func TestUsageExplainDoesNotReplayPersistedInboundChainOnlyBySharedEntryPort(t *
 	bodyText := string(body)
 	if strings.Contains(bodyText, `"source_ip":"203.0.113.77"`) || strings.Contains(bodyText, `"target_ip":"142.250.72.14"`) {
 		t.Fatalf("did not expect shared-entry-port persisted chain replay: %s", bodyText)
+	}
+}
+
+func TestUsageExplainFiltersCurrentTupleByRemotePort(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 17, 7, 10, 0, 0, time.UTC).Unix()
+
+	err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "198.51.100.44",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   2048,
+			BytesDown: 8192,
+			PktsUp:    8,
+			PktsDown:  11,
+			FlowCount: 2,
+		},
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "198.51.100.44",
+			RemotePort:  8443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   512,
+			BytesDown: 1024,
+			PktsUp:    2,
+			PktsDown:  4,
+			FlowCount: 1,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("seed usage rows: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443", minute),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"remote_port":443`) {
+		t.Fatalf("expected explain response to include the anchored remote port: %s", bodyText)
+	}
+	if strings.Contains(bodyText, `"remote_port":8443`) {
+		t.Fatalf("did not expect same-IP different-port usage to leak into related peers: %s", bodyText)
 	}
 }
 

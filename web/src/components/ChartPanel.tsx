@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import {
   CartesianGrid,
   Legend,
@@ -8,20 +9,55 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import type { RangeKey, TimeSeriesPoint } from '../types';
+import type { GroupBy, RangeKey, TimeSeriesGroup, TimeSeriesPoint } from '../types';
 import { chartTickLabel, formatBytes, formatLongDateTime } from '../utils';
+
+const directionPalette = {
+  in: '#f59e0b',
+  out: '#38bdf8',
+} as const;
+
+function directionGroupLabel(key: string) {
+  if (key === 'in') {
+    return '入站';
+  }
+  if (key === 'out') {
+    return '出站';
+  }
+  return key;
+}
 
 export function ChartPanel({
   points,
+  groups = [],
+  groupBy,
   range,
   title = '流量趋势',
   subtitle = '上行 / 下行',
 }: {
   points: TimeSeriesPoint[];
+  groups?: TimeSeriesGroup[];
+  groupBy?: GroupBy;
   range: RangeKey;
   title?: string;
   subtitle?: string;
 }) {
+  const showDirectionGroups = groupBy === 'direction' && groups.length > 0;
+  const groupedData = useMemo(() => {
+    if (!showDirectionGroups) {
+      return [];
+    }
+    const merged = new Map<number, Record<string, number | string>>();
+    for (const group of groups) {
+      for (const point of group.points) {
+        const current = merged.get(point.ts) ?? { ts: point.ts, label: point.label };
+        current[group.key] = point.up + point.down;
+        merged.set(point.ts, current);
+      }
+    }
+    return [...merged.values()].sort((left, right) => Number(left.ts) - Number(right.ts));
+  }, [groups, showDirectionGroups]);
+
   return (
     <section className="panel chart-panel">
       <div className="panel-head">
@@ -32,7 +68,7 @@ export function ChartPanel({
       </div>
       <div className="chart-frame">
         <ResponsiveContainer width="100%" height={360}>
-          <LineChart data={points}>
+          <LineChart data={showDirectionGroups ? groupedData : points}>
             <CartesianGrid stroke="rgba(128,145,172,0.18)" vertical={false} />
             <XAxis
               dataKey="ts"
@@ -52,11 +88,27 @@ export function ChartPanel({
                 borderRadius: 14,
                 color: '#e9edf5',
               }}
-              formatter={(value: number) => formatBytes(value)}
+              formatter={(value: number, name: string) => [formatBytes(value), name]}
             />
             <Legend />
-            <Line type="monotone" dataKey="up" stroke="#6ee7b7" strokeWidth={2.5} dot={false} name="上行" />
-            <Line type="monotone" dataKey="down" stroke="#60a5fa" strokeWidth={2.5} dot={false} name="下行" />
+            {showDirectionGroups ? (
+              groups.map((group) => (
+                <Line
+                  key={group.key}
+                  type="monotone"
+                  dataKey={group.key}
+                  stroke={directionPalette[group.key as keyof typeof directionPalette] ?? '#6ee7b7'}
+                  strokeWidth={2.5}
+                  dot={false}
+                  name={directionGroupLabel(group.key)}
+                />
+              ))
+            ) : (
+              <>
+                <Line type="monotone" dataKey="up" stroke="#6ee7b7" strokeWidth={2.5} dot={false} name="上行" />
+                <Line type="monotone" dataKey="down" stroke="#60a5fa" strokeWidth={2.5} dot={false} name="下行" />
+              </>
+            )}
           </LineChart>
         </ResponsiveContainer>
       </div>

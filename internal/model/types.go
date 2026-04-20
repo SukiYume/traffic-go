@@ -241,6 +241,7 @@ type UsageQuery struct {
 	Comm        string
 	Exe         string
 	RemoteIP    string
+	RemotePort  *int
 	Direction   Direction
 	Proto       string
 	Attribution Attribution

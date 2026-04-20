@@ -171,7 +171,7 @@ func TestUpdateSnapshotUsesHeuristicAttributionForUDPFallback(t *testing.T) {
 	service := &Service{}
 	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
 
-	snapshot, _, _, _ := service.updateSnapshot(
+	snapshot, _, _, _, _ := service.updateSnapshot(
 		now,
 		model.ConntrackFlow{Proto: "udp", OrigBytes: 10, ReplyBytes: 20, OrigPkts: 1, ReplyPkts: 2},
 		classifiedFlow{
@@ -188,6 +188,7 @@ func TestUpdateSnapshotUsesHeuristicAttributionForUDPFallback(t *testing.T) {
 		model.FlowSnapshot{},
 		false,
 		false,
+		false,
 	)
 
 	if snapshot.Attribution != model.AttributionHeuristic {
@@ -202,7 +203,7 @@ func TestUpdateSnapshotUsesHeuristicAttributionForTCPLocalFallback(t *testing.T)
 	service := &Service{}
 	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
 
-	snapshot, _, _, _ := service.updateSnapshot(
+	snapshot, _, _, _, _ := service.updateSnapshot(
 		now,
 		model.ConntrackFlow{Proto: "tcp", OrigBytes: 10, ReplyBytes: 20, OrigPkts: 1, ReplyPkts: 2},
 		classifiedFlow{
@@ -217,6 +218,7 @@ func TestUpdateSnapshotUsesHeuristicAttributionForTCPLocalFallback(t *testing.T)
 		},
 		model.ProcessInfo{PID: 27896, Comm: "ss-server", Exe: "/usr/local/bin/ss-server"},
 		model.FlowSnapshot{},
+		false,
 		false,
 		false,
 	)
@@ -305,7 +307,7 @@ func TestUpdateSnapshotFallsBackToGuessFromPreviousSnapshot(t *testing.T) {
 		LastRPkts:     26,
 	}
 
-	snapshot, delta, _, _ := service.updateSnapshot(
+	snapshot, delta, _, _, _ := service.updateSnapshot(
 		now,
 		model.ConntrackFlow{Proto: "tcp", OrigBytes: 190, ReplyBytes: 360, OrigPkts: 24, ReplyPkts: 32},
 		classifiedFlow{
@@ -319,6 +321,7 @@ func TestUpdateSnapshotFallsBackToGuessFromPreviousSnapshot(t *testing.T) {
 		},
 		model.ProcessInfo{},
 		prev,
+		true,
 		true,
 		true,
 	)
@@ -338,7 +341,7 @@ func TestUpdateSnapshotCountsInitialDeltaAfterBaselineWarmup(t *testing.T) {
 	service := &Service{}
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
 
-	snapshot, delta, _, countFlow := service.updateSnapshot(
+	snapshot, delta, _, countFlow, _ := service.updateSnapshot(
 		now,
 		model.ConntrackFlow{Proto: "tcp", OrigBytes: 512, ReplyBytes: 2048, OrigPkts: 5, ReplyPkts: 9},
 		classifiedFlow{
@@ -354,6 +357,7 @@ func TestUpdateSnapshotCountsInitialDeltaAfterBaselineWarmup(t *testing.T) {
 		model.FlowSnapshot{},
 		false,
 		true,
+		false,
 	)
 
 	if snapshot.PID != 1088 {
@@ -453,7 +457,7 @@ func TestCarryForwardSnapshotsPreventsRecountAfterTransientGap(t *testing.T) {
 	carried := service.carryForwardSnapshots(map[string]model.FlowSnapshot{
 		identity: prev,
 	}, start.Add(4*time.Second))
-	snapshot, delta, _, countFlow := service.updateSnapshot(
+	snapshot, delta, _, countFlow, _ := service.updateSnapshot(
 		start.Add(6*time.Second),
 		model.ConntrackFlow{
 			Proto:      "udp",
@@ -474,6 +478,7 @@ func TestCarryForwardSnapshotsPreventsRecountAfterTransientGap(t *testing.T) {
 		carried[identity],
 		true,
 		true,
+		true,
 	)
 
 	if countFlow {
@@ -484,6 +489,112 @@ func TestCarryForwardSnapshotsPreventsRecountAfterTransientGap(t *testing.T) {
 	}
 	if snapshot.LastOrig != 420 || snapshot.LastReply != 2100 {
 		t.Fatalf("unexpected snapshot after transient gap: %+v", snapshot)
+	}
+}
+
+func TestTupleReuseKeepsPreviousContributionInOriginalBucket(t *testing.T) {
+	service := &Service{
+		currentMinute: time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC),
+		buckets:       make(map[model.UsageKey]*bucketState),
+	}
+	now := service.currentMinute
+	flowID := "local|ipv4|tcp|out|47920|198.51.100.44|443|10.0.0.2"
+	classified := classifiedFlow{
+		Proto:      "tcp",
+		Direction:  model.DirectionOut,
+		LocalIP:    "10.0.0.2",
+		LocalPort:  47920,
+		RemoteIP:   "198.51.100.44",
+		RemotePort: 443,
+		Connected:  true,
+	}
+	oldProcess := model.ProcessInfo{PID: 1088, Comm: "ss-server", Exe: "/usr/bin/ss-server"}
+	newProcess := model.ProcessInfo{PID: 2099, Comm: "curl", Exe: "/usr/bin/curl"}
+
+	firstSnapshot, firstDelta, _, firstCount, resetOwners := service.updateSnapshot(
+		now,
+		model.ConntrackFlow{
+			CTID:       1001,
+			Proto:      "tcp",
+			OrigBytes:  300,
+			ReplyBytes: 900,
+			OrigPkts:   3,
+			ReplyPkts:  7,
+		},
+		classified,
+		oldProcess,
+		model.FlowSnapshot{},
+		false,
+		true,
+		false,
+	)
+	if resetOwners {
+		t.Fatalf("did not expect initial observation to reset ownership")
+	}
+	if firstDelta == nil || !firstCount {
+		t.Fatalf("expected first tuple observation to count immediately, got delta=%+v count=%v", firstDelta, firstCount)
+	}
+	service.addUsage(flowID, firstSnapshot, *firstDelta, firstCount)
+
+	secondSnapshot, secondDelta, _, secondCount, resetOwners := service.updateSnapshot(
+		now.Add(4*time.Second),
+		model.ConntrackFlow{
+			CTID:       2001,
+			Proto:      "tcp",
+			OrigBytes:  40,
+			ReplyBytes: 60,
+			OrigPkts:   1,
+			ReplyPkts:  1,
+		},
+		classified,
+		newProcess,
+		firstSnapshot,
+		true,
+		true,
+		false,
+	)
+	if !resetOwners {
+		t.Fatalf("expected tuple reuse with a new conntrack lineage to reset flow ownership")
+	}
+	if secondDelta == nil || !secondCount {
+		t.Fatalf("expected reused tuple to start a fresh counted flow, got delta=%+v count=%v", secondDelta, secondCount)
+	}
+	service.releaseFlowOwnership(flowID)
+	service.addUsage(flowID, secondSnapshot, *secondDelta, secondCount)
+
+	oldKey := model.UsageKey{
+		MinuteTS:    now.Unix(),
+		Proto:       "tcp",
+		Direction:   model.DirectionOut,
+		PID:         oldProcess.PID,
+		Comm:        oldProcess.Comm,
+		Exe:         oldProcess.Exe,
+		LocalPort:   classified.LocalPort,
+		RemoteIP:    classified.RemoteIP,
+		RemotePort:  classified.RemotePort,
+		Attribution: model.AttributionExact,
+	}
+	newKey := model.UsageKey{
+		MinuteTS:    now.Unix(),
+		Proto:       "tcp",
+		Direction:   model.DirectionOut,
+		PID:         newProcess.PID,
+		Comm:        newProcess.Comm,
+		Exe:         newProcess.Exe,
+		LocalPort:   classified.LocalPort,
+		RemoteIP:    classified.RemoteIP,
+		RemotePort:  classified.RemotePort,
+		Attribution: model.AttributionExact,
+	}
+
+	if state := service.buckets[oldKey]; state == nil || state.bytesUp != 300 || state.bytesDown != 900 || state.flowCount != 1 {
+		t.Fatalf("expected previous bucket contribution to stay put, got %+v", state)
+	}
+	if state := service.buckets[newKey]; state == nil || state.bytesUp != 40 || state.bytesDown != 60 || state.flowCount != 1 {
+		t.Fatalf("expected new tuple lineage to create its own bucket contribution, got %+v", state)
+	}
+	if owner, ok := service.usageFlowOwner[flowID]; !ok || owner != newKey {
+		t.Fatalf("expected flow owner to move only for the new lineage, got %v %v", ok, owner)
 	}
 }
 

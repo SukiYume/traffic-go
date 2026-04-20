@@ -7,9 +7,9 @@ describe('FiltersBar', () => {
     const { container } = render(
       <FiltersBar
         processes={[
-          { pid: 1, comm: 'nginx', exe: '/usr/sbin/nginx', totalBytes: 0 },
-          { pid: 2, comm: 'nginx', exe: '/usr/sbin/nginx', totalBytes: 0 },
-          { pid: 3, comm: 'sshd', exe: '/usr/sbin/sshd', totalBytes: 0 },
+          { pid: 1, comm: 'nginx', exe: '/usr/sbin/nginx' },
+          { pid: 2, comm: 'nginx', exe: '/usr/sbin/nginx' },
+          { pid: 3, comm: 'sshd', exe: '/usr/sbin/sshd' },
         ]}
         filters={{
           comm: '',

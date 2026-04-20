@@ -108,7 +108,13 @@ export function DashboardPage() {
       {series.isError ? (
         <QueryErrorState error={series.error} title="趋势加载失败" />
       ) : series.data ? (
-        <ChartPanel points={series.data.points} range={range} />
+        <ChartPanel
+          points={series.data.points}
+          groups={series.data.groups}
+          groupBy={series.data.groupBy}
+          range={range}
+          subtitle="按方向聚合：入站 / 出站总量"
+        />
       ) : (
         <EmptyState title="趋势加载中" description="正在获取时间序列。" />
       )}
@@ -143,7 +149,7 @@ export function DashboardPage() {
         <section className="panel">
           <div className="panel-head">
             <h2>Top 入站来源 IP</h2>
-            <Link to={buildDrilldownPath('/remotes', range, { direction: 'in' })}>查看全部</Link>
+            <Link to={buildDrilldownPath('/remotes', range, { direction: 'in', include_loopback: '1' })}>查看全部</Link>
           </div>
           {topInboundRemotes.isError ? (
             <QueryErrorState error={topInboundRemotes.error} title="入站排行加载失败" compact />
@@ -169,7 +175,7 @@ export function DashboardPage() {
         <section className="panel">
           <div className="panel-head">
             <h2>Top 出站目标 IP</h2>
-            <Link to={buildDrilldownPath('/remotes', range, { direction: 'out' })}>查看全部</Link>
+            <Link to={buildDrilldownPath('/remotes', range, { direction: 'out', include_loopback: '1' })}>查看全部</Link>
           </div>
           {topOutboundRemotes.isError ? (
             <QueryErrorState error={topOutboundRemotes.error} title="出站排行加载失败" compact />

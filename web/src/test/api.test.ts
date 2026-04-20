@@ -97,7 +97,7 @@ describe('http api client', () => {
     );
   });
 
-  it('decodes overview and aggregates timeseries buckets from backend payloads', async () => {
+  it('preserves grouped timeseries semantics while aggregating total buckets', async () => {
     vi.stubGlobal('fetch', fetchMock);
     fetchMock
       .mockResolvedValueOnce(
@@ -143,8 +143,20 @@ describe('http api client', () => {
       '/api/v1/stats/timeseries?range=24h&bucket=5m&group_by=direction&comm=ss-server',
       expect.any(Object),
     );
+    expect(series.groupBy).toBe('direction');
     expect(series.points).toHaveLength(1);
     expect(series.points[0]).toMatchObject({ ts: 1710000000, up: 40, down: 60, flowCount: 3 });
+    expect(series.groups).toHaveLength(2);
+    expect(series.groups).toEqual([
+      {
+        key: 'in',
+        points: [expect.objectContaining({ ts: 1710000000, up: 10, down: 20, flowCount: 1 })],
+      },
+      {
+        key: 'out',
+        points: [expect.objectContaining({ ts: 1710000000, up: 30, down: 40, flowCount: 2 })],
+      },
+    ]);
   });
 
   it('preserves null-only hourly dimensions in usage responses', async () => {

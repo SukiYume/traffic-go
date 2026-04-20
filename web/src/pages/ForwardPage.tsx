@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
 import { useSearchParams } from 'react-router-dom';
@@ -12,6 +12,7 @@ import { useApiClient } from '../api-context';
 import { normalizeRangeKey } from '../ranges';
 import { normalizeForwardSortKey } from '../sort-keys';
 import type { ForwardUsageRow, RangeKey } from '../types';
+import { useResettingPage } from '../useResettingPage';
 import { formatBytes, formatDateTime, rangeLabel } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
@@ -32,7 +33,6 @@ export function ForwardPage() {
     origDstIp: params.get('origDstIp') ?? '',
     proto: params.get('proto') ?? '',
   };
-  const [page, setPage] = useState(1);
   const [sorting, setSorting] = useState<SortingState>([{ id: 'minuteTs', desc: true }]);
 
   const setRange = (next: RangeKey) => {
@@ -52,11 +52,16 @@ export function ForwardPage() {
     setParams(nextParams, { replace: true });
   };
 
-  useEffect(() => {
-    setPage(1);
-  }, [range, sorting, filters.origSrcIp, filters.origDstIp, filters.proto]);
-
   const currentSort = sorting[0];
+  const pageResetKey = JSON.stringify([
+    range,
+    filters.origSrcIp,
+    filters.origDstIp,
+    filters.proto,
+    currentSort?.id ?? null,
+    currentSort?.desc ?? null,
+  ]);
+  const [page, setPage] = useResettingPage(pageResetKey);
   const query = useQuery({
     queryKey: ['forward', range, filters.origSrcIp, filters.origDstIp, filters.proto, page, currentSort?.id, currentSort?.desc],
     queryFn: ({ signal }) =>

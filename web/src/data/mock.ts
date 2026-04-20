@@ -29,7 +29,9 @@ import { executableName } from '../utils';
 const BASE_TS = 1_735_689_600;
 const MINUTE = 60;
 
-const PROCESSES: ProcessOption[] = [
+type MockProcessSeed = ProcessOption & { totalBytes: number };
+
+const PROCESSES: MockProcessSeed[] = [
   { pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', totalBytes: 842_731_520 },
   { pid: 2041, comm: 'v2ray', exe: '/opt/v2ray/v2ray', totalBytes: 631_320_128 },
   { pid: 3312, comm: 'nginx', exe: '/usr/sbin/nginx', totalBytes: 188_220_416 },
@@ -76,6 +78,43 @@ function aggregateSeries(range: RangeKey, bucket: string): TimeSeriesPoint[] {
       label: new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(ts * 1000),
     };
   });
+}
+
+function buildGroupedSeries(points: TimeSeriesPoint[], groupBy: 'direction' | 'comm' | 'remote_ip') {
+  if (groupBy === 'direction') {
+    return [
+      {
+        key: 'in',
+        points: points.map((point, index) => {
+          const inboundShare = 0.34 + (index % 3) * 0.07;
+          const bytesTotal = point.up + point.down;
+          return {
+            ...point,
+            up: Math.round(bytesTotal * inboundShare * 0.42),
+            down: Math.round(bytesTotal * inboundShare * 0.58),
+            flowCount: Math.max(1, Math.round(point.flowCount * inboundShare)),
+          };
+        }),
+      },
+      {
+        key: 'out',
+        points: points.map((point, index) => {
+          const inboundShare = 0.34 + (index % 3) * 0.07;
+          const outboundShare = 1 - inboundShare;
+          const bytesTotal = point.up + point.down;
+          return {
+            ...point,
+            up: Math.round(bytesTotal * outboundShare * 0.36),
+            down: Math.round(bytesTotal * outboundShare * 0.64),
+            flowCount: Math.max(1, point.flowCount - Math.round(point.flowCount * inboundShare)),
+          };
+        }),
+      },
+    ];
+  }
+
+  const key = groupBy === 'comm' ? 'process' : 'remote';
+  return [{ key, points }];
 }
 
 function overviewFor(range: RangeKey): OverviewStats {
@@ -595,19 +634,23 @@ export function createMockApiClient(): TrafficApiClient {
       return overviewFor(range);
     },
     async getTimeSeries(range, groupBy = 'direction', filters?: TimeSeriesFilters) {
+      const basePoints = aggregateSeries(range, RANGE_TO_BUCKET[range]).map((point, index) => {
+        const filterModifier = filters?.comm ? 1.18 : filters?.remoteIp ? 1.08 : 1;
+        const modifier = (groupBy === 'comm' ? 1.4 : groupBy === 'remote_ip' ? 1.1 : 1) * filterModifier;
+        return {
+          ...point,
+          up: Math.round(point.up * modifier + (index % 3) * 110_000),
+          down: Math.round(point.down * modifier + (index % 4) * 160_000),
+          flowCount: Math.max(1, Math.round(point.flowCount * modifier)),
+        };
+      });
+      const groups = buildGroupedSeries(basePoints, groupBy);
       return {
         dataSource: range === '90d' ? 'usage_1h' : 'usage_1m',
         bucket: RANGE_TO_BUCKET[range],
-        points: aggregateSeries(range, RANGE_TO_BUCKET[range]).map((point, index) => {
-          const filterModifier = filters?.comm ? 1.18 : filters?.remoteIp ? 1.08 : 1;
-          const modifier = (groupBy === 'comm' ? 1.4 : groupBy === 'remote_ip' ? 1.1 : 1) * filterModifier;
-          return {
-            ...point,
-            up: Math.round(point.up * modifier + (index % 3) * 110_000),
-            down: Math.round(point.down * modifier + (index % 4) * 160_000),
-            flowCount: Math.max(1, Math.round(point.flowCount * modifier)),
-          };
-        }),
+        groupBy,
+        points: basePoints,
+        groups,
       };
     },
     async getUsage(query) {
@@ -638,7 +681,9 @@ export function createMockApiClient(): TrafficApiClient {
       };
     },
     async getProcesses() {
-      return { processes: PROCESSES };
+      return {
+        processes: PROCESSES.map(({ totalBytes: _totalBytes, ...process }) => process),
+      };
     },
     async getForwardUsage(query) {
       const rows = createFilteredForward(query);

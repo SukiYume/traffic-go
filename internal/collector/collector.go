@@ -196,10 +196,14 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 		if exists && now.Sub(prev.LastSeen) > defaultFlowGraceTTL {
 			exists = false
 		}
-		snapshot, delta, forwardDelta, countFlow := s.updateSnapshot(now, flow.Flow, classified, process, prev, exists, baselineReady)
+		lineageContinues := observedLineageContinues(prev, flow.RawIDs)
+		snapshot, delta, forwardDelta, countFlow, resetOwners := s.updateSnapshot(now, flow.Flow, classified, process, prev, exists, baselineReady, lineageContinues)
 		nextSnapshots[flowID] = snapshot
 		if snapshot.Direction != model.DirectionForward && snapshot.PID > 0 {
 			s.rememberProcessHint(snapshot, now)
+		}
+		if resetOwners {
+			s.releaseFlowOwnership(flowID)
 		}
 
 		if classified.Direction == model.DirectionForward {
@@ -275,7 +279,8 @@ func (s *Service) updateSnapshot(
 	prev model.FlowSnapshot,
 	exists bool,
 	baselineReady bool,
-) (model.FlowSnapshot, *deltaPair, *deltaPair, bool) {
+	lineageContinues bool,
+) (model.FlowSnapshot, *deltaPair, *deltaPair, bool, bool) {
 	attribution := model.AttributionUnknown
 	pid := 0
 	comm := ""
@@ -350,7 +355,7 @@ func (s *Service) updateSnapshot(
 	if !exists {
 		if !baselineReady {
 			snapshot.Counted = true
-			return snapshot, nil, nil, false
+			return snapshot, nil, nil, false, false
 		}
 		snapshot.Counted = true
 		if classified.Direction == model.DirectionForward {
@@ -359,7 +364,7 @@ func (s *Service) updateSnapshot(
 				downBytes: int64(flow.ReplyBytes),
 				upPkts:    int64(flow.OrigPkts),
 				downPkts:  int64(flow.ReplyPkts),
-			}, true
+			}, true, false
 		}
 
 		delta := deltaPair{}
@@ -375,13 +380,42 @@ func (s *Service) updateSnapshot(
 			delta.upPkts = int64(flow.OrigPkts)
 			delta.downPkts = int64(flow.ReplyPkts)
 		}
-		return snapshot, &delta, nil, true
+		return snapshot, &delta, nil, true, false
 	}
 
 	if snapshotTupleChanged(prev, snapshot) || flow.OrigBytes < prev.LastOrig || flow.ReplyBytes < prev.LastReply {
-		// Counter resets or tuple instability should not double-count the flow.
-		snapshot.Counted = prev.Counted
-		return snapshot, nil, nil, false
+		if lineageContinues {
+			// Reclassification or transient counter anomalies on the same conntrack
+			// lineage should not double-count the flow.
+			snapshot.Counted = prev.Counted
+			return snapshot, nil, nil, false, false
+		}
+		snapshot.Counted = true
+		if !baselineReady {
+			return snapshot, nil, nil, false, true
+		}
+		if classified.Direction == model.DirectionForward {
+			return snapshot, nil, &deltaPair{
+				upBytes:   int64(flow.OrigBytes),
+				downBytes: int64(flow.ReplyBytes),
+				upPkts:    int64(flow.OrigPkts),
+				downPkts:  int64(flow.ReplyPkts),
+			}, true, true
+		}
+		delta := deltaPair{}
+		switch classified.Direction {
+		case model.DirectionIn:
+			delta.upBytes = int64(flow.ReplyBytes)
+			delta.downBytes = int64(flow.OrigBytes)
+			delta.upPkts = int64(flow.ReplyPkts)
+			delta.downPkts = int64(flow.OrigPkts)
+		default:
+			delta.upBytes = int64(flow.OrigBytes)
+			delta.downBytes = int64(flow.ReplyBytes)
+			delta.upPkts = int64(flow.OrigPkts)
+			delta.downPkts = int64(flow.ReplyPkts)
+		}
+		return snapshot, &delta, nil, true, true
 	}
 
 	snapshot.StartedAt = prev.StartedAt
@@ -402,7 +436,7 @@ func (s *Service) updateSnapshot(
 			downBytes: int64(replyDelta),
 			upPkts:    int64(origPktDelta),
 			downPkts:  int64(replyPktDelta),
-		}, false
+		}, false, false
 	}
 
 	delta := deltaPair{}
@@ -418,7 +452,7 @@ func (s *Service) updateSnapshot(
 		delta.upPkts = int64(origPktDelta)
 		delta.downPkts = int64(replyPktDelta)
 	}
-	return snapshot, &delta, nil, false
+	return snapshot, &delta, nil, false, false
 }
 
 type deltaPair struct {
@@ -455,6 +489,14 @@ func snapshotTupleChanged(prev, next model.FlowSnapshot) bool {
 		prev.LocalPort != next.LocalPort ||
 		prev.RemoteIP != next.RemoteIP ||
 		prev.RemotePort != next.RemotePort
+}
+
+func observedLineageContinues(prev model.FlowSnapshot, rawIDs map[uint64]struct{}) bool {
+	if prev.CTID == 0 || len(rawIDs) == 0 {
+		return false
+	}
+	_, ok := rawIDs[prev.CTID]
+	return ok
 }
 
 func (s *Service) addUsage(flowID string, snapshot model.FlowSnapshot, delta deltaPair, countFlow bool) {
@@ -511,6 +553,12 @@ func (s *Service) addUsage(flowID string, snapshot model.FlowSnapshot, delta del
 		ensureState().applyContribution(flowID, contribution)
 	}
 	s.usageFlowOwner[flowID] = key
+}
+
+func (s *Service) releaseFlowOwnership(flowID string) {
+	s.ensureFlowOwners()
+	delete(s.usageFlowOwner, flowID)
+	delete(s.fwdFlowOwner, flowID)
 }
 
 func (s *Service) addForwardUsage(flowID string, classified classifiedFlow, delta deltaPair, countFlow bool) {

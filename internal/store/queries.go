@@ -700,6 +700,10 @@ func appendUsageFiltersDetailed(builder *strings.Builder, args *[]any, query mod
 		builder.WriteString(" AND local_port = ?")
 		*args = append(*args, *query.LocalPort)
 	}
+	if query.RemotePort != nil {
+		builder.WriteString(" AND remote_port = ?")
+		*args = append(*args, *query.RemotePort)
+	}
 	if !hourSource && query.Attribution != "" {
 		builder.WriteString(" AND attribution = ?")
 		*args = append(*args, query.Attribution)

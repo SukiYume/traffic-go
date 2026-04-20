@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "../App";
@@ -70,7 +70,7 @@ describe("traffic-go web ui", () => {
     expect(screen.getAllByText("小时聚合 / EXE 在此视图不展示").length).toBeGreaterThan(0);
   });
 
-  it("keeps dashboard drill-down links on the current range", async () => {
+  it("keeps dashboard drill-down links on the current range and preserves the loopback flag for remotes", async () => {
     renderWithProviders("/?range=90d", <DashboardPage />);
     expect(await screen.findByText("流量总览")).toBeInTheDocument();
 
@@ -81,8 +81,8 @@ describe("traffic-go web ui", () => {
     expect(hrefs).toEqual(
       expect.arrayContaining([
         "/processes?range=90d",
-        "/remotes?range=90d&direction=in",
-        "/remotes?range=90d&direction=out",
+        "/remotes?range=90d&direction=in&include_loopback=1",
+        "/remotes?range=90d&direction=out&include_loopback=1",
         "/usage?range=90d",
       ]),
     );
@@ -234,6 +234,35 @@ describe("traffic-go web ui", () => {
     expect(screen.queryByText("暂无明细")).not.toBeInTheDocument();
   });
 
+  it("resets usage pagination before issuing filtered queries", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const usageCalls: Array<Record<string, unknown>> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        usageCalls.push({ ...query });
+        return base.getUsage({ ...query, pageSize: 1 }, requestOptions);
+      },
+    };
+
+    renderWithProviders("/usage", <UsagePage />, client);
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+
+    await user.click(await screen.findByRole("button", { name: "下一页" }));
+    await waitFor(() => {
+      expect(usageCalls.some((call) => call.page === 2)).toBe(true);
+    });
+
+    usageCalls.length = 0;
+    await user.type(screen.getByLabelText("对端 IP"), "198.51.100.44");
+
+    await waitFor(() => {
+      expect(usageCalls.length).toBeGreaterThan(0);
+    });
+    expect(usageCalls.every((call) => call.page === 1)).toBe(true);
+  });
+
   it("mounts the app shell with navigation", () => {
     renderWithProviders("/", <App />);
     expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
@@ -326,6 +355,66 @@ describe("traffic-go web ui", () => {
     expect(await screen.findByText("流量趋势 · ss-server")).toBeInTheDocument();
     expect(container.querySelectorAll("tr.selected")).toHaveLength(1);
     expect(container.querySelector("tr.selected")).toHaveTextContent("ss-server");
+  });
+
+  it("keeps comm-table selection inside the comm table when the selected row disappears after pagination", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getTopProcesses(_range, options) {
+        if (options?.groupBy === "comm") {
+          const rows =
+            options.page === 2
+              ? [{ pid: null, comm: "comm-b", exe: null, bytesUp: 30, bytesDown: 70, flowCount: 2, totalBytes: 100 }]
+              : [{ pid: null, comm: "comm-a", exe: null, bytesUp: 50, bytesDown: 150, flowCount: 3, totalBytes: 200 }];
+          return {
+            dataSource: "usage_1m",
+            page: options?.page ?? 1,
+            pageSize: 1,
+            totalRows: 2,
+            rows,
+          };
+        }
+
+        return {
+          dataSource: "usage_1m",
+          page: 1,
+          pageSize: 1,
+          totalRows: 1,
+          rows: [{ pid: 11, comm: "pid-one", exe: "/usr/bin/pid-one", bytesUp: 120, bytesDown: 240, flowCount: 4, totalBytes: 360 }],
+        };
+      },
+      async getTimeSeries(_range, groupBy = "direction") {
+        return {
+          dataSource: "usage_1m",
+          bucket: "5m",
+          groupBy,
+          points: [{ ts: 1710000000, up: 40, down: 60, flowCount: 3, label: "03/09 16:00" }],
+          groups: [
+            { key: "in", points: [{ ts: 1710000000, up: 10, down: 20, flowCount: 1, label: "03/09 16:00" }] },
+            { key: "out", points: [{ ts: 1710000000, up: 30, down: 40, flowCount: 2, label: "03/09 16:00" }] },
+          ],
+        };
+      },
+    };
+
+    const { container } = renderWithProviders("/processes", <ProcessesPage />, client);
+    expect(await screen.findByText("流量趋势 · pid-one")).toBeInTheDocument();
+
+    const commSection = screen.getByText("按进程名聚合").closest("section");
+    if (!commSection) {
+      throw new Error("expected comm section");
+    }
+
+    await user.click(within(commSection).getByText("comm-a"));
+    expect(await screen.findByText("流量趋势 · comm-a")).toBeInTheDocument();
+
+    await user.click(within(commSection).getByRole("button", { name: "下一页" }));
+
+    expect(await screen.findByText("流量趋势 · comm-b")).toBeInTheDocument();
+    expect(container.querySelectorAll("tr.selected")).toHaveLength(1);
+    expect(container.querySelector("tr.selected")).toHaveTextContent("comm-b");
   });
 
   it("shows a loading state instead of an empty state on the processes page first load", () => {

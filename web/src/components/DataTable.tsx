@@ -26,6 +26,41 @@ type TableColumnMeta = {
   nowrap?: boolean;
 };
 
+function SortIndicator({ state }: { state: false | 'asc' | 'desc' }) {
+  if (state === 'asc') {
+    return (
+      <span className="table-sort-indicator" aria-hidden="true">
+        <svg viewBox="0 0 12 12" focusable="false">
+          <path d="M6 9V3" />
+          <path d="M3.5 5.5 6 3l2.5 2.5" />
+        </svg>
+      </span>
+    );
+  }
+
+  if (state === 'desc') {
+    return (
+      <span className="table-sort-indicator" aria-hidden="true">
+        <svg viewBox="0 0 12 12" focusable="false">
+          <path d="M6 3v6" />
+          <path d="M3.5 6.5 6 9l2.5-2.5" />
+        </svg>
+      </span>
+    );
+  }
+
+  return (
+    <span className="table-sort-indicator" aria-hidden="true">
+      <svg viewBox="0 0 12 12" focusable="false">
+        <path d="M6 5V2.5" />
+        <path d="M4 4.5 6 2.5l2 2" />
+        <path d="M6 7v2.5" />
+        <path d="M4 7.5 6 9.5l2-2" />
+      </svg>
+    </span>
+  );
+}
+
 function columnMetaToClassName(meta: TableColumnMeta | undefined, target: 'header' | 'cell') {
   if (!meta) return undefined;
   const classes = [meta.className];
@@ -111,9 +146,7 @@ export function DataTable<TData>({
                           onClick={header.column.getToggleSortingHandler()}
                         >
                           <span>{flexRender(header.column.columnDef.header, header.getContext())}</span>
-                          <span className="table-sort-indicator">
-                            {sortState === 'asc' ? '↑' : sortState === 'desc' ? '↓' : '↕'}
-                          </span>
+                          <SortIndicator state={sortState} />
                         </button>
                       ) : (
                         flexRender(header.column.columnDef.header, header.getContext())

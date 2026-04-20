@@ -435,6 +435,7 @@ func (s *Server) collectRelatedUsage(ctx context.Context, query usageExplainQuer
 		currentQuery.RemoteIP = query.RemoteIP
 		currentQuery.Direction = query.Direction
 		currentQuery.LocalPort = query.LocalPort
+		currentQuery.RemotePort = query.RemotePort
 		currentQuery.PageSize = 200
 
 		currentRecords, _, _, err := s.store.QueryUsage(ctx, currentQuery, store.DataSourceMinute)
@@ -466,6 +467,7 @@ func (s *Server) collectRelatedUsage(ctx context.Context, query usageExplainQuer
 	currentQuery.Direction = query.Direction
 	currentQuery.RemoteIP = query.RemoteIP
 	currentQuery.LocalPort = query.LocalPort
+	currentQuery.RemotePort = query.RemotePort
 	currentQuery.PageSize = 200
 
 	currentRecords, _, _, err := s.store.QueryUsage(ctx, currentQuery, store.DataSourceMinute)
@@ -2303,47 +2305,38 @@ func (s *Server) loadPersistedChains(ctx context.Context, bucketTS int64, query 
 		lookups[0], lookups[1] = lookups[1], lookups[0]
 	}
 
-	var (
-		rows        []model.UsageChainRecord
-		sourceLabel string
-		err         error
-	)
 	for _, lookup := range lookups {
-		rows, err = s.store.QueryUsageChainsForProcess(ctx, lookup.bucket, pidFilter, query.Comm, query.Exe, lookup.source)
+		rows, err := s.store.QueryUsageChainsForProcess(ctx, lookup.bucket, pidFilter, query.Comm, query.Exe, lookup.source)
 		if err != nil {
 			return nil, err
 		}
-		if len(rows) > 0 {
-			sourceLabel = lookup.label
-			break
-		}
-	}
-	if len(rows) == 0 {
-		return nil, nil
-	}
-
-	relevant := make([]model.UsageChainRecord, 0, len(rows))
-	for _, row := range rows {
-		if chainRecordMatchesExplain(row, query) {
-			relevant = append(relevant, row)
-		}
-	}
-	if len(relevant) == 0 {
-		return nil, nil
-	}
-
-	chains := make([]usageExplainChain, 0, len(relevant))
-	for _, row := range relevant {
-		chain := usageExplainChainFromRecord(row, sourceLabel)
-		if !shouldPersistCanonicalChain(chain) {
+		if len(rows) == 0 {
 			continue
 		}
-		chains = append(chains, chain)
+
+		relevant := make([]model.UsageChainRecord, 0, len(rows))
+		for _, row := range rows {
+			if chainRecordMatchesExplain(row, query) {
+				relevant = append(relevant, row)
+			}
+		}
+		if len(relevant) == 0 {
+			continue
+		}
+
+		chains := make([]usageExplainChain, 0, len(relevant))
+		for _, row := range relevant {
+			chain := usageExplainChainFromRecord(row, lookup.label)
+			if !shouldPersistCanonicalChain(chain) {
+				continue
+			}
+			chains = append(chains, chain)
+		}
+		if len(chains) > 0 {
+			return chains, nil
+		}
 	}
-	if len(chains) == 0 {
-		return nil, nil
-	}
-	return chains, nil
+	return nil, nil
 }
 
 func explainChainIdentity(chain usageExplainChain) string {
@@ -2522,8 +2515,10 @@ func chainRecordMatchesExplain(record model.UsageChainRecord, query usageExplain
 			if !sameIP(record.SourceIP, query.RemoteIP) {
 				return false
 			}
-			if query.LocalPort != nil && record.EntryPort != nil && *record.EntryPort != *query.LocalPort {
-				return false
+			if query.LocalPort != nil {
+				if record.EntryPort == nil || *record.EntryPort != *query.LocalPort {
+					return false
+				}
 			}
 			return true
 		}
@@ -2535,8 +2530,15 @@ func chainRecordMatchesExplain(record model.UsageChainRecord, query usageExplain
 		if !sameIP(record.TargetIP, query.RemoteIP) {
 			return false
 		}
-		if query.RemotePort != nil && record.TargetPort != nil && *record.TargetPort != *query.RemotePort {
-			return false
+		if query.LocalPort != nil {
+			if record.EntryPort == nil || *record.EntryPort != *query.LocalPort {
+				return false
+			}
+		}
+		if query.RemotePort != nil {
+			if record.TargetPort == nil || *record.TargetPort != *query.RemotePort {
+				return false
+			}
 		}
 		return true
 	default:

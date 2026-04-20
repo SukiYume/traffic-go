@@ -392,20 +392,31 @@ function decodeOverview(raw: unknown): OverviewStats {
   };
 }
 
-function decodeTimeSeries(raw: unknown, bucket: BucketKey): TimeSeriesResponse {
+function decodeTimeSeries(raw: unknown, bucket: BucketKey, groupBy: GroupBy): TimeSeriesResponse {
   const payload = raw as RawTimeseriesResponse;
   const byBucket = new Map<number, { up: number; down: number; flowCount: number }>();
+  const byGroup = new Map<string, Map<number, { up: number; down: number; flowCount: number }>>();
   for (const point of payload.data ?? []) {
     const current = byBucket.get(point.bucket_ts) ?? { up: 0, down: 0, flowCount: 0 };
     current.up += point.bytes_up;
     current.down += point.bytes_down;
     current.flowCount += point.flow_count;
     byBucket.set(point.bucket_ts, current);
+
+    const groupKey = point.group || 'unknown';
+    const groupBuckets = byGroup.get(groupKey) ?? new Map<number, { up: number; down: number; flowCount: number }>();
+    const groupCurrent = groupBuckets.get(point.bucket_ts) ?? { up: 0, down: 0, flowCount: 0 };
+    groupCurrent.up += point.bytes_up;
+    groupCurrent.down += point.bytes_down;
+    groupCurrent.flowCount += point.flow_count;
+    groupBuckets.set(point.bucket_ts, groupCurrent);
+    byGroup.set(groupKey, groupBuckets);
   }
 
   return {
     dataSource: payload.data_source,
     bucket,
+    groupBy,
     points: [...byBucket.entries()]
       .sort((left, right) => left[0] - right[0])
       .map(([ts, value]) => ({
@@ -414,6 +425,20 @@ function decodeTimeSeries(raw: unknown, bucket: BucketKey): TimeSeriesResponse {
         down: value.down,
         flowCount: value.flowCount,
         label: formatPointLabel(ts, bucket),
+      })),
+    groups: [...byGroup.entries()]
+      .sort((left, right) => left[0].localeCompare(right[0], 'zh-CN'))
+      .map(([key, groupBuckets]) => ({
+        key,
+        points: [...groupBuckets.entries()]
+          .sort((left, right) => left[0] - right[0])
+          .map(([ts, value]) => ({
+            ts,
+            up: value.up,
+            down: value.down,
+            flowCount: value.flowCount,
+            label: formatPointLabel(ts, bucket),
+          })),
       })),
   };
 }
@@ -517,7 +542,6 @@ function decodeProcesses(raw: unknown): ProcessesResponse {
       pid: process.pid,
       comm: process.comm,
       exe: process.exe,
-      totalBytes: 0,
     })),
   };
 }
@@ -592,7 +616,7 @@ export function createHttpClient(): TrafficApiClient {
       const bucket = RANGE_TO_BUCKET[range];
       return requestJson(
         withAppBase(`/api/v1/stats/timeseries${buildTimeSeriesQuery(range, bucket, groupBy, filters)}`),
-        (raw) => decodeTimeSeries(raw, bucket),
+        (raw) => decodeTimeSeries(raw, bucket, groupBy),
         requestOptions,
       );
     },

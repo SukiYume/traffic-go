@@ -12,6 +12,7 @@ import { useApiClient } from '../api-context';
 import { normalizeRangeKey } from '../ranges';
 import { normalizeProcessSortKey } from '../sort-keys';
 import type { ProcessSummaryRow, RangeKey } from '../types';
+import { useResettingPage } from '../useResettingPage';
 import { formatBytes, rangeLabel, safeText } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
@@ -60,8 +61,6 @@ export function ProcessesPage() {
   const api = useApiClient();
   const [params, setParams] = useSearchParams();
   const range = normalizeRangeKey(params.get('range'), defaultRange);
-  const [pidPage, setPidPage] = useState(1);
-  const [commPage, setCommPage] = useState(1);
   const [pidSorting, setPidSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
   const [commSorting, setCommSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
   const [selected, setSelected] = useState<SelectedProcessState | null>(null);
@@ -75,6 +74,10 @@ export function ProcessesPage() {
   const shouldRequestPID = range !== '90d';
   const currentPIDSort = pidSorting[0];
   const currentCommSort = commSorting[0];
+  const pidResetKey = JSON.stringify([range, currentPIDSort?.id ?? null, currentPIDSort?.desc ?? null]);
+  const commResetKey = JSON.stringify([range, currentCommSort?.id ?? null, currentCommSort?.desc ?? null]);
+  const [pidPage, setPidPage] = useResettingPage(pidResetKey);
+  const [commPage, setCommPage] = useResettingPage(commResetKey);
 
   const pidQuery = useQuery({
     queryKey: ['process-summaries', range, 'pid', pidPage, currentPIDSort?.id, currentPIDSort?.desc],
@@ -112,14 +115,6 @@ export function ProcessesPage() {
   const pidRows = pidDimensionUnavailable ? [] : (pidQuery.data?.rows ?? []);
   const commRows = commQuery.data?.rows ?? [];
 
-  useEffect(() => {
-    setPidPage(1);
-  }, [range, pidSorting]);
-
-  useEffect(() => {
-    setCommPage(1);
-  }, [range, commSorting]);
-
   const selectedPIDRow = useMemo(() => findSelectedRow(pidRows, selected, 'pid'), [pidRows, selected]);
   const selectedCommRow = useMemo(() => findSelectedRow(commRows, selected, 'comm'), [commRows, selected]);
   const selectedProcess = selectedPIDRow ?? selectedCommRow;
@@ -128,16 +123,32 @@ export function ProcessesPage() {
     if (selectedPIDRow || selectedCommRow) {
       return;
     }
-    if (pidRows.length) {
+    if (selected?.section === 'comm' && commRows.length) {
+      setSelected({ section: 'comm', key: processRowKey(commRows[0]) });
+      return;
+    }
+    if (selected?.section === 'pid' && pidRows.length) {
       setSelected({ section: 'pid', key: processRowKey(pidRows[0]) });
+      return;
+    }
+    if (!selected && pidRows.length) {
+      setSelected({ section: 'pid', key: processRowKey(pidRows[0]) });
+      return;
+    }
+    if (!selected && commRows.length) {
+      setSelected({ section: 'comm', key: processRowKey(commRows[0]) });
       return;
     }
     if (commRows.length) {
       setSelected({ section: 'comm', key: processRowKey(commRows[0]) });
       return;
     }
+    if (pidRows.length) {
+      setSelected({ section: 'pid', key: processRowKey(pidRows[0]) });
+      return;
+    }
     setSelected(null);
-  }, [commRows, pidRows, selectedCommRow, selectedPIDRow]);
+  }, [commRows, pidRows, selected, selectedCommRow, selectedPIDRow]);
 
   const selectedSeriesFilters = useMemo(() => buildProcessSeriesFilters(selectedProcess), [selectedProcess]);
   const canQuerySeries = Boolean(selectedSeriesFilters);
@@ -347,14 +358,16 @@ export function ProcessesPage() {
       ) : selectedProcess && series.data ? (
         <ChartPanel
           points={series.data.points}
+          groups={series.data.groups}
+          groupBy={series.data.groupBy}
           range={range}
           title={`流量趋势 · ${safeText(selectedProcess.comm)}`}
           subtitle={
             selected?.section === 'pid'
-              ? `按 PID 聚合 · PID ${selectedProcess.pid ?? '未知'}`
+              ? `按 PID 聚合 · PID ${selectedProcess.pid ?? '未知'} · 入站 / 出站总量`
               : activeDataSource === 'usage_1h'
-                ? '当前窗口已降级为按进程名聚合'
-                : '按进程名聚合'
+                ? '当前窗口已降级为按进程名聚合 · 入站 / 出站总量'
+                : '按进程名聚合 · 入站 / 出站总量'
           }
         />
       ) : selectedProcess && canQuerySeries ? (
