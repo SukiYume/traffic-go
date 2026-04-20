@@ -49,7 +49,7 @@ export function DashboardPage() {
   });
   const topProcesses = useQuery({
     queryKey: ['top-processes', range, 'dashboard'],
-    queryFn: ({ signal }) => api.getTopProcesses(range, { page: 1, pageSize: 5, groupBy: 'comm' }, { signal }),
+    queryFn: ({ signal }) => api.getTopProcesses(range, { page: 1, pageSize: 5, groupBy: 'pid' }, { signal }),
   });
   const topInboundRemotes = useQuery({
     queryKey: ['top-remotes', range, 'in'],
@@ -127,11 +127,11 @@ export function DashboardPage() {
                 <li key={`${row.pid ?? 'none'}-${row.comm ?? 'unknown'}-${index}`}>
                   <div>
                     <strong>{safeText(row.comm)}</strong>
-                    <span>{row.pid !== null ? `PID ${row.pid}` : '按进程名聚合'}</span>
+                    <span>{row.pid !== null ? `PID ${row.pid}` : '当前窗口已降级为按进程名聚合'}</span>
                   </div>
                   <div className="top-value">
                     <strong>{formatBytes(row.totalBytes)}</strong>
-                    <span>{row.exe ? displayExecutableName(row.exe) : '未归因 / EXE 不可用'}</span>
+                    <span>{row.pid !== null ? displayExecutableName(row.exe) : '小时聚合 / EXE 在此视图不展示'}</span>
                   </div>
                 </li>
               ))}

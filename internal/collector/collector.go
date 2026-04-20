@@ -23,22 +23,25 @@ type Runner interface {
 }
 
 type Service struct {
-	cfg            config.Config
-	store          *store.Store
-	logger         *log.Logger
-	resolver       *processResolver
-	currentMinute  time.Time
-	buckets        map[model.UsageKey]*bucketState
-	forwardBuckets map[model.ForwardUsageKey]*bucketState
-	usageFlowOwner map[uint64]model.UsageKey
-	fwdFlowOwner   map[uint64]model.ForwardUsageKey
-	runtimeMu      sync.RWMutex
-	snapshots      map[uint64]model.FlowSnapshot
-	snapshotReady  bool
-	processHints   map[string]processHint
-	localIPs       map[string]struct{}
-	lastIPRefresh  time.Time
-	warnedNoAcct   bool
+	cfg             config.Config
+	store           *store.Store
+	logger          *log.Logger
+	resolver        *processResolver
+	currentMinute   time.Time
+	buckets         map[model.UsageKey]*bucketState
+	forwardBuckets  map[model.ForwardUsageKey]*bucketState
+	usageFlowOwner  map[string]model.UsageKey
+	fwdFlowOwner    map[string]model.ForwardUsageKey
+	runtimeMu       sync.RWMutex
+	snapshots       map[string]model.FlowSnapshot
+	snapshotReady   bool
+	processHints    map[string]processHint
+	localIPs        map[string]struct{}
+	lastIPRefresh   time.Time
+	socketIndex     socketIndex
+	lastSockRefresh time.Time
+	socketReady     bool
+	warnedNoAcct    bool
 }
 
 type bucketState struct {
@@ -47,12 +50,14 @@ type bucketState struct {
 	pktsUp    int64
 	pktsDown  int64
 	flowCount int64
-	flows     map[uint64]struct{}
-	perFlow   map[uint64]flowContribution
+	flows     map[string]struct{}
+	perFlow   map[string]flowContribution
 }
 
 const defaultProcessHintTTL = 90 * time.Second
 const shutdownFlushTimeout = 5 * time.Second
+const defaultFlowGraceTTL = 15 * time.Second
+const defaultSocketIndexTTL = 10 * time.Second
 
 type processHint struct {
 	process model.ProcessInfo
@@ -85,9 +90,9 @@ func New(cfg config.Config, trafficStore *store.Store, logger *log.Logger) Runne
 		resolver:       newProcessResolver(cfg.ProcFS),
 		buckets:        make(map[model.UsageKey]*bucketState),
 		forwardBuckets: make(map[model.ForwardUsageKey]*bucketState),
-		usageFlowOwner: make(map[uint64]model.UsageKey),
-		fwdFlowOwner:   make(map[uint64]model.ForwardUsageKey),
-		snapshots:      make(map[uint64]model.FlowSnapshot),
+		usageFlowOwner: make(map[string]model.UsageKey),
+		fwdFlowOwner:   make(map[string]model.ForwardUsageKey),
+		snapshots:      make(map[string]model.FlowSnapshot),
 		processHints:   make(map[string]processHint),
 	}
 }
@@ -157,30 +162,27 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 		s.logger.Printf("conntrack accounting appears disabled; enable `sysctl -w net.netfilter.nf_conntrack_acct=1` to collect byte and packet counters")
 		s.warnedNoAcct = true
 	}
-	socketIndex, err := ReadSocketIndex(s.cfg.ProcFS)
+	socketIndex, err := s.socketIndexSnapshot(now)
 	if err != nil {
 		return err
 	}
 	s.pruneProcessHints(now)
 
 	inodesNeeded := make(map[uint64]struct{})
-	flowMeta := make(map[uint64]classifiedFlow)
-	for _, flow := range flows {
-		classified := classifyFlow(flow, s.localIPs, socketIndex)
-		classified, inodeResolved := attachSocketMetadata(socketIndex, classified)
-		if inodeResolved && classified.Inode > 0 {
-			inodesNeeded[classified.Inode] = struct{}{}
+	observed := normalizeObservedFlows(flows, s.localIPs, socketIndex)
+	for _, flow := range observed {
+		if flow.Classified.Inode > 0 {
+			inodesNeeded[flow.Classified.Inode] = struct{}{}
 		}
-		flowMeta[flow.CTID] = classified
 	}
 
 	processes := s.resolver.Resolve(ctx, inodesNeeded)
 	prevSnapshots := s.snapshotCopy()
 	baselineReady := s.isSnapshotReady()
-	nextSnapshots := make(map[uint64]model.FlowSnapshot, len(flows))
+	nextSnapshots := s.carryForwardSnapshots(prevSnapshots, now)
 
-	for _, flow := range flows {
-		classified := flowMeta[flow.CTID]
+	for _, flow := range observed {
+		classified := flow.Classified
 		process := processes[classified.Inode]
 		if process.PID <= 0 {
 			if hinted, ok := s.lookupProcessHint(classified, now); ok {
@@ -189,9 +191,13 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 			}
 		}
 
-		prev, exists := prevSnapshots[flow.CTID]
-		snapshot, delta, forwardDelta, countFlow := s.updateSnapshot(now, flow, classified, process, prev, exists, baselineReady)
-		nextSnapshots[flow.CTID] = snapshot
+		flowID := string(flow.Identity)
+		prev, exists := prevSnapshots[flowID]
+		if exists && now.Sub(prev.LastSeen) > defaultFlowGraceTTL {
+			exists = false
+		}
+		snapshot, delta, forwardDelta, countFlow := s.updateSnapshot(now, flow.Flow, classified, process, prev, exists, baselineReady)
+		nextSnapshots[flowID] = snapshot
 		if snapshot.Direction != model.DirectionForward && snapshot.PID > 0 {
 			s.rememberProcessHint(snapshot, now)
 		}
@@ -202,7 +208,7 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 				if forwardDelta != nil {
 					deltaValue = *forwardDelta
 				}
-				s.addForwardUsage(snapshot.CTID, classified, deltaValue, countFlow)
+				s.addForwardUsage(flowID, classified, deltaValue, countFlow)
 			}
 			continue
 		}
@@ -211,11 +217,45 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 			if delta != nil {
 				deltaValue = *delta
 			}
-			s.addUsage(snapshot.CTID, snapshot, deltaValue, countFlow)
+			s.addUsage(flowID, snapshot, deltaValue, countFlow)
 		}
 	}
 	s.replaceSnapshots(nextSnapshots)
 	return nil
+}
+
+func (s *Service) socketIndexSnapshot(now time.Time) (socketIndex, error) {
+	if s.socketReady && now.Sub(s.lastSockRefresh) < defaultSocketIndexTTL {
+		return s.socketIndex, nil
+	}
+
+	index, err := ReadSocketIndex(s.cfg.ProcFS)
+	if err != nil {
+		if s.socketReady {
+			return s.socketIndex, nil
+		}
+		return socketIndex{}, err
+	}
+
+	s.socketIndex = index
+	s.lastSockRefresh = now
+	s.socketReady = true
+	return index, nil
+}
+
+func (s *Service) carryForwardSnapshots(prev map[string]model.FlowSnapshot, now time.Time) map[string]model.FlowSnapshot {
+	if len(prev) == 0 {
+		return make(map[string]model.FlowSnapshot)
+	}
+
+	next := make(map[string]model.FlowSnapshot, len(prev))
+	for key, snapshot := range prev {
+		if now.Sub(snapshot.LastSeen) > defaultFlowGraceTTL {
+			continue
+		}
+		next[key] = snapshot
+	}
+	return next
 }
 
 func hasConntrackAccounting(flows []model.ConntrackFlow) bool {
@@ -417,7 +457,7 @@ func snapshotTupleChanged(prev, next model.FlowSnapshot) bool {
 		prev.RemotePort != next.RemotePort
 }
 
-func (s *Service) addUsage(ctid uint64, snapshot model.FlowSnapshot, delta deltaPair, countFlow bool) {
+func (s *Service) addUsage(flowID string, snapshot model.FlowSnapshot, delta deltaPair, countFlow bool) {
 	s.ensureFlowOwners()
 
 	key := model.UsageKey{
@@ -442,21 +482,21 @@ func (s *Service) addUsage(ctid uint64, snapshot model.FlowSnapshot, delta delta
 		return state
 	}
 
-	if previousForwardKey, ok := s.fwdFlowOwner[ctid]; ok {
+	if previousForwardKey, ok := s.fwdFlowOwner[flowID]; ok {
 		if previousForwardState := s.forwardBuckets[previousForwardKey]; previousForwardState != nil {
-			ensureState().applyContribution(ctid, previousForwardState.detachFlow(ctid))
+			ensureState().applyContribution(flowID, previousForwardState.detachFlow(flowID))
 			if previousForwardState.empty() {
 				delete(s.forwardBuckets, previousForwardKey)
 			}
 		}
-		delete(s.fwdFlowOwner, ctid)
+		delete(s.fwdFlowOwner, flowID)
 	}
-	if previousUsageKey, ok := s.usageFlowOwner[ctid]; ok && previousUsageKey != key {
+	if previousUsageKey, ok := s.usageFlowOwner[flowID]; ok && previousUsageKey != key {
 		// Reclassification within the same minute must migrate the flow's existing
 		// bytes/packets and one-time flow_count to the new bucket instead of
 		// counting it again.
 		if previousUsageState := s.buckets[previousUsageKey]; previousUsageState != nil {
-			ensureState().applyContribution(ctid, previousUsageState.detachFlow(ctid))
+			ensureState().applyContribution(flowID, previousUsageState.detachFlow(flowID))
 			if previousUsageState.empty() {
 				delete(s.buckets, previousUsageKey)
 			}
@@ -468,12 +508,12 @@ func (s *Service) addUsage(ctid uint64, snapshot model.FlowSnapshot, delta delta
 		contribution.flowCount = 1
 	}
 	if !contribution.isZero() {
-		ensureState().applyContribution(ctid, contribution)
+		ensureState().applyContribution(flowID, contribution)
 	}
-	s.usageFlowOwner[ctid] = key
+	s.usageFlowOwner[flowID] = key
 }
 
-func (s *Service) addForwardUsage(ctid uint64, classified classifiedFlow, delta deltaPair, countFlow bool) {
+func (s *Service) addForwardUsage(flowID string, classified classifiedFlow, delta deltaPair, countFlow bool) {
 	s.ensureFlowOwners()
 
 	key := model.ForwardUsageKey{
@@ -494,18 +534,18 @@ func (s *Service) addForwardUsage(ctid uint64, classified classifiedFlow, delta 
 		return state
 	}
 
-	if previousUsageKey, ok := s.usageFlowOwner[ctid]; ok {
+	if previousUsageKey, ok := s.usageFlowOwner[flowID]; ok {
 		if previousUsageState := s.buckets[previousUsageKey]; previousUsageState != nil {
-			ensureState().applyContribution(ctid, previousUsageState.detachFlow(ctid))
+			ensureState().applyContribution(flowID, previousUsageState.detachFlow(flowID))
 			if previousUsageState.empty() {
 				delete(s.buckets, previousUsageKey)
 			}
 		}
-		delete(s.usageFlowOwner, ctid)
+		delete(s.usageFlowOwner, flowID)
 	}
-	if previousForwardKey, ok := s.fwdFlowOwner[ctid]; ok && previousForwardKey != key {
+	if previousForwardKey, ok := s.fwdFlowOwner[flowID]; ok && previousForwardKey != key {
 		if previousForwardState := s.forwardBuckets[previousForwardKey]; previousForwardState != nil {
-			ensureState().applyContribution(ctid, previousForwardState.detachFlow(ctid))
+			ensureState().applyContribution(flowID, previousForwardState.detachFlow(flowID))
 			if previousForwardState.empty() {
 				delete(s.forwardBuckets, previousForwardKey)
 			}
@@ -517,17 +557,17 @@ func (s *Service) addForwardUsage(ctid uint64, classified classifiedFlow, delta 
 		contribution.flowCount = 1
 	}
 	if !contribution.isZero() {
-		ensureState().applyContribution(ctid, contribution)
+		ensureState().applyContribution(flowID, contribution)
 	}
-	s.fwdFlowOwner[ctid] = key
+	s.fwdFlowOwner[flowID] = key
 }
 
 func (s *Service) flushCurrentBuckets(ctx context.Context) error {
 	s.ensureFlowOwners()
 
 	if len(s.buckets) == 0 && len(s.forwardBuckets) == 0 {
-		s.usageFlowOwner = make(map[uint64]model.UsageKey)
-		s.fwdFlowOwner = make(map[uint64]model.ForwardUsageKey)
+		s.usageFlowOwner = make(map[string]model.UsageKey)
+		s.fwdFlowOwner = make(map[string]model.ForwardUsageKey)
 		return nil
 	}
 
@@ -564,68 +604,68 @@ func (s *Service) flushCurrentBuckets(ctx context.Context) error {
 	}
 	s.buckets = make(map[model.UsageKey]*bucketState)
 	s.forwardBuckets = make(map[model.ForwardUsageKey]*bucketState)
-	s.usageFlowOwner = make(map[uint64]model.UsageKey)
-	s.fwdFlowOwner = make(map[uint64]model.ForwardUsageKey)
+	s.usageFlowOwner = make(map[string]model.UsageKey)
+	s.fwdFlowOwner = make(map[string]model.ForwardUsageKey)
 	return nil
 }
 
 func (s *Service) ensureFlowOwners() {
 	if s.usageFlowOwner == nil {
-		s.usageFlowOwner = make(map[uint64]model.UsageKey)
+		s.usageFlowOwner = make(map[string]model.UsageKey)
 	}
 	if s.fwdFlowOwner == nil {
-		s.fwdFlowOwner = make(map[uint64]model.ForwardUsageKey)
+		s.fwdFlowOwner = make(map[string]model.ForwardUsageKey)
 	}
 }
 
 func newBucketState() *bucketState {
 	return &bucketState{
-		flows:   make(map[uint64]struct{}),
-		perFlow: make(map[uint64]flowContribution),
+		flows:   make(map[string]struct{}),
+		perFlow: make(map[string]flowContribution),
 	}
 }
 
-func (b *bucketState) applyContribution(ctid uint64, contribution flowContribution) {
+func (b *bucketState) applyContribution(flowID string, contribution flowContribution) {
 	if b == nil || contribution.isZero() {
 		return
 	}
 	if b.flows == nil {
-		b.flows = make(map[uint64]struct{})
+		b.flows = make(map[string]struct{})
 	}
 	if b.perFlow == nil {
-		b.perFlow = make(map[uint64]flowContribution)
+		b.perFlow = make(map[string]flowContribution)
 	}
 
 	// Keep per-flow contributions so we can move an already-counted flow between
 	// buckets when attribution or direction becomes clearer later in the minute.
-	current := b.perFlow[ctid]
+	current := b.perFlow[flowID]
 	current.delta.upBytes += contribution.delta.upBytes
 	current.delta.downBytes += contribution.delta.downBytes
 	current.delta.upPkts += contribution.delta.upPkts
 	current.delta.downPkts += contribution.delta.downPkts
 	current.flowCount += contribution.flowCount
-	b.perFlow[ctid] = current
+	b.perFlow[flowID] = current
 
 	b.bytesUp += contribution.delta.upBytes
 	b.bytesDown += contribution.delta.downBytes
 	b.pktsUp += contribution.delta.upPkts
 	b.pktsDown += contribution.delta.downPkts
 	b.flowCount += contribution.flowCount
-	b.flows[ctid] = struct{}{}
+	b.flows[flowID] = struct{}{}
 }
 
-func (b *bucketState) detachFlow(ctid uint64) flowContribution {
+func (b *bucketState) detachFlow(flowID string) flowContribution {
 	if b == nil {
 		return flowContribution{}
 	}
 	if b.perFlow == nil {
-		delete(b.flows, ctid)
+		delete(b.flows, flowID)
 		return flowContribution{}
 	}
 
-	contribution := b.perFlow[ctid]
-	delete(b.perFlow, ctid)
-	delete(b.flows, ctid)
+	contribution := b.perFlow[flowID]
+	delete(b.perFlow, flowID)
+	delete(b.flows, flowID)
 
 	b.bytesUp -= contribution.delta.upBytes
 	b.bytesDown -= contribution.delta.downBytes
@@ -711,13 +751,13 @@ func (s *Service) ActiveStats() model.ActiveStats {
 	}
 }
 
-func (s *Service) snapshotCopy() map[uint64]model.FlowSnapshot {
+func (s *Service) snapshotCopy() map[string]model.FlowSnapshot {
 	s.runtimeMu.RLock()
 	defer s.runtimeMu.RUnlock()
 
-	copied := make(map[uint64]model.FlowSnapshot, len(s.snapshots))
-	for ctid, snapshot := range s.snapshots {
-		copied[ctid] = snapshot
+	copied := make(map[string]model.FlowSnapshot, len(s.snapshots))
+	for flowID, snapshot := range s.snapshots {
+		copied[flowID] = snapshot
 	}
 	return copied
 }
@@ -728,7 +768,7 @@ func (s *Service) isSnapshotReady() bool {
 	return s.snapshotReady
 }
 
-func (s *Service) replaceSnapshots(next map[uint64]model.FlowSnapshot) {
+func (s *Service) replaceSnapshots(next map[string]model.FlowSnapshot) {
 	s.runtimeMu.Lock()
 	defer s.runtimeMu.Unlock()
 	s.snapshots = next

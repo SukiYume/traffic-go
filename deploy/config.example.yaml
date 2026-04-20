@@ -7,7 +7,7 @@
 
 # Change the port here if the default local listen address conflicts with another service.
 listen: "127.0.0.1:18080"
-# install-centos7.sh rewrites this to /var/lib/traffic-go/traffic.db during install.
+# install-centos7.sh rewrites this to <script-dir>/traffic.db during install.
 db_path: ./traffic.db
 tick_interval: 2s
 log_level: info

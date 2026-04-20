@@ -968,6 +968,39 @@ button {
   table-layout: auto;
 }
 
+.processes-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.processes-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.processes-section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.processes-section-head h3 {
+  margin: 0;
+  font-size: 18px;
+  color: #fff;
+  font-weight: 600;
+}
+
+.processes-section-head p {
+  margin: 6px 0 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .forward-table {
   width: 100%;
   min-width: 0;
@@ -994,7 +1027,7 @@ button {
 }
 
 .processes-table-pid .col-process {
-  min-width: 160px;
+  min-width: 220px;
 }
 
 .processes-table-pid .col-pid {

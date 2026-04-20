@@ -6,20 +6,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=traffic-go
-Group=traffic-go
-WorkingDirectory=/var/lib/traffic-go
-ExecStart=/usr/local/bin/traffic-go -config /etc/traffic-go/config.yaml
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=__INSTALL_ROOT__
+ExecStartPre=-__MODPROBE_BIN__ nf_conntrack
+ExecStartPre=-__SYSCTL_BIN__ -w net.netfilter.nf_conntrack_acct=1
+ExecStart=__INSTALL_BIN__ -config __INSTALL_CONFIG__
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=30
 LimitNOFILE=65536
-UMask=0027
+UMask=0007
 NoNewPrivileges=true
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-StateDirectory=traffic-go
-RuntimeDirectory=traffic-go
 
 [Install]
 WantedBy=multi-user.target

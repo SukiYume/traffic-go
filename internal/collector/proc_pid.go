@@ -14,6 +14,7 @@ import (
 const (
 	defaultPositiveCacheTTL = 30 * time.Second
 	defaultNegativeCacheTTL = 10 * time.Second
+	defaultScanCooldown     = 5 * time.Second
 )
 
 type processResolver struct {
@@ -23,7 +24,9 @@ type processResolver struct {
 	pidSockets    func(int) (map[uint64]struct{}, bool)
 	positiveTTL   time.Duration
 	negativeTTL   time.Duration
+	scanCooldown  time.Duration
 	lastFullScan  time.Time
+	lastMissScan  time.Time
 	cache         map[uint64]model.ProcessInfo
 	negativeCache map[uint64]time.Time
 }
@@ -34,6 +37,7 @@ func newProcessResolver(procFS string) *processResolver {
 		now:           time.Now,
 		positiveTTL:   defaultPositiveCacheTTL,
 		negativeTTL:   defaultNegativeCacheTTL,
+		scanCooldown:  defaultScanCooldown,
 		cache:         make(map[uint64]model.ProcessInfo),
 		negativeCache: make(map[uint64]time.Time),
 	}
@@ -74,6 +78,9 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 	if len(missing) == 0 && !scanDue {
 		return resolved
 	}
+	if len(missing) > 0 && !scanDue && !r.missScanDue(now) {
+		return resolved
+	}
 
 	scanFn := r.scan
 	if scanFn == nil {
@@ -86,6 +93,7 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 	if scanOK {
 		r.cache = scanned
 		r.lastFullScan = now
+		r.lastMissScan = now
 		for inode := range scanned {
 			delete(r.negativeCache, inode)
 		}
@@ -110,6 +118,10 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 
 func (r *processResolver) fullScanDue(now time.Time) bool {
 	return r.lastFullScan.IsZero() || now.Sub(r.lastFullScan) >= r.positiveTTL
+}
+
+func (r *processResolver) missScanDue(now time.Time) bool {
+	return r.lastMissScan.IsZero() || now.Sub(r.lastMissScan) >= r.scanCooldown
 }
 
 func (r *processResolver) cachedOwnershipValid(ownedSockets map[int]map[uint64]struct{}, loaded map[int]bool, pid int, inode uint64) bool {

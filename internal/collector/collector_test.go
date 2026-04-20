@@ -373,6 +373,149 @@ func TestUpdateSnapshotCountsInitialDeltaAfterBaselineWarmup(t *testing.T) {
 	}
 }
 
+func TestNormalizeObservedFlowsDedupesDuplicateTupleByMaxCounters(t *testing.T) {
+	flows := []model.ConntrackFlow{
+		{
+			CTID:          1001,
+			Family:        "ipv4",
+			Proto:         "udp",
+			OrigSrcIP:     "10.0.0.2",
+			OrigDstIP:     "162.159.192.1",
+			OrigSrcPort:   53337,
+			OrigDstPort:   2408,
+			ReplySrcIP:    "162.159.192.1",
+			ReplyDstIP:    "10.0.0.2",
+			ReplySrcPort:  2408,
+			ReplyDstPort:  53337,
+			OrigBytes:     420,
+			ReplyBytes:    2100,
+			OrigPkts:      4,
+			ReplyPkts:     9,
+			HasAccounting: true,
+		},
+		{
+			CTID:          1002,
+			Family:        "ipv4",
+			Proto:         "udp",
+			OrigSrcIP:     "10.0.0.2",
+			OrigDstIP:     "162.159.192.1",
+			OrigSrcPort:   53337,
+			OrigDstPort:   2408,
+			ReplySrcIP:    "162.159.192.1",
+			ReplyDstIP:    "10.0.0.2",
+			ReplySrcPort:  2408,
+			ReplyDstPort:  53337,
+			OrigBytes:     419,
+			ReplyBytes:    2099,
+			OrigPkts:      4,
+			ReplyPkts:     9,
+			HasAccounting: true,
+		},
+	}
+
+	observed := normalizeObservedFlows(flows, map[string]struct{}{"10.0.0.2": {}}, socketIndex{})
+	if len(observed) != 1 {
+		t.Fatalf("expected duplicate tuple to collapse into one observed flow, got %d", len(observed))
+	}
+	if observed[0].Flow.OrigBytes != 420 || observed[0].Flow.ReplyBytes != 2100 {
+		t.Fatalf("expected strongest counters to survive normalization, got %+v", observed[0].Flow)
+	}
+	if len(observed[0].RawIDs) != 2 {
+		t.Fatalf("expected both raw conntrack IDs to be retained, got %+v", observed[0].RawIDs)
+	}
+}
+
+func TestCarryForwardSnapshotsPreventsRecountAfterTransientGap(t *testing.T) {
+	service := &Service{}
+	start := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	identity := "local|ipv4|udp|out|53337|162.159.192.1|2408|10.0.0.2"
+
+	prev := model.FlowSnapshot{
+		Proto:         "udp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     53337,
+		RemoteIP:      "162.159.192.1",
+		RemotePort:    2408,
+		StartedAt:     start,
+		BaselineOrig:  420,
+		BaselineReply: 2100,
+		LastOrig:      420,
+		LastReply:     2100,
+		BaselineOPkts: 4,
+		BaselineRPkts: 9,
+		LastOPkts:     4,
+		LastRPkts:     9,
+		Counted:       true,
+		LastSeen:      start,
+	}
+
+	carried := service.carryForwardSnapshots(map[string]model.FlowSnapshot{
+		identity: prev,
+	}, start.Add(4*time.Second))
+	snapshot, delta, _, countFlow := service.updateSnapshot(
+		start.Add(6*time.Second),
+		model.ConntrackFlow{
+			Proto:      "udp",
+			OrigBytes:  420,
+			ReplyBytes: 2100,
+			OrigPkts:   4,
+			ReplyPkts:  9,
+		},
+		classifiedFlow{
+			Proto:      "udp",
+			Direction:  model.DirectionOut,
+			LocalIP:    "10.0.0.2",
+			LocalPort:  53337,
+			RemoteIP:   "162.159.192.1",
+			RemotePort: 2408,
+		},
+		model.ProcessInfo{},
+		carried[identity],
+		true,
+		true,
+	)
+
+	if countFlow {
+		t.Fatalf("expected transient gap to preserve existing flow count state")
+	}
+	if delta == nil || !delta.isZero() {
+		t.Fatalf("expected no byte delta after transient gap, got %+v", delta)
+	}
+	if snapshot.LastOrig != 420 || snapshot.LastReply != 2100 {
+		t.Fatalf("unexpected snapshot after transient gap: %+v", snapshot)
+	}
+}
+
+func TestProcessResolverThrottlesRepeatedUnknownInodeScans(t *testing.T) {
+	base := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	current := base
+	scanCalls := 0
+
+	resolver := &processResolver{
+		now:           func() time.Time { return current },
+		positiveTTL:   30 * time.Second,
+		negativeTTL:   10 * time.Second,
+		scanCooldown:  5 * time.Second,
+		cache:         make(map[uint64]model.ProcessInfo),
+		negativeCache: make(map[uint64]time.Time),
+		scan: func(context.Context) (map[uint64]model.ProcessInfo, bool) {
+			scanCalls++
+			return map[uint64]model.ProcessInfo{}, true
+		},
+	}
+
+	resolver.Resolve(context.Background(), map[uint64]struct{}{1: {}})
+	current = base.Add(2 * time.Second)
+	resolver.Resolve(context.Background(), map[uint64]struct{}{2: {}})
+	current = base.Add(6 * time.Second)
+	resolver.Resolve(context.Background(), map[uint64]struct{}{3: {}})
+
+	if scanCalls != 2 {
+		t.Fatalf("expected unknown-inode scans to be throttled, got %d full scans", scanCalls)
+	}
+}
+
 func TestProcessHintCacheLookupAndExpiry(t *testing.T) {
 	service := &Service{processHints: make(map[string]processHint)}
 	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
@@ -490,8 +633,8 @@ func TestAddUsageMovesFlowOwnershipAcrossUsageKeys(t *testing.T) {
 		Attribution: model.AttributionExact,
 	}
 
-	service.addUsage(9001, unknownSnapshot, deltaPair{upBytes: 100}, true)
-	service.addUsage(9001, exactSnapshot, deltaPair{upBytes: 200}, false)
+	service.addUsage("flow-9001", unknownSnapshot, deltaPair{upBytes: 100}, true)
+	service.addUsage("flow-9001", exactSnapshot, deltaPair{upBytes: 200}, false)
 
 	unknownKey := model.UsageKey{
 		MinuteTS:    minute.Unix(),
@@ -549,7 +692,7 @@ func TestAddForwardUsageMovesFlowOwnershipFromUsageBucket(t *testing.T) {
 		RemotePort:  443,
 		Attribution: model.AttributionExact,
 	}
-	service.addUsage(7001, usageSnapshot, deltaPair{upBytes: 100}, true)
+	service.addUsage("flow-7001", usageSnapshot, deltaPair{upBytes: 100}, true)
 
 	forwardClassified := classifiedFlow{
 		Proto:       "tcp",
@@ -558,7 +701,7 @@ func TestAddForwardUsageMovesFlowOwnershipFromUsageBucket(t *testing.T) {
 		OrigSrcPort: 51000,
 		OrigDstPort: 443,
 	}
-	service.addForwardUsage(7001, forwardClassified, deltaPair{upBytes: 200}, false)
+	service.addForwardUsage("flow-7001", forwardClassified, deltaPair{upBytes: 200}, false)
 
 	usageKey := model.UsageKey{
 		MinuteTS:    minute.Unix(),
@@ -612,8 +755,8 @@ func TestFlushCurrentBucketsCountsFlowOnlyOnFirstObservedMinute(t *testing.T) {
 		currentMinute:  minute,
 		buckets:        make(map[model.UsageKey]*bucketState),
 		forwardBuckets: make(map[model.ForwardUsageKey]*bucketState),
-		usageFlowOwner: make(map[uint64]model.UsageKey),
-		fwdFlowOwner:   make(map[uint64]model.ForwardUsageKey),
+		usageFlowOwner: make(map[string]model.UsageKey),
+		fwdFlowOwner:   make(map[string]model.ForwardUsageKey),
 	}
 
 	snapshot := model.FlowSnapshot{
@@ -628,13 +771,13 @@ func TestFlushCurrentBucketsCountsFlowOnlyOnFirstObservedMinute(t *testing.T) {
 		Attribution: model.AttributionExact,
 	}
 
-	service.addUsage(7001, snapshot, deltaPair{upBytes: 100}, true)
+	service.addUsage("flow-7001", snapshot, deltaPair{upBytes: 100}, true)
 	if err := service.flushCurrentBuckets(ctx); err != nil {
 		t.Fatalf("flush first minute: %v", err)
 	}
 
 	service.currentMinute = minute.Add(time.Minute)
-	service.addUsage(7001, snapshot, deltaPair{upBytes: 50}, false)
+	service.addUsage("flow-7001", snapshot, deltaPair{upBytes: 50}, false)
 	if err := service.flushCurrentBuckets(ctx); err != nil {
 		t.Fatalf("flush second minute: %v", err)
 	}
@@ -678,8 +821,8 @@ func TestFlushCurrentBucketsSkipsZeroContributionRows(t *testing.T) {
 		currentMinute:  minute,
 		buckets:        make(map[model.UsageKey]*bucketState),
 		forwardBuckets: make(map[model.ForwardUsageKey]*bucketState),
-		usageFlowOwner: make(map[uint64]model.UsageKey),
-		fwdFlowOwner:   make(map[uint64]model.ForwardUsageKey),
+		usageFlowOwner: make(map[string]model.UsageKey),
+		fwdFlowOwner:   make(map[string]model.ForwardUsageKey),
 	}
 
 	usageSnapshot := model.FlowSnapshot{
@@ -693,7 +836,7 @@ func TestFlushCurrentBucketsSkipsZeroContributionRows(t *testing.T) {
 		RemotePort:  443,
 		Attribution: model.AttributionExact,
 	}
-	service.addUsage(7001, usageSnapshot, deltaPair{}, false)
+	service.addUsage("flow-7001", usageSnapshot, deltaPair{}, false)
 
 	forwardClassified := classifiedFlow{
 		Proto:       "tcp",
@@ -702,7 +845,7 @@ func TestFlushCurrentBucketsSkipsZeroContributionRows(t *testing.T) {
 		OrigSrcPort: 51000,
 		OrigDstPort: 443,
 	}
-	service.addForwardUsage(7002, forwardClassified, deltaPair{}, false)
+	service.addForwardUsage("flow-7002", forwardClassified, deltaPair{}, false)
 
 	if err := service.flushCurrentBuckets(ctx); err != nil {
 		t.Fatalf("flush zero contribution buckets: %v", err)

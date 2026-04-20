@@ -30,8 +30,10 @@ copy_release_assets() {
   cp "${ROOT_DIR}/deploy/config.example.yaml" "${RELEASE_DIR}/config.yaml"
   cp "${ROOT_DIR}/deploy/config.example.yaml" "${RELEASE_DIR}/config.example.yaml"
   cp "${ROOT_DIR}/deploy/install-centos7.sh" "${RELEASE_DIR}/install-centos7.sh"
+  cp "${ROOT_DIR}/deploy/uninstall-centos7.sh" "${RELEASE_DIR}/uninstall-centos7.sh"
   cp "${ROOT_DIR}/deploy/traffic-go.service" "${RELEASE_DIR}/traffic-go.service"
   chmod +x "${RELEASE_DIR}/install-centos7.sh"
+  chmod +x "${RELEASE_DIR}/uninstall-centos7.sh"
 }
 
 mkdir -p "${ROOT_DIR}/${RELEASE_ROOT}"

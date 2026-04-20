@@ -11,12 +11,18 @@ import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
 import { normalizeRangeKey } from '../ranges';
 import { normalizeProcessSortKey } from '../sort-keys';
-import type { ProcessGroupBy, ProcessSummaryRow, RangeKey } from '../types';
-import { clampText, displayExecutableName, executableName, formatBytes, rangeLabel, safeText } from '../utils';
+import type { ProcessSummaryRow, RangeKey } from '../types';
+import { formatBytes, rangeLabel, safeText } from '../utils';
 
 const defaultRange = '24h' satisfies RangeKey;
 const pageSize = 25;
 const columnHelper = createColumnHelper<ProcessSummaryRow>();
+
+type ProcessTableSection = 'pid' | 'comm';
+type SelectedProcessState = {
+  section: ProcessTableSection;
+  key: string;
+};
 
 function processRowKey(row: Pick<ProcessSummaryRow, 'pid' | 'comm' | 'exe'>) {
   return `${row.pid ?? 'none'}-${row.comm ?? ''}-${row.exe ?? ''}`;
@@ -43,15 +49,22 @@ function buildProcessSeriesFilters(row: ProcessSummaryRow | null) {
   return Object.keys(filters).length ? filters : undefined;
 }
 
+function findSelectedRow(rows: ProcessSummaryRow[], selected: SelectedProcessState | null, section: ProcessTableSection) {
+  if (!selected || selected.section !== section) {
+    return null;
+  }
+  return rows.find((row) => processRowKey(row) === selected.key) ?? null;
+}
+
 export function ProcessesPage() {
   const api = useApiClient();
   const [params, setParams] = useSearchParams();
   const range = normalizeRangeKey(params.get('range'), defaultRange);
-  const [page, setPage] = useState(1);
-  const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [sorting, setSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
-  const [groupBy, setGroupBy] = useState<ProcessGroupBy>(() => (range === '90d' ? 'comm' : 'pid'));
-  const effectiveGroupBy: ProcessGroupBy = range === '90d' ? 'comm' : groupBy;
+  const [pidPage, setPidPage] = useState(1);
+  const [commPage, setCommPage] = useState(1);
+  const [pidSorting, setPidSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
+  const [commSorting, setCommSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
+  const [selected, setSelected] = useState<SelectedProcessState | null>(null);
 
   const setRange = (next: RangeKey) => {
     const nextParams = new URLSearchParams(params);
@@ -59,61 +72,78 @@ export function ProcessesPage() {
     setParams(nextParams, { replace: true });
   };
 
-  const currentSort = sorting[0];
-  const query = useQuery({
-    queryKey: ['process-summaries', range, effectiveGroupBy, page, currentSort?.id, currentSort?.desc],
+  const shouldRequestPID = range !== '90d';
+  const currentPIDSort = pidSorting[0];
+  const currentCommSort = commSorting[0];
+
+  const pidQuery = useQuery({
+    queryKey: ['process-summaries', range, 'pid', pidPage, currentPIDSort?.id, currentPIDSort?.desc],
     queryFn: ({ signal }) =>
       api.getTopProcesses(range, {
-        page,
+        page: pidPage,
         pageSize,
-        groupBy: effectiveGroupBy,
-        sortBy: normalizeProcessSortKey(currentSort?.id),
-        sortOrder: currentSort?.desc ? 'desc' : 'asc',
+        groupBy: 'pid',
+        sortBy: normalizeProcessSortKey(currentPIDSort?.id),
+        sortOrder: currentPIDSort?.desc ? 'desc' : 'asc',
+      }, { signal }),
+    placeholderData: keepPreviousData,
+    enabled: shouldRequestPID,
+  });
+
+  const commQuery = useQuery({
+    queryKey: ['process-summaries', range, 'comm', commPage, currentCommSort?.id, currentCommSort?.desc],
+    queryFn: ({ signal }) =>
+      api.getTopProcesses(range, {
+        page: commPage,
+        pageSize,
+        groupBy: 'comm',
+        sortBy: normalizeProcessSortKey(currentCommSort?.id),
+        sortOrder: currentCommSort?.desc ? 'desc' : 'asc',
       }, { signal }),
     placeholderData: keepPreviousData,
   });
 
-  const rows = query.data?.rows ?? [];
-  const showPIDColumn = effectiveGroupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
-  const showExeColumn = effectiveGroupBy === 'pid' && query.data?.dataSource !== 'usage_1h';
+  const activeDataSource = pidQuery.data?.dataSource ?? commQuery.data?.dataSource;
+  const pidDimensionUnavailable =
+    range === '90d' ||
+    pidQuery.data?.dataSource === 'usage_1h' ||
+    commQuery.data?.dataSource === 'usage_1h';
+
+  const pidRows = pidDimensionUnavailable ? [] : (pidQuery.data?.rows ?? []);
+  const commRows = commQuery.data?.rows ?? [];
 
   useEffect(() => {
-    setPage(1);
-  }, [range, effectiveGroupBy, sorting]);
+    setPidPage(1);
+  }, [range, pidSorting]);
 
   useEffect(() => {
-    if (query.data?.dataSource !== 'usage_1h') return;
-    if (groupBy === 'comm') return;
-    setGroupBy('comm');
-  }, [query.data?.dataSource, groupBy]);
+    setCommPage(1);
+  }, [range, commSorting]);
+
+  const selectedPIDRow = useMemo(() => findSelectedRow(pidRows, selected, 'pid'), [pidRows, selected]);
+  const selectedCommRow = useMemo(() => findSelectedRow(commRows, selected, 'comm'), [commRows, selected]);
+  const selectedProcess = selectedPIDRow ?? selectedCommRow;
 
   useEffect(() => {
-    if (!showPIDColumn && sorting[0]?.id === 'pid') {
-      setSorting([{ id: 'totalBytes', desc: true }]);
-    }
-  }, [showPIDColumn, sorting]);
-
-  const selectedProcess = useMemo(
-    () => rows.find((row) => processRowKey(row) === selectedKey) ?? null,
-    [rows, selectedKey],
-  );
-
-  useEffect(() => {
-    if (!rows.length) {
-      setSelectedKey(null);
+    if (selectedPIDRow || selectedCommRow) {
       return;
     }
-    // Keep the table highlight and the chart target on the same source of truth.
-    if (!selectedKey || !rows.some((row) => processRowKey(row) === selectedKey)) {
-      setSelectedKey(processRowKey(rows[0]));
+    if (pidRows.length) {
+      setSelected({ section: 'pid', key: processRowKey(pidRows[0]) });
+      return;
     }
-  }, [rows, selectedKey]);
+    if (commRows.length) {
+      setSelected({ section: 'comm', key: processRowKey(commRows[0]) });
+      return;
+    }
+    setSelected(null);
+  }, [commRows, pidRows, selectedCommRow, selectedPIDRow]);
 
   const selectedSeriesFilters = useMemo(() => buildProcessSeriesFilters(selectedProcess), [selectedProcess]);
   const canQuerySeries = Boolean(selectedSeriesFilters);
 
   const series = useQuery({
-    queryKey: ['process-series', range, selectedProcess ? processRowKey(selectedProcess) : null],
+    queryKey: ['process-series', range, selected?.section ?? null, selectedProcess ? processRowKey(selectedProcess) : null],
     queryFn: ({ signal }) => {
       if (!selectedSeriesFilters) {
         throw new Error('missing process series filters');
@@ -123,7 +153,7 @@ export function ProcessesPage() {
     enabled: canQuerySeries,
   });
 
-  const columns = useMemo(
+  const pidColumns = useMemo(
     () => [
       columnHelper.accessor('comm', {
         id: 'comm',
@@ -131,32 +161,13 @@ export function ProcessesPage() {
         meta: { className: 'col-process', nowrap: true },
         cell: (info) => safeText(info.getValue()),
       }),
-      ...(showPIDColumn
-        ? [
-            columnHelper.accessor('pid', {
-              id: 'pid',
-              header: 'PID',
-              enableSorting: true,
-              meta: { className: 'col-pid', nowrap: true },
-              cell: (info) => info.getValue() ?? '未知',
-            }),
-          ]
-        : []),
-      ...(showExeColumn
-        ? [
-            columnHelper.accessor('exe', {
-              id: 'exe',
-              header: 'EXE',
-              enableSorting: false,
-              meta: { className: 'col-exe', nowrap: true },
-              cell: (info) => {
-                const raw = info.getValue();
-                const cmd = executableName(raw);
-                return <span title={cmd ?? undefined}>{clampText(displayExecutableName(raw), 36)}</span>;
-              },
-            }),
-          ]
-        : []),
+      columnHelper.accessor('pid', {
+        id: 'pid',
+        header: 'PID',
+        enableSorting: true,
+        meta: { className: 'col-pid', nowrap: true },
+        cell: (info) => info.getValue() ?? '未知',
+      }),
       columnHelper.accessor('bytesUp', {
         id: 'bytesUp',
         header: '上行',
@@ -176,12 +187,48 @@ export function ProcessesPage() {
         cell: (info) => formatBytes(info.getValue()),
       }),
     ],
-    [showExeColumn, showPIDColumn],
+    [],
   );
 
-  const processesTableClassName = showPIDColumn
-    ? 'processes-table processes-table-pid table-dense'
-    : 'processes-table processes-table-comm table-dense';
+  const commColumns = useMemo(
+    () => [
+      columnHelper.accessor('comm', {
+        id: 'comm',
+        header: '进程',
+        meta: { className: 'col-process', nowrap: true },
+        cell: (info) => safeText(info.getValue()),
+      }),
+      columnHelper.accessor('bytesUp', {
+        id: 'bytesUp',
+        header: '上行',
+        meta: { className: 'col-bytes', align: 'right', nowrap: true },
+        cell: (info) => formatBytes(info.getValue()),
+      }),
+      columnHelper.accessor('bytesDown', {
+        id: 'bytesDown',
+        header: '下行',
+        meta: { className: 'col-bytes', align: 'right', nowrap: true },
+        cell: (info) => formatBytes(info.getValue()),
+      }),
+      columnHelper.accessor('totalBytes', {
+        id: 'totalBytes',
+        header: '总流量',
+        meta: { className: 'col-bytes col-bytes-total', align: 'right', nowrap: true },
+        cell: (info) => formatBytes(info.getValue()),
+      }),
+    ],
+    [],
+  );
+
+  const initialLoading =
+    !commQuery.data &&
+    commQuery.isPending &&
+    (!shouldRequestPID || !pidQuery.data || pidQuery.isPending);
+
+  const initialError =
+    !commRows.length &&
+    commQuery.isError &&
+    (pidDimensionUnavailable || !pidRows.length);
 
   return (
     <div className="page">
@@ -190,64 +237,111 @@ export function ProcessesPage() {
           <p className="eyebrow">Processes</p>
           <h2>进程聚合</h2>
           <p>
-            该页面用于回答“是谁在消耗带宽”：可按 PID 或按进程名聚合比较流量占比，点击任意行会在下方展示该进程的时间趋势，
-            便于区分持续高占用与短时突发。
+            该页面用于回答“是谁在消耗带宽”：上方先看按 PID 聚合，定位到具体进程实例；下方再看按进程名聚合，
+            用于观察同名进程合并后的总体占比。点击任意行会在下方展示对应趋势。
           </p>
           <section className="status-row">
             <div className="status-pill">
               <strong>时间范围</strong>
               <span>{rangeLabel(range)}</span>
             </div>
-            {query.data ? <DataSourceBadge dataSource={query.data.dataSource} /> : null}
+            {activeDataSource ? <DataSourceBadge dataSource={activeDataSource} /> : null}
           </section>
         </div>
         <RangeSelect value={range} onChange={setRange} />
       </header>
 
-      {query.data?.dataSource !== 'usage_1h' && range !== '90d' && (
-        <section className="segmented-control" aria-label="聚合方式">
-          <button type="button" className={groupBy === 'pid' ? 'chip active' : 'chip'} onClick={() => setGroupBy('pid')}>
-            按 PID 聚合
-          </button>
-          <button type="button" className={groupBy === 'comm' ? 'chip active' : 'chip'} onClick={() => setGroupBy('comm')}>
-            按进程名聚合
-          </button>
+      {initialError ? (
+        <QueryErrorState error={commQuery.error ?? pidQuery.error} title="进程聚合加载失败" />
+      ) : initialLoading ? (
+        <EmptyState title="进程聚合加载中" description="正在获取当前时间范围内的进程聚合结果。" />
+      ) : (
+        <section className="processes-sections">
+          <section className="processes-section">
+            <div className="processes-section-head">
+              <div>
+                <h3>按 PID 聚合</h3>
+                <p>区分同名进程的不同实例，更适合排查到底是哪个 PID 在消耗带宽。</p>
+              </div>
+            </div>
+            {pidQuery.isError && pidRows.length ? (
+              <QueryErrorState error={pidQuery.error} title="按 PID 聚合刷新失败，当前展示旧结果" compact />
+            ) : null}
+            {pidDimensionUnavailable ? (
+              <EmptyState
+                title="当前窗口不提供 PID 维度"
+                description="当前时间范围已回退到小时聚合历史；这里不再展示 PID 粒度，只保留下方的按进程名聚合结果。"
+              />
+            ) : pidQuery.isError && !pidRows.length ? (
+              <QueryErrorState error={pidQuery.error} title="按 PID 聚合加载失败" />
+            ) : pidQuery.isPending && !pidQuery.data ? (
+              <EmptyState title="按 PID 聚合加载中" description="正在获取进程实例级别的聚合结果。" />
+            ) : pidRows.length ? (
+              <DataTable
+                columns={pidColumns}
+                data={pidRows}
+                cardClassName="table-card-auto"
+                tableClassName="processes-table processes-table-pid table-dense"
+                sorting={pidSorting}
+                onSortingChange={setPidSorting}
+                manualSorting
+                onRowClick={(row) => setSelected({ section: 'pid', key: processRowKey(row) })}
+                isRowSelected={(row) => selected?.section === 'pid' && selected.key === processRowKey(row)}
+                pagination={{
+                  page: pidQuery.data?.page ?? 1,
+                  pageSize: pidQuery.data?.pageSize ?? pageSize,
+                  totalRows: pidQuery.data?.totalRows ?? 0,
+                  onPageChange: setPidPage,
+                }}
+                emptyText="当前时间范围没有按 PID 聚合结果。"
+              />
+            ) : (
+              <EmptyState title="暂无按 PID 聚合结果" description="当前时间范围没有可以展示的进程实例流量。" />
+            )}
+          </section>
+
+          <section className="processes-section">
+            <div className="processes-section-head">
+              <div>
+                <h3>按进程名聚合</h3>
+                <p>把同名 PID 合并后看整体流量占比，适合快速判断某类服务的总消耗。</p>
+              </div>
+            </div>
+            {commQuery.isError && commRows.length ? (
+              <QueryErrorState error={commQuery.error} title="按进程名聚合刷新失败，当前展示旧结果" compact />
+            ) : null}
+            {commQuery.isError && !commRows.length ? (
+              <QueryErrorState error={commQuery.error} title="按进程名聚合加载失败" />
+            ) : commQuery.isPending && !commQuery.data ? (
+              <EmptyState title="按进程名聚合加载中" description="正在获取进程名级别的聚合结果。" />
+            ) : commRows.length ? (
+              <DataTable
+                columns={commColumns}
+                data={commRows}
+                cardClassName="table-card-auto"
+                tableClassName="processes-table processes-table-comm table-dense"
+                sorting={commSorting}
+                onSortingChange={setCommSorting}
+                manualSorting
+                onRowClick={(row) => setSelected({ section: 'comm', key: processRowKey(row) })}
+                isRowSelected={(row) => selected?.section === 'comm' && selected.key === processRowKey(row)}
+                pagination={{
+                  page: commQuery.data?.page ?? 1,
+                  pageSize: commQuery.data?.pageSize ?? pageSize,
+                  totalRows: commQuery.data?.totalRows ?? 0,
+                  onPageChange: setCommPage,
+                }}
+                emptyText="当前时间范围没有按进程名聚合结果。"
+              />
+            ) : (
+              <EmptyState title="暂无按进程名聚合结果" description="当前时间范围没有可以展示的进程名流量。" />
+            )}
+          </section>
         </section>
       )}
 
-      {query.isError && rows.length ? (
-        <QueryErrorState error={query.error} title="进程聚合刷新失败，当前展示旧结果" compact />
-      ) : null}
-
-      {query.isError && !rows.length ? (
-        <QueryErrorState error={query.error} title="进程聚合加载失败" />
-      ) : query.isPending && !query.data ? (
-        <EmptyState title="进程聚合加载中" description="正在获取当前时间范围内的进程聚合结果。" />
-      ) : rows.length ? (
-        <DataTable
-          columns={columns}
-          data={rows}
-          cardClassName="table-card-auto"
-          tableClassName={processesTableClassName}
-          sorting={sorting}
-          onSortingChange={setSorting}
-          manualSorting
-          onRowClick={(row) => setSelectedKey(processRowKey(row))}
-          isRowSelected={(row) => processRowKey(row) === selectedKey}
-          pagination={{
-            page: query.data?.page ?? 1,
-            pageSize: query.data?.pageSize ?? pageSize,
-            totalRows: query.data?.totalRows ?? 0,
-            onPageChange: setPage,
-          }}
-          emptyText="当前时间范围没有进程聚合结果。"
-        />
-      ) : (
-        <EmptyState title="暂无进程聚合" description="当前时间范围没有可以展示的进程流量。" />
-      )}
-
       {selectedProcess && !canQuerySeries ? (
-        <EmptyState title="无法绘制趋势" description="这条小时聚合记录缺少稳定进程名，无法定位到单个进程趋势。" />
+        <EmptyState title="无法绘制趋势" description="这条记录缺少稳定进程标识，无法定位到单个进程趋势。" />
       ) : selectedProcess && series.isError ? (
         <QueryErrorState error={series.error} title="进程趋势加载失败" />
       ) : selectedProcess && series.data ? (
@@ -255,7 +349,13 @@ export function ProcessesPage() {
           points={series.data.points}
           range={range}
           title={`流量趋势 · ${safeText(selectedProcess.comm)}`}
-          subtitle={selectedProcess.pid !== null ? `PID ${selectedProcess.pid} · ${displayExecutableName(selectedProcess.exe)}` : '当前窗口已降级为按进程名聚合'}
+          subtitle={
+            selected?.section === 'pid'
+              ? `按 PID 聚合 · PID ${selectedProcess.pid ?? '未知'}`
+              : activeDataSource === 'usage_1h'
+                ? '当前窗口已降级为按进程名聚合'
+                : '按进程名聚合'
+          }
         />
       ) : selectedProcess && canQuerySeries ? (
         <EmptyState title="趋势加载中" description="正在获取该进程的时间趋势。" />

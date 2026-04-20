@@ -44,6 +44,32 @@ describe("traffic-go web ui", () => {
     expect(await screen.findByText("Top 进程")).toBeInTheDocument();
   });
 
+  it("queries dashboard top processes by pid and shows pid/exe in minute windows", async () => {
+    const base = createMockApiClient();
+    const topProcessCalls: ProcessGroupBy[] = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getTopProcesses(range, options, requestOptions) {
+        topProcessCalls.push(options?.groupBy ?? 'pid');
+        return base.getTopProcesses(range, options, requestOptions);
+      },
+    };
+
+    renderWithProviders("/", <DashboardPage />, client);
+
+    expect(await screen.findByText("PID 1088")).toBeInTheDocument();
+    expect(await screen.findAllByText("ss-server")).not.toHaveLength(0);
+    expect(screen.queryByText("未归因 / EXE 不可用")).not.toBeInTheDocument();
+    expect(topProcessCalls).toContain("pid");
+  });
+
+  it("keeps dashboard top processes in comm fallback when the window is hourly", async () => {
+    renderWithProviders("/?range=90d", <DashboardPage />);
+
+    expect((await screen.findAllByText("当前窗口已降级为按进程名聚合")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("小时聚合 / EXE 在此视图不展示").length).toBeGreaterThan(0);
+  });
+
   it("keeps dashboard drill-down links on the current range", async () => {
     renderWithProviders("/?range=90d", <DashboardPage />);
     expect(await screen.findByText("流量总览")).toBeInTheDocument();
@@ -269,6 +295,9 @@ describe("traffic-go web ui", () => {
   it("renders the processes investigation page", async () => {
     renderWithProviders("/processes", <ProcessesPage />);
     expect(await screen.findByText("进程聚合")).toBeInTheDocument();
+    expect(await screen.findByText("按 PID 聚合")).toBeInTheDocument();
+    expect(await screen.findByText("按进程名聚合")).toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "EXE" })).not.toBeInTheDocument();
   });
 
   it("does not issue a redundant pid-group request on the initial 90d processes load", async () => {
@@ -285,7 +314,7 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/processes?range=90d", <ProcessesPage />, client);
     expect(await screen.findByText("进程聚合")).toBeInTheDocument();
     expect(await screen.findByText("ss-server")).toBeInTheDocument();
-    expect(screen.queryByText("按 PID 聚合")).not.toBeInTheDocument();
+    expect(screen.getByText("当前窗口不提供 PID 维度")).toBeInTheDocument();
     await waitFor(() => {
       expect(processCalls).toEqual(["comm"]);
     });
