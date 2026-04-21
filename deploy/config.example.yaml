@@ -33,6 +33,11 @@ process_log_dirs:
 # nginx_log_dir: /var/log/nginx
 # ss_log_dir: /var/log/shadowsocks
 
+# Keep this true on hosts where Shadowsocks only logs to systemd journal.
+# Set false once rsyslog or the service itself already writes usable files
+# under /var/log/shadowsocks, to avoid duplicate fallback scans.
+shadowsocks_journal_fallback: true
+
 retention:
   flows_days: 30
   hourly_days: 180

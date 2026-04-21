@@ -44,19 +44,25 @@ type Config struct {
 	NginxLogDir    string            `yaml:"nginx_log_dir"`
 	SSLogDir       string            `yaml:"ss_log_dir"`
 	ProcessLogDirs map[string]string `yaml:"process_log_dirs"`
-	MockData       bool              `yaml:"mock_data"`
-	LogLevel       string            `yaml:"log_level"`
-	Retention      Retention         `yaml:"retention"`
-	Prefetch       Prefetch          `yaml:"prefetch"`
+	// Keep systemd journal fallback enabled by default for hosts where
+	// shadowsocks still logs only to journald. Set false once rsyslog or the
+	// service itself writes usable files under process_log_dirs.
+	ShadowsocksJournalFallback *bool     `yaml:"shadowsocks_journal_fallback"`
+	MockData                   bool      `yaml:"mock_data"`
+	LogLevel                   string    `yaml:"log_level"`
+	Retention                  Retention `yaml:"retention"`
+	Prefetch                   Prefetch  `yaml:"prefetch"`
 }
 
 func Default() Config {
+	enableShadowsocksJournalFallback := true
 	return Config{
-		Listen:       defaultListen,
-		DBPath:       defaultDBPath,
-		TickInterval: defaultTickInterval,
-		ProcFS:       defaultProcFS,
-		LogLevel:     "info",
+		Listen:                     defaultListen,
+		DBPath:                     defaultDBPath,
+		TickInterval:               defaultTickInterval,
+		ProcFS:                     defaultProcFS,
+		ShadowsocksJournalFallback: &enableShadowsocksJournalFallback,
+		LogLevel:                   "info",
 		Retention: Retention{
 			MinuteDays: 30,
 			HourlyDays: 180,
@@ -117,6 +123,10 @@ func withDerivedDefaults(cfg Config) Config {
 		cfg.ConntrackPath = filepath.Join(cfg.ProcFS, "net", "nf_conntrack")
 	}
 	cfg.ProcessLogDirs = withConfiguredProcessLogDirs(cfg.ProcessLogDirs, cfg.NginxLogDir, cfg.SSLogDir)
+	if cfg.ShadowsocksJournalFallback == nil {
+		enableShadowsocksJournalFallback := true
+		cfg.ShadowsocksJournalFallback = &enableShadowsocksJournalFallback
+	}
 	if cfg.Retention.MinuteDays <= 0 {
 		cfg.Retention.MinuteDays = 30
 	}

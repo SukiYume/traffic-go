@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -235,4 +236,91 @@ func TestRunAggregationReplaysDirtyBackfilledChainHours(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected one replayable hourly chain row, got %+v", rows)
 	}
+}
+
+func TestRunWaitsForCollectorShutdownBeforeReturning(t *testing.T) {
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
+	cfg.Listen = "127.0.0.1:0"
+
+	application, err := New(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = application.Close()
+	})
+
+	collector := &blockingCollector{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		returned: make(chan struct{}),
+	}
+	application.collector = collector
+	application.apiServer = api.NewServer(application.store, collector, log.New(io.Discard, "", 0), nil, nil, true)
+	application.server = &http.Server{
+		Addr:    cfg.Listen,
+		Handler: http.NewServeMux(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- application.Run(ctx)
+	}()
+
+	select {
+	case <-collector.started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("collector did not start")
+	}
+
+	cancel()
+
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run returned before collector finished shutdown: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(collector.release)
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Run did not wait for collector shutdown")
+	}
+
+	select {
+	case <-collector.returned:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("collector did not finish shutdown")
+	}
+}
+
+type blockingCollector struct {
+	started  chan struct{}
+	release  chan struct{}
+	returned chan struct{}
+}
+
+func (c *blockingCollector) Start(ctx context.Context) error {
+	close(c.started)
+	<-ctx.Done()
+	<-c.release
+	close(c.returned)
+	return nil
+}
+
+func (c *blockingCollector) ActiveProcesses() []model.ProcessListItem {
+	return nil
+}
+
+func (c *blockingCollector) ActiveStats() model.ActiveStats {
+	return model.ActiveStats{}
 }

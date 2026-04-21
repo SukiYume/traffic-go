@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"io/fs"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"traffic-go/internal/model"
 	"traffic-go/internal/store"
@@ -15,21 +17,34 @@ type runtimeProvider interface {
 	ActiveStats() model.ActiveStats
 }
 
+type shadowsocksJournalReader func(context.Context, time.Time, time.Time) ([]string, error)
+
 type Server struct {
-	store          *store.Store
-	runtime        runtimeProvider
-	logger         *log.Logger
-	static         fs.FS
-	processLogDirs map[string]string
+	store                   *store.Store
+	runtime                 runtimeProvider
+	logger                  *log.Logger
+	static                  fs.FS
+	processLogDirs          map[string]string
+	enableSSJournalFallback bool
+	readShadowsocksJournal  shadowsocksJournalReader
 }
 
-func NewServer(trafficStore *store.Store, runtime runtimeProvider, logger *log.Logger, static fs.FS, processLogDirs map[string]string) *Server {
+func NewServer(
+	trafficStore *store.Store,
+	runtime runtimeProvider,
+	logger *log.Logger,
+	static fs.FS,
+	processLogDirs map[string]string,
+	enableSSJournalFallback bool,
+) *Server {
 	return &Server{
-		store:          trafficStore,
-		runtime:        runtime,
-		logger:         logger,
-		static:         static,
-		processLogDirs: cloneStringMap(processLogDirs),
+		store:                   trafficStore,
+		runtime:                 runtime,
+		logger:                  logger,
+		static:                  static,
+		processLogDirs:          cloneStringMap(processLogDirs),
+		enableSSJournalFallback: enableSSJournalFallback,
+		readShadowsocksJournal:  defaultShadowsocksJournalReader,
 	}
 }
 

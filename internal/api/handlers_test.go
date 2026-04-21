@@ -64,7 +64,7 @@ func newTestServer(t *testing.T) *Server {
 			{PID: 42, Comm: "ss-server", Exe: "/usr/bin/ss-server"},
 		},
 		stats: model.ActiveStats{Connections: 3, Processes: 1},
-	}, nil, embed.StaticFS(), cfg.ProcessLogDirs)
+	}, nil, embed.StaticFS(), cfg.ProcessLogDirs, true)
 }
 
 func setProcessLogDir(server *Server, processKey string, dir string) {
@@ -659,6 +659,280 @@ func TestRunBackgroundPrefetchDedupesEquivalentUsageQueries(t *testing.T) {
 	}
 }
 
+func TestRunBackgroundPrefetchLimitsUsageReplayWindow(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	logDir := t.TempDir()
+	setProcessLogDir(server, "ss-server", logDir)
+
+	now := time.Date(2026, 4, 18, 12, 10, 30, 0, time.UTC)
+	oldMinute := now.Add(-backgroundPrefetchReplayWindow).Add(-time.Minute).Truncate(time.Minute)
+	recentMinute := now.Add(-time.Minute).Truncate(time.Minute)
+	logLines := []string{
+		fmt.Sprintf("%s /usr/bin/ss-server[27896]: [12096] connect to stale.example.com:443", oldMinute.Add(10*time.Second).Format(time.RFC3339)),
+		fmt.Sprintf("%s /usr/bin/ss-server[27896]: [12096] connect to chatgpt.com:443", recentMinute.Add(10*time.Second).Format(time.RFC3339)),
+	}
+	if err := os.WriteFile(filepath.Join(logDir, "ss-server.log"), []byte(strings.Join(logLines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write ss log: %v", err)
+	}
+
+	pid := 1088
+	if err := server.store.FlushMinute(ctx, oldMinute.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    oldMinute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         pid,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "203.0.113.10",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 4096,
+			PktsUp:    4,
+			PktsDown:  8,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed old usage row: %v", err)
+	}
+	if err := server.store.FlushMinute(ctx, recentMinute.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    recentMinute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         pid,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "104.26.8.78",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   2048,
+			BytesDown: 8192,
+			PktsUp:    8,
+			PktsDown:  11,
+			FlowCount: 2,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed recent usage row: %v", err)
+	}
+
+	summary := server.RunBackgroundPrefetch(ctx, BackgroundPrefetchOptions{
+		Enabled:             true,
+		Now:                 now,
+		EvidenceLookback:    20 * time.Minute,
+		ChainLookback:       20 * time.Minute,
+		ScanBudget:          2 * time.Second,
+		MaxScanFiles:        4,
+		MaxScanLinesPerFile: 1000,
+	})
+	if summary.UsageRows != 1 {
+		t.Fatalf("expected replay window to prefetch only the newest usage row, got %+v", summary)
+	}
+
+	recentChains, err := server.store.QueryUsageChainsForProcess(ctx, recentMinute.Unix(), &pid, "ss-server", "/usr/bin/ss-server", store.DataSourceMinuteChain)
+	if err != nil {
+		t.Fatalf("query recent chains: %v", err)
+	}
+	if len(recentChains) == 0 {
+		t.Fatalf("expected recent usage row to be prefetched into chains")
+	}
+
+	oldChains, err := server.store.QueryUsageChainsForProcess(ctx, oldMinute.Unix(), &pid, "ss-server", "/usr/bin/ss-server", store.DataSourceMinuteChain)
+	if err != nil {
+		t.Fatalf("query old chains: %v", err)
+	}
+	if len(oldChains) != 0 {
+		t.Fatalf("expected old usage row outside replay window to be skipped, got %+v", oldChains)
+	}
+}
+
+func TestRunBackgroundPrefetchFallsBackToShadowsocksJournal(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	setProcessLogDir(server, "ss-server", t.TempDir())
+	server.readShadowsocksJournal = func(context.Context, time.Time, time.Time) ([]string, error) {
+		return []string{
+			"2026-04-18T20:08:10+08:00 /usr/bin/ss-server[27896]: [12096] connect to chatgpt.com:443",
+			"2026-04-18T20:08:09+08:00 /usr/bin/ss-server[27896]: [12096] [udp] cache miss: chatgpt.com:443 <-> 203.0.113.24:52144",
+		}, nil
+	}
+
+	minuteTime := time.Date(2026, 4, 18, 12, 8, 0, 0, time.UTC)
+	minute := minuteTime.Unix()
+	pid := 1088
+	if err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         pid,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "104.26.8.78",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   2048,
+			BytesDown: 8192,
+			PktsUp:    8,
+			PktsDown:  11,
+			FlowCount: 2,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed ss usage row: %v", err)
+	}
+
+	summary := server.RunBackgroundPrefetch(ctx, BackgroundPrefetchOptions{
+		Enabled:             true,
+		Now:                 minuteTime.Add(30 * time.Second),
+		EvidenceLookback:    20 * time.Minute,
+		ChainLookback:       20 * time.Minute,
+		ScanBudget:          2 * time.Second,
+		MaxScanFiles:        4,
+		MaxScanLinesPerFile: 1000,
+	})
+	if summary.EvidenceRows == 0 {
+		t.Fatalf("expected journal fallback to import evidence rows, got %+v", summary)
+	}
+	if summary.ChainRows == 0 {
+		t.Fatalf("expected journal fallback to hydrate chains, got %+v", summary)
+	}
+
+	evidenceRows, err := server.store.QueryLogEvidence(ctx, store.LogEvidenceQuery{
+		Source:         evidenceSourceSS,
+		StartTS:        minute - 120,
+		EndTS:          minute + 120,
+		HostNormalized: "chatgpt.com",
+		TargetPort:     443,
+		Limit:          10,
+	})
+	if err != nil {
+		t.Fatalf("query prefetched journal evidence: %v", err)
+	}
+	if len(evidenceRows) == 0 {
+		t.Fatalf("expected prefetched journal evidence rows")
+	}
+}
+
+func TestLookupShadowsocksJournalEvidenceByEntryPortsBatchesStrictRead(t *testing.T) {
+	server := newTestServer(t)
+	journalCalls := 0
+	server.readShadowsocksJournal = func(context.Context, time.Time, time.Time) ([]string, error) {
+		journalCalls++
+		return []string{
+			`2026-04-16T01:00:18+08:00 /usr/bin/ss-server[27896]: [12096] [udp] cache miss: chatgpt.com:443 <-> 74.7.227.153:52144`,
+			`2026-04-16T01:00:19+08:00 /usr/bin/ss-server[27896]: [12097] [udp] cache miss: openai.com:443 <-> 74.7.227.154:52145`,
+		}, nil
+	}
+
+	cst := time.FixedZone("CST", 8*3600)
+	bucketTS := time.Date(2026, 4, 16, 1, 0, 0, 0, cst).Unix()
+	rowsByPort, notes, err := server.lookupShadowsocksJournalEvidenceByEntryPorts(context.Background(), bucketTS, []int{12096, 12097}, maxRelatedPeers*4)
+	if err != nil {
+		t.Fatalf("lookup batched shadowsocks journal evidence: %v", err)
+	}
+	if journalCalls != 1 {
+		t.Fatalf("expected a single strict journal read for multiple ports, got %d", journalCalls)
+	}
+	if len(rowsByPort[12096]) == 0 || len(rowsByPort[12097]) == 0 {
+		t.Fatalf("expected both entry ports to be hydrated, got %+v", rowsByPort)
+	}
+	notesText := strings.Join(notes, "\n")
+	if !strings.Contains(notesText, "systemd journal") {
+		t.Fatalf("expected journal fallback note, got %s", notesText)
+	}
+}
+
+func TestLookupShadowsocksJournalEvidenceByEntryPortsFallsBackForRemainingPorts(t *testing.T) {
+	server := newTestServer(t)
+	journalCalls := 0
+	server.readShadowsocksJournal = func(context.Context, time.Time, time.Time) ([]string, error) {
+		journalCalls++
+		switch journalCalls {
+		case 1:
+			return []string{
+				`2026-04-16T01:00:18+08:00 /usr/bin/ss-server[27896]: [12096] [udp] cache miss: chatgpt.com:443 <-> 74.7.227.153:52144`,
+			}, nil
+		case 2:
+			return []string{
+				`2026-04-16T01:12:18+08:00 /usr/bin/ss-server[27896]: [12097] [udp] cache miss: openai.com:443 <-> 74.7.227.154:52145`,
+			}, nil
+		default:
+			return nil, nil
+		}
+	}
+
+	cst := time.FixedZone("CST", 8*3600)
+	bucketTS := time.Date(2026, 4, 16, 1, 0, 0, 0, cst).Unix()
+	rowsByPort, notes, err := server.lookupShadowsocksJournalEvidenceByEntryPorts(context.Background(), bucketTS, []int{12096, 12097}, maxRelatedPeers*4)
+	if err != nil {
+		t.Fatalf("lookup batched shadowsocks journal evidence with fallback: %v", err)
+	}
+	if journalCalls != 2 {
+		t.Fatalf("expected strict and fallback journal reads, got %d", journalCalls)
+	}
+	if len(rowsByPort[12096]) == 0 || len(rowsByPort[12097]) == 0 {
+		t.Fatalf("expected strict+fallback rows for both ports, got %+v", rowsByPort)
+	}
+	notesText := strings.Join(notes, "\n")
+	if !strings.Contains(notesText, "±15 分钟窗口") {
+		t.Fatalf("expected fallback window note, got %s", notesText)
+	}
+}
+
+func TestQueryUsageRowsForPrefetchCapsCandidateScan(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	start := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 5; i++ {
+		minute := start.Add(time.Duration(i) * time.Minute)
+		if err := server.store.FlushMinute(ctx, minute.Unix(), map[model.UsageKey]model.UsageDelta{
+			{
+				MinuteTS:    minute.Unix(),
+				Proto:       "tcp",
+				Direction:   model.DirectionOut,
+				PID:         1000 + i,
+				Comm:        "ss-server",
+				Exe:         "/usr/bin/ss-server",
+				LocalPort:   40000 + i,
+				RemoteIP:    fmt.Sprintf("203.0.113.%d", 10+i),
+				RemotePort:  443,
+				Attribution: model.AttributionExact,
+			}: {
+				BytesUp:   int64(1024 + i),
+				BytesDown: int64(2048 + i),
+				PktsUp:    2,
+				PktsDown:  4,
+				FlowCount: 1,
+			},
+		}, nil); err != nil {
+			t.Fatalf("seed usage row %d: %v", i, err)
+		}
+	}
+
+	rows, truncated, err := server.queryUsageRowsForPrefetch(ctx, start.Add(-time.Minute), start.Add(6*time.Minute), 3)
+	if err != nil {
+		t.Fatalf("query prefetch rows: %v", err)
+	}
+	if !truncated {
+		t.Fatalf("expected candidate scan to report truncation")
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected prefetch row cap to stop at 3 rows, got %d", len(rows))
+	}
+	if rows[0].TimeBucket <= rows[1].TimeBucket || rows[1].TimeBucket <= rows[2].TimeBucket {
+		t.Fatalf("expected rows ordered from newest to oldest, got %+v", rows)
+	}
+}
+
 func TestProcessesAndOverviewUseRuntimeView(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
@@ -1046,6 +1320,129 @@ func TestUsageExplainReadsShadowsocksLogEvidence(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, `SS 日志命中`) {
 		t.Fatalf("expected ss hit note in body: %s", bodyText)
+	}
+}
+
+func TestUsageExplainFallsBackToShadowsocksJournal(t *testing.T) {
+	server := newTestServer(t)
+	ssLogDir := t.TempDir()
+	setProcessLogDir(server, "ss-server", ssLogDir)
+	server.readShadowsocksJournal = func(context.Context, time.Time, time.Time) ([]string, error) {
+		return []string{
+			`2026-04-16T01:00:18+08:00 /usr/bin/ss-server[27896]: [12096] [udp] cache miss: chatgpt.com:443 <-> 74.7.227.153:52144`,
+			`2026-04-16T01:00:20+08:00 /usr/bin/ss-server[27896]: [12096] connect to chatgpt.com:443`,
+		}, nil
+	}
+
+	cst := time.FixedZone("CST", 8*3600)
+	minute := time.Date(2026, 4, 16, 1, 0, 0, 0, cst).Unix()
+
+	err := server.store.FlushMinute(context.Background(), minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "104.26.8.78",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   50,
+			BytesDown: 80,
+			PktsUp:    1,
+			PktsDown:  1,
+			FlowCount: 1,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("seed ss usage row: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=104.26.8.78&remote_port=443&scan=1", minute),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"source_ips":["74.7.227.153"]`) {
+		t.Fatalf("expected source ip from journal fallback in body: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `systemd journal`) {
+		t.Fatalf("expected systemd journal fallback note in body: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"target_host":"chatgpt.com"`) {
+		t.Fatalf("expected target host from journal fallback in body: %s", bodyText)
+	}
+}
+
+func TestUsageExplainSkipsShadowsocksJournalWhenFallbackDisabled(t *testing.T) {
+	server := newTestServer(t)
+	server.enableSSJournalFallback = false
+	ssLogDir := t.TempDir()
+	setProcessLogDir(server, "ss-server", ssLogDir)
+
+	journalCalls := 0
+	server.readShadowsocksJournal = func(context.Context, time.Time, time.Time) ([]string, error) {
+		journalCalls++
+		return []string{
+			`2026-04-16T01:00:20+08:00 /usr/bin/ss-server[27896]: [12096] connect to chatgpt.com:443`,
+		}, nil
+	}
+
+	cst := time.FixedZone("CST", 8*3600)
+	minute := time.Date(2026, 4, 16, 1, 0, 0, 0, cst).Unix()
+	err := server.store.FlushMinute(context.Background(), minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "104.26.8.78",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   50,
+			BytesDown: 80,
+			PktsUp:    1,
+			PktsDown:  1,
+			FlowCount: 1,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("seed ss usage row: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=104.26.8.78&remote_port=443&scan=1", minute),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	if journalCalls != 0 {
+		t.Fatalf("expected disabled shadowsocks journal fallback to skip journal reads, got %d", journalCalls)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if strings.Contains(bodyText, "systemd journal") {
+		t.Fatalf("expected disabled shadowsocks journal fallback to omit journal notes: %s", bodyText)
 	}
 }
 

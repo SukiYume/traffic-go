@@ -33,6 +33,9 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if len(cfg.ProcessLogDirs) != 0 {
 		t.Fatalf("expected no default process_log_dirs entries, got %v", cfg.ProcessLogDirs)
 	}
+	if cfg.ShadowsocksJournalFallback == nil || !*cfg.ShadowsocksJournalFallback {
+		t.Fatalf("expected shadowsocks_journal_fallback enabled by default, got %+v", cfg.ShadowsocksJournalFallback)
+	}
 	if !cfg.Prefetch.Enabled {
 		t.Fatalf("expected prefetch enabled by default")
 	}
@@ -113,6 +116,25 @@ func TestLoadProcessLogDirsOverride(t *testing.T) {
 	}
 }
 
+func TestLoadShadowsocksJournalFallbackOverride(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := []byte("shadowsocks_journal_fallback: false\n")
+	if err := os.WriteFile(configPath, content, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ShadowsocksJournalFallback == nil {
+		t.Fatalf("expected shadowsocks_journal_fallback to be set")
+	}
+	if *cfg.ShadowsocksJournalFallback {
+		t.Fatalf("expected shadowsocks_journal_fallback override false, got true")
+	}
+}
+
 func TestLoadProcessLogDirsNormalizesKeysAndDropsEmptyValues(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	content := []byte("process_log_dirs:\n  FRPS: /var/log/frps\n  xray: '   '\n")
@@ -163,6 +185,9 @@ func TestDeriveMergesLegacyDirsIntoProcessLogDirs(t *testing.T) {
 	}
 	if derived.ProcessLogDirs["ss-server"] != "/legacy/ss" {
 		t.Fatalf("expected derived ss-server path, got %v", derived.ProcessLogDirs)
+	}
+	if derived.ShadowsocksJournalFallback == nil || !*derived.ShadowsocksJournalFallback {
+		t.Fatalf("expected derived shadowsocks_journal_fallback enabled, got %+v", derived.ShadowsocksJournalFallback)
 	}
 }
 

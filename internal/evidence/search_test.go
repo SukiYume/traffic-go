@@ -190,3 +190,57 @@ func TestPrefetchWindowPersistsScannedRows(t *testing.T) {
 		t.Fatalf("expected 2 persisted rows, got %+v", store.upserted)
 	}
 }
+
+func TestScanLinesDedupesAndFiltersRows(t *testing.T) {
+	startTS := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC).Unix()
+	endTS := time.Date(2026, 4, 18, 12, 2, 0, 0, time.UTC).Unix()
+	referenceTS := time.Date(2026, 4, 18, 12, 1, 0, 0, time.UTC).Unix()
+
+	rows, err := ScanLines(
+		context.Background(),
+		"ss",
+		[]string{
+			"2026-04-18T12:01:00Z connect to chatgpt.com:443 #dup",
+			"2026-04-18T12:01:00Z connect to chatgpt.com:443 #dup",
+			"2026-04-18T12:01:10Z connect to openai.com:443 #keep",
+			"2026-04-18T11:58:00Z connect to skipped.example:443 #old",
+		},
+		func(source string, line string, _ time.Time) (model.LogEvidence, bool) {
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				return model.LogEvidence{}, false
+			}
+			ts, parseErr := time.Parse(time.RFC3339, fields[0])
+			if parseErr != nil {
+				return model.LogEvidence{}, false
+			}
+			hostPort := fields[len(fields)-2]
+			host := strings.TrimSuffix(hostPort, ":443")
+			return Normalize(model.LogEvidence{
+				Source:      source,
+				EventTS:     ts.Unix(),
+				Host:        host,
+				Path:        "443",
+				Method:      "connect",
+				Fingerprint: fields[len(fields)-1],
+				Message:     strings.TrimSpace(line),
+			}), true
+		},
+		func(row model.LogEvidence) bool {
+			return row.Host != "openai.com"
+		},
+		startTS,
+		endTS,
+		referenceTS,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("scan lines: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected deduped and filtered rows, got %+v", rows)
+	}
+	if rows[0].Host != "chatgpt.com" {
+		t.Fatalf("expected chatgpt.com row, got %+v", rows[0])
+	}
+}

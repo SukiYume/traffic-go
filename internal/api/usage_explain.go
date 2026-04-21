@@ -628,6 +628,19 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 		appendNoteUnique(&response.Notes, note)
 	}
 	configuredDir := fallbackText(formatResolvedLogDirs(logDirs), "缓存证据库")
+	if len(rows) == 0 && allowFileScan {
+		journalRows, journalNote, err := s.lookupShadowsocksJournalEvidence(ctx, bucketTS, maxEvidenceRows, matcher)
+		if err != nil {
+			return err
+		}
+		if len(journalRows) > 0 {
+			rows = journalRows
+			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 中未命中 SS 相关日志，已回退到 systemd journal。", configuredDir))
+		}
+		if journalNote != "" {
+			appendNoteUnique(&response.Notes, journalNote)
+		}
+	}
 	if len(rows) == 0 {
 		if !allowFileScan {
 			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", configuredDir))
@@ -991,6 +1004,7 @@ func (s *Server) lookupShadowsocksSourceEvidenceByEntryPort(
 
 	rows := make([]model.LogEvidence, 0, len(ports)*4)
 	notes := make([]string, 0, len(ports))
+	missingJournalPorts := make([]int, 0, len(ports))
 	for _, entryPort := range ports {
 		portValue := entryPort
 		entryRows, entryNotes, err := s.lookupOrScanEvidenceAcrossSourcesAndDirs(
@@ -1013,7 +1027,23 @@ func (s *Server) lookupShadowsocksSourceEvidenceByEntryPort(
 		for _, note := range entryNotes {
 			appendUniqueString(&notes, note)
 		}
+		if len(entryRows) == 0 && allowFileScan {
+			missingJournalPorts = append(missingJournalPorts, portValue)
+			continue
+		}
 		rows = appendDedupEvidenceRows(rows, entryRows)
+	}
+	if allowFileScan && len(missingJournalPorts) > 0 {
+		journalRowsByPort, journalNotes, err := s.lookupShadowsocksJournalEvidenceByEntryPorts(ctx, bucketTS, missingJournalPorts, maxRelatedPeers*4)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, note := range journalNotes {
+			appendUniqueString(&notes, note)
+		}
+		for _, entryPort := range missingJournalPorts {
+			rows = appendDedupEvidenceRows(rows, journalRowsByPort[entryPort])
+		}
 	}
 	return evidence.SortAndTrim(rows, bucketTS, maxEvidenceRows), notes, nil
 }
@@ -1398,21 +1428,7 @@ func parseSSEvidenceLine(source string, line string, reference time.Time) (model
 			method = "connect"
 		}
 	}
-
-	host, targetPort, targetIP := parseSSTargetToken(targetToken)
-
-	ips := extractIPs(line)
-	if clientIP == "" && len(ips) > 0 {
-		clientIP = ips[0]
-	}
-	if targetIP == "" && len(ips) > 0 {
-		for i := len(ips) - 1; i >= 0; i-- {
-			if !sameIP(ips[i], clientIP) {
-				targetIP = ips[i]
-				break
-			}
-		}
-	}
+	clientIP, host, targetPort, targetIP := resolveEvidenceEndpoints(line, clientIP, targetToken)
 	if method == "" {
 		lower := strings.ToLower(line)
 		switch {
@@ -1467,20 +1483,7 @@ func parseGenericEvidenceLine(source string, line string, reference time.Time) (
 			targetToken = match[1]
 		}
 	}
-	host, targetPort, targetIP := parseSSTargetToken(targetToken)
-
-	ips := extractIPs(line)
-	if clientIP == "" && len(ips) > 0 {
-		clientIP = ips[0]
-	}
-	if targetIP == "" && len(ips) > 0 {
-		for i := len(ips) - 1; i >= 0; i-- {
-			if !sameIP(ips[i], clientIP) {
-				targetIP = ips[i]
-				break
-			}
-		}
-	}
+	clientIP, host, targetPort, targetIP := resolveEvidenceEndpoints(line, clientIP, targetToken)
 
 	if clientIP == "" && targetIP == "" && host == "" {
 		return model.LogEvidence{}, false
@@ -1515,6 +1518,30 @@ func parseGenericEvidenceLine(source string, line string, reference time.Time) (
 	return ev, true
 }
 
+func resolveEvidenceEndpoints(line string, clientIP string, targetToken string) (string, string, int, string) {
+	host, targetPort, targetIP := parseSSTargetToken(targetToken)
+	ips := extractIPs(line)
+	if clientIP == "" && len(ips) > 0 {
+		clientIP = ips[0]
+	}
+	if targetIP == "" {
+		targetIP = selectSecondaryIP(ips, clientIP)
+	}
+	return clientIP, host, targetPort, targetIP
+}
+
+func selectSecondaryIP(ips []string, primary string) string {
+	if len(ips) == 0 {
+		return ""
+	}
+	for i := len(ips) - 1; i >= 0; i-- {
+		if !sameIP(ips[i], primary) {
+			return ips[i]
+		}
+	}
+	return ""
+}
+
 func parseNginxTimestamp(value string) (int64, bool) {
 	ts, err := time.Parse("02/Jan/2006:15:04:05 -0700", value)
 	if err != nil {
@@ -1539,10 +1566,13 @@ func parseFlexibleTimestamp(line string, reference time.Time) (int64, bool) {
 		if ts, err := time.Parse(time.RFC3339, raw); err == nil {
 			return ts.Unix(), true
 		}
-		if len(raw) == 24 && strings.HasSuffix(raw, "0000") {
-			patched := raw[:22] + ":" + raw[22:]
-			if ts, err := time.Parse(time.RFC3339, patched); err == nil {
-				return ts.Unix(), true
+		if len(raw) >= 24 {
+			tzStart := len(raw) - 5
+			if tzStart > 0 && (raw[tzStart] == '+' || raw[tzStart] == '-') && raw[len(raw)-3] != ':' {
+				patched := raw[:len(raw)-2] + ":" + raw[len(raw)-2:]
+				if ts, err := time.Parse(time.RFC3339, patched); err == nil {
+					return ts.Unix(), true
+				}
 			}
 		}
 	}

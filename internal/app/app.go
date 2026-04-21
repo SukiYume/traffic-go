@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"traffic-go/internal/api"
@@ -35,7 +36,18 @@ func New(cfg config.Config, logger *log.Logger) (*App, error) {
 	}
 
 	trafficCollector := collector.New(cfg, trafficStore, logger)
-	apiServer := api.NewServer(trafficStore, trafficCollector, logger, embedfs.StaticFS(), cfg.ProcessLogDirs)
+	enableSSJournalFallback := true
+	if cfg.ShadowsocksJournalFallback != nil {
+		enableSSJournalFallback = *cfg.ShadowsocksJournalFallback
+	}
+	apiServer := api.NewServer(
+		trafficStore,
+		trafficCollector,
+		logger,
+		embedfs.StaticFS(),
+		cfg.ProcessLogDirs,
+		enableSSJournalFallback,
+	)
 	return &App{
 		cfg:       cfg,
 		logger:    logger,
@@ -50,30 +62,44 @@ func New(cfg config.Config, logger *log.Logger) (*App, error) {
 }
 
 func (a *App) Run(ctx context.Context) error {
-	errCh := make(chan error, 3)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		errCh <- a.serveHTTP()
-	}()
-	go func() {
-		errCh <- a.collector.Start(ctx)
-	}()
-	go func() {
-		errCh <- a.runMaintenance(ctx)
-	}()
+	errCh := make(chan error, 3)
+	var wg sync.WaitGroup
+
+	startTask := func(fn func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- fn()
+		}()
+	}
+
+	startTask(a.serveHTTP)
+	startTask(func() error {
+		return a.collector.Start(runCtx)
+	})
+	startTask(func() error {
+		return a.runMaintenance(runCtx)
+	})
+
+	var runErr error
 
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+			runErr = err
 		}
 	}
 
+	cancel()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = a.server.Shutdown(shutdownCtx)
-	return nil
+	wg.Wait()
+	return runErr
 }
 
 func (a *App) Close() error {

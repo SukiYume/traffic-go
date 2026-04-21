@@ -154,6 +154,23 @@ func TestParseSyslogTimestamp(t *testing.T) {
 	}
 }
 
+func TestParseFlexibleTimestampSupportsShortISOWithoutColonOffset(t *testing.T) {
+	line := "2026-04-21T11:20:06+0800 host /usr/local/bin/ss-server[1019]: [12096] connect to chatgpt.com:443"
+	reference := time.Date(2026, 4, 21, 11, 22, 0, 0, time.FixedZone("CST", 8*3600))
+
+	ts, ok := parseFlexibleTimestamp(line, reference)
+	if !ok {
+		t.Fatalf("expected short-iso timestamp parse success")
+	}
+	parsed := time.Unix(ts, 0).In(reference.Location())
+	if parsed.Year() != 2026 || parsed.Month() != time.April || parsed.Day() != 21 {
+		t.Fatalf("unexpected parsed date: %s", parsed)
+	}
+	if parsed.Hour() != 11 || parsed.Minute() != 20 || parsed.Second() != 6 {
+		t.Fatalf("unexpected parsed time: %s", parsed)
+	}
+}
+
 func TestParseSSEvidenceLineConnectHost(t *testing.T) {
 	line := "Apr 16 20:34:11 217 /usr/local/bin/ss-server[27896]: [12096] connect to chatgpt.com:443"
 	reference := time.Date(2026, 4, 16, 20, 35, 0, 0, time.Local)

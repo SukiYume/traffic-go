@@ -11,6 +11,14 @@ import (
 	"traffic-go/internal/store"
 )
 
+const (
+	// Background prefetch is a cache warmer, not the main request path. Keep it
+	// focused on the newest activity so a busy host does not re-run thousands of
+	// explain queries every minute.
+	backgroundPrefetchReplayWindow = 3 * time.Minute
+	backgroundPrefetchMaxUsageRows = 256
+)
+
 type BackgroundPrefetchOptions struct {
 	Enabled             bool
 	Now                 time.Time
@@ -82,13 +90,45 @@ func (s *Server) RunBackgroundPrefetch(ctx context.Context, options BackgroundPr
 		if strings.TrimSpace(result.Note) != "" {
 			s.logPrefetchf("prefetch source %s: %s", descriptor.LookupKey, result.Note)
 		}
+		if descriptor.EvidenceSource == evidenceSourceSS && !result.Partial && result.RowsImported == 0 {
+			journalRows, journalNote, err := s.loadShadowsocksJournalEvidence(
+				ctx,
+				startTS,
+				endTS,
+				endTS,
+				backgroundPrefetchMaxEvidenceRows,
+				nil,
+				options.ScanBudget,
+			)
+			if err != nil {
+				summary.Errors++
+				s.logPrefetchf("prefetch source %s journal fallback failed: %v", descriptor.LookupKey, err)
+				continue
+			}
+			if journalNote != "" {
+				s.logPrefetchf("prefetch source %s: %s", descriptor.LookupKey, journalNote)
+			}
+			if len(journalRows) > 0 {
+				summary.EvidenceRows += len(journalRows)
+				s.logPrefetchf("prefetch source %s: imported %d rows from systemd journal", descriptor.LookupKey, len(journalRows))
+			}
+		}
 	}
 
-	usageRows, err := s.queryUsageRowsForPrefetch(ctx, now.Add(-options.ChainLookback), now.Add(time.Minute))
+	chainStart := now.Add(-options.ChainLookback)
+	replayFloor := now.Add(-backgroundPrefetchReplayWindow)
+	if chainStart.Before(replayFloor) {
+		chainStart = replayFloor
+	}
+
+	usageRows, truncated, err := s.queryUsageRowsForPrefetch(ctx, chainStart, now.Add(time.Minute), backgroundPrefetchMaxUsageRows)
 	if err != nil {
 		summary.Errors++
 		s.logPrefetchf("query prefetch usage rows failed: %v", err)
 		return summary
+	}
+	if truncated {
+		s.logPrefetchf("prefetch usage replay capped at %d rows within %s", backgroundPrefetchMaxUsageRows, backgroundPrefetchReplayWindow)
 	}
 	queries := dedupePrefetchExplainQueries(usageRows)
 	for _, query := range queries {
@@ -188,27 +228,41 @@ func buildProcessLogDescriptor(lookupKey string, logDir string) processLogDescri
 	}
 }
 
-func (s *Server) queryUsageRowsForPrefetch(ctx context.Context, start time.Time, end time.Time) ([]model.UsageRecord, error) {
+func (s *Server) queryUsageRowsForPrefetch(ctx context.Context, start time.Time, end time.Time, maxRows int) ([]model.UsageRecord, bool, error) {
 	query := model.UsageQuery{
 		Start:     start.UTC(),
 		End:       end.UTC(),
-		Limit:     200,
 		SortBy:    "minute_ts",
 		SortOrder: "desc",
 	}
 	result := make([]model.UsageRecord, 0, 256)
 	for {
+		pageLimit := 200
+		if maxRows > 0 {
+			remaining := maxRows - len(result)
+			if remaining <= 0 {
+				return result, true, nil
+			}
+			if remaining < pageLimit {
+				pageLimit = remaining
+			}
+		}
+		query.Limit = pageLimit
+
 		rows, nextCursor, _, err := s.store.QueryUsage(ctx, query, store.DataSourceMinute)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		result = append(result, rows...)
+		if maxRows > 0 && len(result) >= maxRows {
+			return result, nextCursor != "", nil
+		}
 		if nextCursor == "" {
-			return result, nil
+			return result, false, nil
 		}
 		cursorTS, cursorRowID, err := store.DecodeCursor(nextCursor)
 		if err != nil {
-			return nil, fmt.Errorf("decode usage cursor: %w", err)
+			return nil, false, fmt.Errorf("decode usage cursor: %w", err)
 		}
 		query.CursorTS = cursorTS
 		query.CursorRowID = cursorRowID

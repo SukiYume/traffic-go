@@ -85,6 +85,85 @@ type PrefetchResult struct {
 	Note            string
 }
 
+type lineEvidenceCollector struct {
+	source        string
+	parser        Parser
+	matcher       Matcher
+	startTS       int64
+	endTS         int64
+	reference     time.Time
+	limit         int
+	collected     []model.LogEvidence
+	seen          map[string]struct{}
+	overEndStreak int
+}
+
+func newLineEvidenceCollector(
+	source string,
+	parser Parser,
+	matcher Matcher,
+	startTS int64,
+	endTS int64,
+	referenceTS int64,
+	limit int,
+	initialCapacity int,
+) *lineEvidenceCollector {
+	if initialCapacity < 0 {
+		initialCapacity = 0
+	}
+	return &lineEvidenceCollector{
+		source:    source,
+		parser:    parser,
+		matcher:   matcher,
+		startTS:   startTS,
+		endTS:     endTS,
+		reference: time.Unix(referenceTS, 0).In(time.Local),
+		limit:     limit,
+		collected: make([]model.LogEvidence, 0, initialCapacity),
+		seen:      make(map[string]struct{}, initialCapacity),
+	}
+}
+
+func (c *lineEvidenceCollector) StartStream() {
+	c.overEndStreak = 0
+}
+
+func (c *lineEvidenceCollector) AddLine(line string) bool {
+	row, ok := c.parser(c.source, line, c.reference)
+	if !ok {
+		return false
+	}
+	row = Normalize(row)
+	if row.EventTS > c.endTS {
+		c.overEndStreak++
+		return c.overEndStreak >= 200
+	}
+	c.overEndStreak = 0
+	if row.EventTS < c.startTS || row.EventTS > c.endTS {
+		return false
+	}
+	if c.matcher != nil && !c.matcher(row) {
+		return false
+	}
+	if row.Fingerprint == "" {
+		row.Fingerprint = Fingerprint(row)
+	}
+	if _, exists := c.seen[row.Fingerprint]; exists {
+		return false
+	}
+	c.seen[row.Fingerprint] = struct{}{}
+	c.collected = append(c.collected, row)
+	return c.limit > 0 && len(c.collected) >= c.limit
+}
+
+func (c *lineEvidenceCollector) Rows() []model.LogEvidence {
+	return c.collected
+}
+
+func (c *lineEvidenceCollector) Full() bool {
+	return c.limit > 0 && len(c.collected) >= c.limit
+}
+
 func LookupOrScan(ctx context.Context, evidenceStore Store, options SearchOptions) ([]model.LogEvidence, string, error) {
 	strictStart := options.BucketTS - options.StrictWindow
 	strictEnd := options.BucketTS + options.StrictWindow
@@ -259,6 +338,37 @@ func PrefetchWindow(ctx context.Context, evidenceStore Store, options PrefetchOp
 	}
 	result.RowsImported = len(rows)
 	return result, nil
+}
+
+func ScanLines(
+	ctx context.Context,
+	source string,
+	lines []string,
+	parser Parser,
+	matcher Matcher,
+	startTS int64,
+	endTS int64,
+	referenceTS int64,
+	limit int,
+) ([]model.LogEvidence, error) {
+	if len(lines) == 0 {
+		return nil, nil
+	}
+	initialCapacity := len(lines)
+	if limit > 0 && limit < initialCapacity {
+		initialCapacity = limit
+	}
+	collector := newLineEvidenceCollector(source, parser, matcher, startTS, endTS, referenceTS, limit, initialCapacity)
+	collector.StartStream()
+	for _, line := range lines {
+		if ctx.Err() != nil {
+			return collector.Rows(), ctx.Err()
+		}
+		if collector.AddLine(line) {
+			break
+		}
+	}
+	return collector.Rows(), nil
 }
 
 func queryCachedEvidence(ctx context.Context, evidenceStore Store, source string, startTS int64, endTS int64, hints QueryHints, limit int) ([]model.LogEvidence, error) {
@@ -509,13 +619,11 @@ func ScanFiles(
 	if len(files) == 0 {
 		return nil, nil
 	}
-	collected := make([]model.LogEvidence, 0)
-	seen := make(map[string]struct{})
-	reference := time.Unix(referenceTS, 0).In(time.Local)
+	collector := newLineEvidenceCollector(source, parser, matcher, startTS, endTS, referenceTS, limit, 0)
 
 	for _, file := range files {
 		if ctx.Err() != nil {
-			return collected, ctx.Err()
+			return collector.Rows(), ctx.Err()
 		}
 		reader, err := openMaybeGzip(file.Path)
 		if err != nil {
@@ -526,44 +634,17 @@ func ScanFiles(
 		buffer := make([]byte, 0, 64*1024)
 		scanner.Buffer(buffer, 1024*1024)
 		linesRead := 0
-		overEndStreak := 0
+		collector.StartStream()
 		for scanner.Scan() {
 			if ctx.Err() != nil {
 				_ = reader.Close()
-				return collected, ctx.Err()
+				return collector.Rows(), ctx.Err()
 			}
 			linesRead++
 			if maxLinesPerFile > 0 && linesRead > maxLinesPerFile {
 				break
 			}
-			row, ok := parser(source, scanner.Text(), reference)
-			if !ok {
-				continue
-			}
-			row = Normalize(row)
-			if row.EventTS > endTS {
-				overEndStreak++
-				if overEndStreak >= 200 {
-					break
-				}
-				continue
-			}
-			overEndStreak = 0
-			if row.EventTS < startTS || row.EventTS > endTS {
-				continue
-			}
-			if matcher != nil && !matcher(row) {
-				continue
-			}
-			if row.Fingerprint == "" {
-				row.Fingerprint = Fingerprint(row)
-			}
-			if _, exists := seen[row.Fingerprint]; exists {
-				continue
-			}
-			seen[row.Fingerprint] = struct{}{}
-			collected = append(collected, row)
-			if limit > 0 && len(collected) >= limit {
+			if collector.AddLine(scanner.Text()) {
 				break
 			}
 		}
@@ -572,11 +653,11 @@ func ScanFiles(
 			return nil, fmt.Errorf("scan evidence file %s: %w", file.Path, err)
 		}
 		_ = reader.Close()
-		if limit > 0 && len(collected) >= limit {
+		if collector.Full() {
 			break
 		}
 	}
-	return collected, nil
+	return collector.Rows(), nil
 }
 
 func deriveScanContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {

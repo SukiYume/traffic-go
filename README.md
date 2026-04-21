@@ -354,6 +354,7 @@ location /traffic/ {
 - `conntrack_path`：conntrack 文件路径，默认 `/proc/net/nf_conntrack`
 - `mock_data`：显式启用 mock collector
 - `process_log_dirs`：进程日志路径映射，key 为进程名，大小写不敏感
+- `shadowsocks_journal_fallback`：Shadowsocks 文件日志未命中时，是否回退到 systemd journal
 - `retention.flows_days`：分钟数据保留天数，也是 PID / EXE 过滤可用的最长窗口
 - `retention.hourly_days`：小时数据保留天数
 - `prefetch.enabled`：是否启用后台日志预热与链路预物化
@@ -370,6 +371,7 @@ location /traffic/ {
 - `nginx_log_dir` 与 `ss_log_dir` 仍保留兼容支持；如果 `process_log_dirs` 已经显式写了对应进程键，则以 `process_log_dirs` 为准。
 - 多个进程如果共用同一批日志文件，需要分别配置各自键指向同一个目录或 glob。
 - 对 `shadowsocks-libev + shadowsocks-manager + simple-obfs`，推荐把 `ss-server`、`ss-manager`、`obfs-server` 都指向 `/var/log/shadowsocks`。
+- 如果 rsyslog 已经把 `ss-server/ss-manager` 的 journal 镜像到 `/var/log/shadowsocks/*.log`，建议把 `shadowsocks_journal_fallback` 设为 `false`，避免重复兜底扫描。
 - `flows_days` 或 `hourly_days` 设为 `0` 时，会回退到默认值 `30` 和 `180`。
 - `log_level` 当前只做解析，不提供真正的 logger 级别裁剪。
 
