@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -702,7 +703,7 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 		hydrateChainsFromEntryPortCandidates(chainMap, buildEntryPortSourceCandidatesFromEvidence(sourceRows))
 		promoteConfirmedSourcesFromEvidence(sourceConfirmed, sourceRows)
 	}
-	entrySources, err := s.collectEntryPortSourceCandidates(ctx, bucketTS, query.Proto, entryPorts)
+	entrySources, err := s.collectEntryPortSourceCandidates(ctx, bucketTS, query, entryPorts)
 	if err != nil {
 		return err
 	}
@@ -906,17 +907,14 @@ func (s *Server) lookupOrScanEvidenceAcrossDirs(
 		}
 		return rows, []string{note}, nil
 	}
-
-	rows := make([]model.LogEvidence, 0, limit)
-	notes := make([]string, 0, len(uniqueDirs))
-	for _, logDir := range uniqueDirs {
-		scannedRows, note, err := s.lookupOrScanEvidence(
+	if !allowFileScan {
+		rows, note, err := s.lookupOrScanEvidence(
 			ctx,
 			source,
-			logDir,
+			"",
 			bucketTS,
 			limit,
-			allowFileScan,
+			false,
 			matcher,
 			queryHints,
 			fileNameMatcher,
@@ -925,15 +923,190 @@ func (s *Server) lookupOrScanEvidenceAcrossDirs(
 		if err != nil {
 			return nil, nil, err
 		}
-		if note != "" {
-			appendUniqueString(&notes, note)
+		if note == "" {
+			return rows, nil, nil
 		}
-		rows = appendDedupEvidenceRows(rows, scannedRows)
-		if len(rows) > 0 {
-			break
+		return rows, []string{note}, nil
+	}
+	if len(uniqueDirs) == 1 {
+		rows, note, err := s.lookupOrScanEvidence(
+			ctx,
+			source,
+			uniqueDirs[0],
+			bucketTS,
+			limit,
+			true,
+			matcher,
+			queryHints,
+			fileNameMatcher,
+			parser,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		if note == "" {
+			return rows, nil, nil
+		}
+		return rows, []string{note}, nil
+	}
+
+	rows := make([]model.LogEvidence, 0, limit)
+	hitNotes := make([]string, 0, len(uniqueDirs))
+	missNotes := make([]string, 0, len(uniqueDirs))
+	cachedRows, cacheNote, err := s.lookupOrScanEvidence(
+		ctx,
+		source,
+		"",
+		bucketTS,
+		limit,
+		false,
+		matcher,
+		queryHints,
+		fileNameMatcher,
+		parser,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(cachedRows) > 0 {
+		rows = appendDedupEvidenceRows(rows, cachedRows)
+		if cacheNote != "" {
+			appendUniqueString(&hitNotes, cacheNote)
 		}
 	}
-	return evidence.SortAndTrim(rows, bucketTS, limit), notes, nil
+	for _, logDir := range uniqueDirs {
+		scannedRows, note, err := s.scanEvidenceDir(
+			ctx,
+			source,
+			logDir,
+			bucketTS,
+			limit,
+			matcher,
+			fileNameMatcher,
+			parser,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(scannedRows) == 0 {
+			if note != "" {
+				appendUniqueString(&missNotes, note)
+			}
+			continue
+		}
+		if note != "" {
+			appendUniqueString(&hitNotes, note)
+		}
+		rows = appendDedupEvidenceRows(rows, scannedRows)
+	}
+	if len(rows) > 0 {
+		return evidence.SortAndTrim(rows, bucketTS, limit), hitNotes, nil
+	}
+	return nil, missNotes, nil
+}
+
+func (s *Server) scanEvidenceDir(
+	ctx context.Context,
+	source string,
+	logDir string,
+	bucketTS int64,
+	limit int,
+	matcher evidenceMatcher,
+	fileNameMatcher func(string) bool,
+	parser evidenceParser,
+) ([]model.LogEvidence, string, error) {
+	strictRows, strictNote, err := s.scanEvidenceDirWindow(
+		ctx,
+		source,
+		logDir,
+		bucketTS-logWindowStrict,
+		bucketTS+logWindowStrict,
+		bucketTS,
+		limit,
+		maxScanFilesStrict,
+		matcher,
+		fileNameMatcher,
+		parser,
+		"",
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(strictRows) > 0 || strictNote != "" {
+		return strictRows, strictNote, nil
+	}
+	return s.scanEvidenceDirWindow(
+		ctx,
+		source,
+		logDir,
+		bucketTS-logWindowFallback,
+		bucketTS+logWindowFallback,
+		bucketTS,
+		limit,
+		maxScanFilesFallback,
+		matcher,
+		fileNameMatcher,
+		parser,
+		"在 ±2 分钟窗口未命中，已回退到 ±15 分钟窗口匹配日志。",
+	)
+}
+
+func (s *Server) scanEvidenceDirWindow(
+	ctx context.Context,
+	source string,
+	logDir string,
+	startTS int64,
+	endTS int64,
+	bucketTS int64,
+	limit int,
+	maxScanFiles int,
+	matcher evidenceMatcher,
+	fileNameMatcher func(string) bool,
+	parser evidenceParser,
+	hitNote string,
+) ([]model.LogEvidence, string, error) {
+	files, err := evidence.ListLogFiles(logDir, fileNameMatcher, startTS, endTS, maxScanFiles)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(files) == 0 {
+		return nil, "", nil
+	}
+
+	scanCtx, cancel := context.WithTimeout(ctx, explainLogScanBudget)
+	defer cancel()
+
+	rows, err := evidence.ScanFiles(
+		scanCtx,
+		source,
+		files,
+		parser,
+		matcher,
+		startTS,
+		endTS,
+		bucketTS,
+		limit*3,
+		maxScanLinesPerFile,
+	)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			if len(rows) == 0 {
+				return nil, fmt.Sprintf("日志深度扫描超过 %s，已跳过文件扫描。", explainLogScanBudget.Truncate(100*time.Millisecond)), nil
+			}
+			if err := s.store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+				return nil, "", fmt.Errorf("persist partial scanned evidence: %w", err)
+			}
+			return evidence.SortAndTrim(rows, bucketTS, limit), fmt.Sprintf("日志深度扫描超过 %s，已返回部分候选。", explainLogScanBudget.Truncate(100*time.Millisecond)), nil
+		}
+		return nil, "", err
+	}
+	if len(rows) == 0 {
+		return nil, "", nil
+	}
+	if err := s.store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+		return nil, "", fmt.Errorf("persist scanned evidence: %w", err)
+	}
+	return evidence.SortAndTrim(rows, bucketTS, limit), hitNote, nil
 }
 
 func shadowsocksEvidenceSources() []string {
@@ -1048,7 +1221,11 @@ func (s *Server) lookupShadowsocksSourceEvidenceByEntryPort(
 	return evidence.SortAndTrim(rows, bucketTS, maxEvidenceRows), notes, nil
 }
 
-func (s *Server) collectEntryPortSourceCandidates(ctx context.Context, bucketTS int64, proto string, entryPorts []int) (map[int][]entrySourceCandidate, error) {
+func (s *Server) collectEntryPortSourceCandidates(ctx context.Context, bucketTS int64, query usageExplainQuery, entryPorts []int) (map[int][]entrySourceCandidate, error) {
+	if !usageExplainHasProcessIdentity(query) {
+		return nil, nil
+	}
+
 	result := make(map[int][]entrySourceCandidate)
 	seen := make(map[int]struct{}, len(entryPorts))
 	for _, entryPort := range entryPorts {
@@ -1065,7 +1242,10 @@ func (s *Server) collectEntryPortSourceCandidates(ctx context.Context, bucketTS 
 			Start:     time.Unix(bucketTS-usageExplainWindowPadding, 0).UTC(),
 			End:       time.Unix(bucketTS+usageExplainWindowPadding+60, 0).UTC(),
 			Direction: model.DirectionIn,
-			Proto:     proto,
+			Proto:     query.Proto,
+			PID:       usageExplainPIDFilter(query.PID),
+			Comm:      strings.TrimSpace(query.Comm),
+			Exe:       strings.TrimSpace(query.Exe),
 			LocalPort: &portValue,
 			UsePage:   true,
 			Page:      1,
@@ -1096,6 +1276,20 @@ func (s *Server) collectEntryPortSourceCandidates(ctx context.Context, bucketTS 
 		result[entryPort] = candidates
 	}
 	return result, nil
+}
+
+func usageExplainHasProcessIdentity(query usageExplainQuery) bool {
+	return usageExplainPIDFilter(query.PID) != nil ||
+		strings.TrimSpace(query.Comm) != "" ||
+		strings.TrimSpace(query.Exe) != ""
+}
+
+func usageExplainPIDFilter(pid *int) *int {
+	if pid == nil || *pid <= 0 {
+		return nil
+	}
+	result := *pid
+	return &result
 }
 
 func summarizeNginxRequests(rows []model.LogEvidence, limit int) []usageExplainNginxRequest {
@@ -2531,11 +2725,8 @@ func sortExplainChains(chains []usageExplainChain) {
 }
 
 func explainChainPIDFilter(pid *int) (*int, bool) {
-	if pid == nil || *pid <= 0 {
-		return nil, false
-	}
-	result := *pid
-	return &result, true
+	result := usageExplainPIDFilter(pid)
+	return result, result != nil
 }
 
 func chainRecordMatchesExplain(record model.UsageChainRecord, query usageExplainQuery) bool {
@@ -2724,10 +2915,10 @@ func inferConfidence(response usageExplainResponse) string {
 		return "high"
 	}
 	if len(response.SourceIPs) > 0 && len(response.TargetIPs) > 0 {
-		return "high"
+		return "medium"
 	}
 	if len(response.SourceIPs) > 0 || len(response.TargetIPs) > 0 {
-		return "medium"
+		return "low"
 	}
 	return "low"
 }

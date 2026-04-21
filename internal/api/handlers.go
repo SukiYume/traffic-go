@@ -361,6 +361,13 @@ func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {
 		}
 		query.LocalPort = &port
 	}
+	if portValue := r.URL.Query().Get("remote_port"); portValue != "" {
+		port, err := strconv.Atoi(portValue)
+		if err != nil {
+			return query, fmt.Errorf("invalid remote_port: %w", err)
+		}
+		query.RemotePort = &port
+	}
 	if !query.UsePage {
 		if err := validateCursorSort(query.SortBy, query.SortOrder); err != nil {
 			return query, err

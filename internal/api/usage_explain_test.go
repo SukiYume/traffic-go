@@ -563,3 +563,132 @@ func TestInferConfidenceDowngradesLoopbackFallbackNginxHits(t *testing.T) {
 		t.Fatalf("expected direct nginx evidence to remain high confidence, got %s", confidence)
 	}
 }
+
+func TestInferConfidenceTreatsPeerCooccurrenceAsMedium(t *testing.T) {
+	confidence := inferConfidence(usageExplainResponse{
+		SourceIPs: []string{"203.0.113.24"},
+		TargetIPs: []string{"142.250.72.14"},
+	})
+	if confidence != "medium" {
+		t.Fatalf("expected neighboring peer cooccurrence to stay medium confidence, got %s", confidence)
+	}
+
+	confidence = inferConfidence(usageExplainResponse{
+		SourceIPs: []string{"203.0.113.24"},
+	})
+	if confidence != "low" {
+		t.Fatalf("expected one-sided peer hints to stay low confidence, got %s", confidence)
+	}
+}
+
+func TestCollectEntryPortSourceCandidatesFiltersToExplainProcess(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 21, 11, 20, 0, 0, time.UTC).Unix()
+	ssPID := 1088
+	nginxPID := 3312
+
+	if err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionIn,
+			PID:         ssPID,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   12096,
+			RemoteIP:    "203.0.113.24",
+			RemotePort:  44598,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   400,
+			BytesDown: 3200,
+			PktsUp:    2,
+			PktsDown:  9,
+			FlowCount: 1,
+		},
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionIn,
+			PID:         nginxPID,
+			Comm:        "nginx",
+			Exe:         "/usr/sbin/nginx",
+			LocalPort:   12096,
+			RemoteIP:    "198.51.100.77",
+			RemotePort:  41220,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   600,
+			BytesDown: 6400,
+			PktsUp:    3,
+			PktsDown:  12,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed usage rows: %v", err)
+	}
+
+	candidates, err := server.collectEntryPortSourceCandidates(ctx, minute, usageExplainQuery{
+		TimeBucket: minute,
+		Proto:      "tcp",
+		PID:        &ssPID,
+		Comm:       "ss-server",
+		Exe:        "/usr/bin/ss-server",
+	}, []int{12096})
+	if err != nil {
+		t.Fatalf("collect entry-port source candidates: %v", err)
+	}
+
+	portCandidates := candidates[12096]
+	if len(portCandidates) != 1 {
+		t.Fatalf("expected only same-process candidates, got %+v", portCandidates)
+	}
+	if portCandidates[0].RemoteIP != "203.0.113.24" {
+		t.Fatalf("unexpected candidate selected: %+v", portCandidates[0])
+	}
+}
+
+func TestLookupOrScanEvidenceAcrossDirsMergesConfiguredDirectoryHits(t *testing.T) {
+	server := newTestServer(t)
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	bucket := time.Date(2026, 4, 21, 11, 20, 0, 0, time.Local)
+
+	lines := map[string]string{
+		filepath.Join(dirA, "relay.log"): "2026-04-21 11:20:06 relay client=203.0.113.24 target=142.250.72.14:443\n",
+		filepath.Join(dirB, "relay.log"): "2026-04-21 11:20:16 relay client=198.51.100.77 target=1.1.1.1:443\n",
+	}
+	for path, content := range lines {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write log file %s: %v", path, err)
+		}
+	}
+
+	rows, notes, err := server.lookupOrScanEvidenceAcrossDirs(
+		context.Background(),
+		customEvidenceSource("relay"),
+		[]string{dirA, dirB},
+		bucket.Unix(),
+		10,
+		true,
+		func(model.LogEvidence) bool { return true },
+		evidenceQueryHints{},
+		isGenericLogFileName,
+		parseGenericEvidenceLine,
+	)
+	if err != nil {
+		t.Fatalf("lookup evidence across dirs: %v", err)
+	}
+	if len(notes) != 0 {
+		t.Fatalf("did not expect miss notes when configured directories both contribute rows, got %+v", notes)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected rows from both configured directories, got %+v", rows)
+	}
+
+	gotClients := []string{rows[0].ClientIP, rows[1].ClientIP}
+	if !strings.Contains(strings.Join(gotClients, ","), "203.0.113.24") || !strings.Contains(strings.Join(gotClients, ","), "198.51.100.77") {
+		t.Fatalf("expected both directory hits to survive merge, got %+v", rows)
+	}
+}

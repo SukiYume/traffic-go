@@ -302,6 +302,72 @@ func TestUsageResponseNormalizesPageMetadata(t *testing.T) {
 	}
 }
 
+func TestUsageFiltersByRemotePort(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
+
+	if err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "198.51.100.44",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    3,
+			PktsDown:  5,
+			FlowCount: 1,
+		},
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "198.51.100.44",
+			RemotePort:  8443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   256,
+			BytesDown: 512,
+			PktsUp:    1,
+			PktsDown:  1,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed usage rows: %v", err)
+	}
+
+	start := url.QueryEscape(time.Unix(minute, 0).Add(-time.Minute).UTC().Format(time.RFC3339))
+	end := url.QueryEscape(time.Unix(minute, 0).Add(time.Minute).UTC().Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/usage?start=%s&end=%s&page=1&page_size=10&remote_ip=198.51.100.44&remote_port=443", start, end), nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"remote_port":443`) {
+		t.Fatalf("expected filtered remote_port=443 row in body: %s", bodyText)
+	}
+	if strings.Contains(bodyText, `"remote_port":8443`) {
+		t.Fatalf("expected remote_port filter to exclude 8443 row: %s", bodyText)
+	}
+}
+
 func TestForwardUsageResponseNormalizesPageMetadata(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
