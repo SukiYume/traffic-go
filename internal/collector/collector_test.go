@@ -377,6 +377,143 @@ func TestUpdateSnapshotCountsInitialDeltaAfterBaselineWarmup(t *testing.T) {
 	}
 }
 
+func TestUpdateSnapshotReturnsZeroDeltaForSameLineageTupleChange(t *testing.T) {
+	service := &Service{}
+	now := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+
+	prev := model.FlowSnapshot{
+		CTID:          7001,
+		Proto:         "tcp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     47920,
+		RemoteIP:      "198.51.100.44",
+		RemotePort:    443,
+		StartedAt:     now.Add(-20 * time.Second),
+		BaselineOrig:  100,
+		BaselineReply: 300,
+		LastOrig:      400,
+		LastReply:     1200,
+		BaselineOPkts: 1,
+		BaselineRPkts: 3,
+		LastOPkts:     4,
+		LastRPkts:     12,
+		Counted:       true,
+		LastSeen:      now.Add(-2 * time.Second),
+	}
+
+	snapshot, delta, forwardDelta, countFlow, resetOwners := service.updateSnapshot(
+		now,
+		model.ConntrackFlow{
+			CTID:       7001,
+			Proto:      "tcp",
+			OrigBytes:  400,
+			ReplyBytes: 1200,
+			OrigPkts:   4,
+			ReplyPkts:  12,
+		},
+		classifiedFlow{
+			Proto:      "tcp",
+			Direction:  model.DirectionIn,
+			LocalIP:    "10.0.0.2",
+			LocalPort:  47920,
+			RemoteIP:   "198.51.100.44",
+			RemotePort: 443,
+			Connected:  true,
+		},
+		model.ProcessInfo{},
+		prev,
+		true,
+		true,
+		true,
+	)
+
+	if delta == nil || !delta.isZero() {
+		t.Fatalf("expected zero delta pointer for rebucketing, got %+v", delta)
+	}
+	if forwardDelta != nil {
+		t.Fatalf("did not expect forward delta for local reclassification, got %+v", forwardDelta)
+	}
+	if countFlow || resetOwners {
+		t.Fatalf("did not expect recount/reset on same lineage reclassification, count=%v reset=%v", countFlow, resetOwners)
+	}
+	if snapshot.Direction != model.DirectionIn || !snapshot.Counted {
+		t.Fatalf("expected snapshot to preserve counted flow with new tuple, got %+v", snapshot)
+	}
+}
+
+func TestUpdateSnapshotReturnsZeroForwardDeltaForSameLineageForwardReclassification(t *testing.T) {
+	service := &Service{}
+	now := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+
+	prev := model.FlowSnapshot{
+		CTID:          8001,
+		Proto:         "tcp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     8388,
+		RemoteIP:      "198.51.100.44",
+		RemotePort:    443,
+		StartedAt:     now.Add(-20 * time.Second),
+		BaselineOrig:  100,
+		BaselineReply: 300,
+		LastOrig:      400,
+		LastReply:     1200,
+		BaselineOPkts: 1,
+		BaselineRPkts: 3,
+		LastOPkts:     4,
+		LastRPkts:     12,
+		Counted:       true,
+		LastSeen:      now.Add(-2 * time.Second),
+	}
+
+	snapshot, delta, forwardDelta, countFlow, resetOwners := service.updateSnapshot(
+		now,
+		model.ConntrackFlow{
+			CTID:         8001,
+			Proto:        "tcp",
+			OrigSrcIP:    "203.0.113.24",
+			OrigDstIP:    "198.51.100.44",
+			OrigSrcPort:  52144,
+			OrigDstPort:  443,
+			ReplySrcIP:   "198.51.100.44",
+			ReplyDstIP:   "203.0.113.24",
+			ReplySrcPort: 443,
+			ReplyDstPort: 52144,
+			OrigBytes:    400,
+			ReplyBytes:   1200,
+			OrigPkts:     4,
+			ReplyPkts:    12,
+		},
+		classifiedFlow{
+			Proto:       "tcp",
+			Direction:   model.DirectionForward,
+			OrigSrcIP:   "203.0.113.24",
+			OrigDstIP:   "198.51.100.44",
+			OrigSrcPort: 52144,
+			OrigDstPort: 443,
+		},
+		model.ProcessInfo{},
+		prev,
+		true,
+		true,
+		true,
+	)
+
+	if delta != nil {
+		t.Fatalf("did not expect local delta when reclassifying to forward, got %+v", delta)
+	}
+	if forwardDelta == nil || !forwardDelta.isZero() {
+		t.Fatalf("expected zero forward delta pointer for rebucketing, got %+v", forwardDelta)
+	}
+	if countFlow || resetOwners {
+		t.Fatalf("did not expect recount/reset on same lineage forward reclassification, count=%v reset=%v", countFlow, resetOwners)
+	}
+	if snapshot.Direction != model.DirectionForward || !snapshot.Counted {
+		t.Fatalf("expected forward snapshot to preserve counted state, got %+v", snapshot)
+	}
+}
+
 func TestNormalizeObservedFlowsDedupesDuplicateTupleByMaxCounters(t *testing.T) {
 	flows := []model.ConntrackFlow{
 		{

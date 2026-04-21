@@ -386,9 +386,15 @@ func (s *Service) updateSnapshot(
 	if snapshotTupleChanged(prev, snapshot) || flow.OrigBytes < prev.LastOrig || flow.ReplyBytes < prev.LastReply {
 		if lineageContinues {
 			// Reclassification or transient counter anomalies on the same conntrack
-			// lineage should not double-count the flow.
+			// lineage should not double-count the flow, but the caller still needs
+			// a zero-delta update so an already-counted flow can migrate to the new
+			// bucket when direction/tuple attribution becomes clearer mid-minute.
 			snapshot.Counted = prev.Counted
-			return snapshot, nil, nil, false, false
+			zero := &deltaPair{}
+			if classified.Direction == model.DirectionForward {
+				return snapshot, nil, zero, false, false
+			}
+			return snapshot, zero, nil, false, false
 		}
 		snapshot.Counted = true
 		if !baselineReady {

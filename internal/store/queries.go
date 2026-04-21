@@ -258,6 +258,9 @@ func (s *Store) QueryUsage(ctx context.Context, query model.UsageQuery, source s
 		if query.Attribution != "" {
 			return nil, "", 0, ErrDimensionUnavailable
 		}
+		if query.RemotePort != nil {
+			return nil, "", 0, ErrDimensionUnavailable
+		}
 		builder.WriteString(fmt.Sprintf(`
 SELECT rowid, %s, proto, direction, NULL AS pid, comm, NULL AS exe, local_port, remote_ip, NULL AS remote_port,
        NULL AS attribution, bytes_up, bytes_down, pkts_up, pkts_down, flow_count
@@ -700,7 +703,7 @@ func appendUsageFiltersDetailed(builder *strings.Builder, args *[]any, query mod
 		builder.WriteString(" AND local_port = ?")
 		*args = append(*args, *query.LocalPort)
 	}
-	if query.RemotePort != nil {
+	if !hourSource && query.RemotePort != nil {
 		builder.WriteString(" AND remote_port = ?")
 		*args = append(*args, *query.RemotePort)
 	}

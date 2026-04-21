@@ -150,6 +150,22 @@ func TestUsageRejectsCursorSortOverrides(t *testing.T) {
 	}
 }
 
+func TestUsageRejectsRemotePortForHourlySource(t *testing.T) {
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?range=90d&remote_port=443", nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	if !strings.Contains(string(body), "dimension_unavailable") {
+		t.Fatalf("unexpected body: %s", string(body))
+	}
+}
+
 func TestUsageRejectsNonPositiveRange(t *testing.T) {
 	server := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?range=0h", nil)

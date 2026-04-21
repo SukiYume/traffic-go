@@ -2,6 +2,7 @@ package evidence
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -21,6 +22,8 @@ import (
 )
 
 var fileDatePattern = regexp.MustCompile(`(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)`)
+
+const tailScanChunkSize = 64 * 1024
 
 type LogFileCandidate struct {
 	Name    string
@@ -139,6 +142,29 @@ func (c *lineEvidenceCollector) AddLine(line string) bool {
 		return c.overEndStreak >= 200
 	}
 	c.overEndStreak = 0
+	if row.EventTS < c.startTS || row.EventTS > c.endTS {
+		return false
+	}
+	if c.matcher != nil && !c.matcher(row) {
+		return false
+	}
+	if row.Fingerprint == "" {
+		row.Fingerprint = Fingerprint(row)
+	}
+	if _, exists := c.seen[row.Fingerprint]; exists {
+		return false
+	}
+	c.seen[row.Fingerprint] = struct{}{}
+	c.collected = append(c.collected, row)
+	return c.limit > 0 && len(c.collected) >= c.limit
+}
+
+func (c *lineEvidenceCollector) AddLineReverse(line string) bool {
+	row, ok := c.parser(c.source, line, c.reference)
+	if !ok {
+		return false
+	}
+	row = Normalize(row)
 	if row.EventTS < c.startTS || row.EventTS > c.endTS {
 		return false
 	}
@@ -625,6 +651,25 @@ func ScanFiles(
 		if ctx.Err() != nil {
 			return collector.Rows(), ctx.Err()
 		}
+		if shouldTailScanPlainFile(file.Path, maxLinesPerFile) {
+			plainFile, err := os.Open(file.Path)
+			if err != nil {
+				continue
+			}
+			err = scanPlainFileTail(ctx, plainFile, collector, maxLinesPerFile)
+			_ = plainFile.Close()
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					return collector.Rows(), err
+				}
+				return nil, fmt.Errorf("scan evidence file %s: %w", file.Path, err)
+			}
+			if collector.Full() {
+				break
+			}
+			continue
+		}
+
 		reader, err := openMaybeGzip(file.Path)
 		if err != nil {
 			continue
@@ -658,6 +703,74 @@ func ScanFiles(
 		}
 	}
 	return collector.Rows(), nil
+}
+
+func shouldTailScanPlainFile(path string, maxLinesPerFile int) bool {
+	return maxLinesPerFile > 0 && !strings.HasSuffix(strings.ToLower(path), ".gz")
+}
+
+func scanPlainFileTail(ctx context.Context, file *os.File, collector *lineEvidenceCollector, maxLinesPerFile int) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	remaining := info.Size()
+	if remaining <= 0 {
+		return nil
+	}
+
+	leftover := make([]byte, 0, tailScanChunkSize)
+	linesRead := 0
+
+	for remaining > 0 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		chunkSize := int64(tailScanChunkSize)
+		if remaining < chunkSize {
+			chunkSize = remaining
+		}
+		remaining -= chunkSize
+
+		if _, err := file.Seek(remaining, io.SeekStart); err != nil {
+			return err
+		}
+
+		chunk := make([]byte, chunkSize)
+		if _, err := io.ReadFull(file, chunk); err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+			return err
+		}
+
+		segment := append(append(make([]byte, 0, len(chunk)+len(leftover)), chunk...), leftover...)
+		parts := bytes.Split(segment, []byte{'\n'})
+		startIdx := 0
+		if remaining > 0 {
+			leftover = append(leftover[:0], parts[0]...)
+			startIdx = 1
+		} else {
+			leftover = leftover[:0]
+		}
+
+		for i := len(parts) - 1; i >= startIdx; i-- {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			line := strings.TrimRight(string(parts[i]), "\r")
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			linesRead++
+			if collector.AddLineReverse(line) {
+				return nil
+			}
+			if maxLinesPerFile > 0 && linesRead >= maxLinesPerFile {
+				return nil
+			}
+		}
+	}
+
+	return nil
 }
 
 func deriveScanContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
