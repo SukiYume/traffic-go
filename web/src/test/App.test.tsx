@@ -36,6 +36,35 @@ function pendingPromise<T>() {
   return new Promise<T>(() => {});
 }
 
+function createHourlyClient(): TrafficApiClient {
+  const base = createMockApiClient();
+  return {
+    ...base,
+    async getUsage(query, requestOptions) {
+      const response = await base.getUsage(query, requestOptions);
+      return {
+        ...response,
+        dataSource: "usage_1h",
+        rows: response.rows.map((row) => ({
+          ...row,
+          pid: null,
+          exe: null,
+          remotePort: null,
+          attribution: null,
+        })),
+      };
+    },
+    async getTopProcesses(range, options, requestOptions) {
+      const response = await base.getTopProcesses(range, options, requestOptions);
+      return {
+        ...response,
+        dataSource: "usage_1h",
+        rows: response.rows.map((row) => ({ ...row, pid: null, exe: null })),
+      };
+    },
+  };
+}
+
 describe("traffic-go web ui", () => {
   it("renders dashboard overview", async () => {
     renderWithProviders("/", <DashboardPage />);
@@ -64,14 +93,14 @@ describe("traffic-go web ui", () => {
   });
 
   it("keeps dashboard top processes in comm fallback when the window is hourly", async () => {
-    renderWithProviders("/?range=90d", <DashboardPage />);
+    renderWithProviders("/?range=last_month", <DashboardPage />, createHourlyClient());
 
     expect((await screen.findAllByText("当前窗口已降级为按进程名聚合")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("小时聚合 / EXE 在此视图不展示").length).toBeGreaterThan(0);
   });
 
   it("keeps dashboard drill-down links on the current range and preserves the loopback flag for remotes", async () => {
-    renderWithProviders("/?range=90d", <DashboardPage />);
+    renderWithProviders("/?range=last_month", <DashboardPage />);
     expect(await screen.findByText("流量总览")).toBeInTheDocument();
 
     const hrefs = screen
@@ -80,24 +109,41 @@ describe("traffic-go web ui", () => {
 
     expect(hrefs).toEqual(
       expect.arrayContaining([
-        "/processes?range=90d",
-        "/remotes?range=90d&direction=in&include_loopback=1",
-        "/remotes?range=90d&direction=out&include_loopback=1",
-        "/usage?range=90d",
+        "/processes?range=last_month",
+        "/remotes?range=last_month&direction=in&include_loopback=1",
+        "/remotes?range=last_month&direction=out&include_loopback=1",
+        "/usage?range=last_month",
       ]),
     );
   });
 
-  it("disables pid and exe when range is longer than 30 days", async () => {
+  it("disables pid and exe when the backend returns hourly data", async () => {
+    const base = createHourlyClient();
+    let usageCalls = 0;
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        usageCalls += 1;
+        if (query.pid || query.exe || query.attribution) {
+          throw new ApiError(
+            400,
+            "dimension_unavailable",
+            "minute-only dimensions are unavailable",
+          );
+        }
+        return base.getUsage(query, requestOptions);
+      },
+    };
     renderWithProviders(
-      "/usage?range=90d&pid=1088&exe=ss-server",
+      "/usage?range=last_month&pid=1088&exe=ss-server&attribution=exact",
       <UsagePage />,
+      client,
     );
     const pid = await screen.findByLabelText("PID");
     const exe = await screen.findByLabelText("EXE");
     const attributionLabel = await screen.findByText("全部归因");
     const attribution = attributionLabel.closest("button");
-    expect(pid).toBeDisabled();
+    await waitFor(() => expect(pid).toBeDisabled());
     expect(exe).toBeDisabled();
     expect(attribution).not.toBeNull();
     expect(attribution).toBeDisabled();
@@ -106,10 +152,11 @@ describe("traffic-go web ui", () => {
         "超过分钟明细保留窗口的数据会切换到小时表，PID / EXE 维度不可用。",
       ),
     ).toBeInTheDocument();
+    expect(usageCalls).toBeGreaterThanOrEqual(2);
   });
 
   it("hides minute-only columns when usage data comes from the hourly source", async () => {
-    renderWithProviders("/usage?range=90d", <UsagePage />);
+    renderWithProviders("/usage?range=last_month", <UsagePage />, createHourlyClient());
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
     expect(
       screen.queryByRole("columnheader", { name: "PID" }),
@@ -124,7 +171,7 @@ describe("traffic-go web ui", () => {
 
   it("replays persisted chain analysis for hourly usage rows", async () => {
     const user = userEvent.setup();
-    renderWithProviders("/usage?range=90d", <UsagePage />);
+    renderWithProviders("/usage?range=last_month", <UsagePage />, createHourlyClient());
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
     const rows = await screen.findAllByRole("row");
@@ -138,7 +185,7 @@ describe("traffic-go web ui", () => {
 
   it("uses the real hourly bucket span when rendering average rate", async () => {
     const user = userEvent.setup();
-    renderWithProviders("/usage?range=90d", <UsagePage />);
+    renderWithProviders("/usage?range=last_month", <UsagePage />, createHourlyClient());
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
     const remoteIp = await screen.findByRole("button", { name: "203.0.113.24" });
@@ -179,14 +226,14 @@ describe("traffic-go web ui", () => {
   });
 
   it("clears minute-only filters when the backend downgrades usage to hourly data", async () => {
-    const base = createMockApiClient();
+    const base = createHourlyClient();
     let usageCalls = 0;
     const client: TrafficApiClient = {
       ...base,
       async getUsage(query) {
         usageCalls += 1;
         if (
-          query.range === "30d" &&
+          query.range === "last_month" &&
           (query.pid || query.exe || query.attribution)
         ) {
           throw new ApiError(
@@ -195,13 +242,12 @@ describe("traffic-go web ui", () => {
             "minute-only dimensions are unavailable",
           );
         }
-        const hourly = await base.getUsage({ ...query, range: "90d" });
-        return { ...hourly, dataSource: "usage_1h" };
+        return base.getUsage(query);
       },
     };
 
     renderWithProviders(
-      "/usage?range=30d&pid=1088&exe=ss-server&attribution=exact",
+      "/usage?range=last_month&pid=1088&exe=ss-server&attribution=exact",
       <UsagePage />,
       client,
     );
@@ -329,7 +375,7 @@ describe("traffic-go web ui", () => {
     expect(screen.queryByRole("columnheader", { name: "EXE" })).not.toBeInTheDocument();
   });
 
-  it("does not issue a redundant pid-group request on the initial 90d processes load", async () => {
+  it("requests both PID and process-name summaries for natural month process windows", async () => {
     const base = createMockApiClient();
     const processCalls: ProcessGroupBy[] = [];
     const client: TrafficApiClient = {
@@ -340,12 +386,11 @@ describe("traffic-go web ui", () => {
       },
     };
 
-    renderWithProviders("/processes?range=90d", <ProcessesPage />, client);
+    renderWithProviders("/processes?range=last_month", <ProcessesPage />, client);
     expect(await screen.findByText("进程聚合")).toBeInTheDocument();
-    expect(await screen.findByText("ss-server")).toBeInTheDocument();
-    expect(screen.getByText("当前窗口不提供 PID 维度")).toBeInTheDocument();
+    expect((await screen.findAllByText("ss-server")).length).toBeGreaterThan(0);
     await waitFor(() => {
-      expect(processCalls).toEqual(["comm"]);
+      expect(processCalls).toEqual(expect.arrayContaining(["pid", "comm"]));
     });
   });
 

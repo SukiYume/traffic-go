@@ -193,7 +193,7 @@ describe('http api client', () => {
     );
 
     const client = createHttpClient();
-    const response = await client.getUsage({ range: '90d' });
+    const response = await client.getUsage({ range: 'last_month' });
 
     expect(response.dataSource).toBe('usage_1h');
     expect(response.rows[0]).toMatchObject({
@@ -288,7 +288,7 @@ describe('http api client', () => {
     );
 
     const client = createHttpClient();
-    const response = await client.getTopProcesses('90d', { groupBy: 'comm' });
+    const response = await client.getTopProcesses('last_month', { groupBy: 'comm' });
 
     expect(response.dataSource).toBe('usage_1h');
     expect(response.rows[0]).toMatchObject({

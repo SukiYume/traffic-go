@@ -306,6 +306,10 @@ func writeDimensionError(w http.ResponseWriter, err error) {
 }
 
 func parseWindow(r *http.Request) (time.Time, time.Time, string, error) {
+	return parseWindowAt(r, time.Now().UTC())
+}
+
+func parseWindowAt(r *http.Request, now time.Time) (time.Time, time.Time, string, error) {
 	query := r.URL.Query()
 	if startValue := query.Get("start"); startValue != "" {
 		return parseExplicitWindow(query, startValue)
@@ -315,13 +319,38 @@ func parseWindow(r *http.Request) (time.Time, time.Time, string, error) {
 	if rangeLabel == "" {
 		rangeLabel = "24h"
 	}
+	if start, end, normalizedLabel, ok := naturalMonthWindow(rangeLabel, now); ok {
+		return normalizeWindow(start, end, normalizedLabel)
+	}
 	duration, err := parseRange(rangeLabel)
 	if err != nil {
 		return time.Time{}, time.Time{}, "", err
 	}
-	end := time.Now().UTC()
+	end := now.UTC()
 	start := end.Add(-duration)
 	return normalizeWindow(start, end, rangeLabel)
+}
+
+func naturalMonthWindow(value string, now time.Time) (time.Time, time.Time, string, bool) {
+	monthStart := func(offset int) (time.Time, time.Time) {
+		current := now.UTC()
+		start := time.Date(current.Year(), current.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, offset, 0)
+		return start, start.AddDate(0, 1, 0)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "this_month", "current_month", "month":
+		start, end := monthStart(0)
+		return start, end, "this_month", true
+	case "last_month", "previous_month":
+		start, end := monthStart(-1)
+		return start, end, "last_month", true
+	case "two_months_ago", "month_before_last":
+		start, end := monthStart(-2)
+		return start, end, "two_months_ago", true
+	default:
+		return time.Time{}, time.Time{}, "", false
+	}
 }
 
 func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {

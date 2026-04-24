@@ -71,7 +71,6 @@ export function ProcessesPage() {
     setParams(nextParams, { replace: true });
   };
 
-  const shouldRequestPID = range !== '90d';
   const currentPIDSort = pidSorting[0];
   const currentCommSort = commSorting[0];
   const pidResetKey = JSON.stringify([range, currentPIDSort?.id ?? null, currentPIDSort?.desc ?? null]);
@@ -90,7 +89,6 @@ export function ProcessesPage() {
         sortOrder: currentPIDSort?.desc ? 'desc' : 'asc',
       }, { signal }),
     placeholderData: keepPreviousData,
-    enabled: shouldRequestPID,
   });
 
   const commQuery = useQuery({
@@ -108,7 +106,6 @@ export function ProcessesPage() {
 
   const activeDataSource = pidQuery.data?.dataSource ?? commQuery.data?.dataSource;
   const pidDimensionUnavailable =
-    range === '90d' ||
     pidQuery.data?.dataSource === 'usage_1h' ||
     commQuery.data?.dataSource === 'usage_1h';
 
@@ -234,7 +231,7 @@ export function ProcessesPage() {
   const initialLoading =
     !commQuery.data &&
     commQuery.isPending &&
-    (!shouldRequestPID || !pidQuery.data || pidQuery.isPending);
+    (!pidQuery.data || pidQuery.isPending);
 
   const initialError =
     !commRows.length &&

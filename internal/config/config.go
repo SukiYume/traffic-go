@@ -19,6 +19,9 @@ const (
 )
 
 type Retention struct {
+	Months int `yaml:"months"`
+	// Legacy day-based settings are still parsed so existing config files load,
+	// but retention is now enforced by UTC calendar months.
 	MinuteDays int `yaml:"flows_days"`
 	HourlyDays int `yaml:"hourly_days"`
 }
@@ -64,8 +67,7 @@ func Default() Config {
 		ShadowsocksJournalFallback: &enableShadowsocksJournalFallback,
 		LogLevel:                   "info",
 		Retention: Retention{
-			MinuteDays: 30,
-			HourlyDays: 180,
+			Months: 3,
 		},
 		Prefetch: Prefetch{
 			Enabled:             true,
@@ -127,11 +129,8 @@ func withDerivedDefaults(cfg Config) Config {
 		enableShadowsocksJournalFallback := true
 		cfg.ShadowsocksJournalFallback = &enableShadowsocksJournalFallback
 	}
-	if cfg.Retention.MinuteDays <= 0 {
-		cfg.Retention.MinuteDays = 30
-	}
-	if cfg.Retention.HourlyDays <= 0 {
-		cfg.Retention.HourlyDays = 180
+	if cfg.Retention.Months <= 0 {
+		cfg.Retention.Months = 3
 	}
 	if cfg.Prefetch.Interval <= 0 {
 		cfg.Prefetch.Interval = time.Minute

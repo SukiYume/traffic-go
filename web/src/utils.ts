@@ -70,8 +70,9 @@ export function rangeLabel(range: RangeKey) {
     '1h': '1 小时',
     '24h': '24 小时',
     '7d': '7 天',
-    '30d': '30 天',
-    '90d': '90 天',
+    this_month: '本月',
+    last_month: '上月',
+    two_months_ago: '上上月',
   }[range];
 }
 

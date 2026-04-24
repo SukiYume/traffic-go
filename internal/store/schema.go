@@ -88,6 +88,19 @@ CREATE TABLE IF NOT EXISTS dirty_chain_hours (
     hour_ts INTEGER NOT NULL PRIMARY KEY
 );
 
+CREATE TABLE IF NOT EXISTS usage_monthly (
+    month_ts INTEGER NOT NULL PRIMARY KEY,
+    bytes_up INTEGER NOT NULL,
+    bytes_down INTEGER NOT NULL,
+    flow_count INTEGER NOT NULL,
+    forward_bytes_orig INTEGER NOT NULL,
+    forward_bytes_reply INTEGER NOT NULL,
+    forward_flow_count INTEGER NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    chain_count INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS log_evidence (
     source TEXT NOT NULL,
     event_ts INTEGER NOT NULL,

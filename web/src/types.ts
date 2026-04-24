@@ -1,4 +1,4 @@
-export type RangeKey = '1h' | '24h' | '7d' | '30d' | '90d';
+export type RangeKey = '1h' | '24h' | '7d' | 'this_month' | 'last_month' | 'two_months_ago';
 export type BucketKey = '1m' | '5m' | '1h' | '6h' | '1d';
 export type GroupBy = 'direction' | 'comm' | 'remote_ip';
 export type Direction = 'in' | 'out' | 'forward';

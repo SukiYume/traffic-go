@@ -56,7 +56,14 @@ const FORWARD_ROWS: ForwardUsageRow[] = [
 ];
 
 function rangeToMinutes(range: RangeKey) {
-  return { '1h': 60, '24h': 24 * 60, '7d': 7 * 24 * 60, '30d': 30 * 24 * 60, '90d': 90 * 24 * 60 }[range];
+  return {
+    '1h': 60,
+    '24h': 24 * 60,
+    '7d': 7 * 24 * 60,
+    this_month: 31 * 24 * 60,
+    last_month: 30 * 24 * 60,
+    two_months_ago: 28 * 24 * 60,
+  }[range];
 }
 
 function bucketMinutes(bucket: string) {
@@ -118,14 +125,14 @@ function buildGroupedSeries(points: TimeSeriesPoint[], groupBy: 'direction' | 'c
 }
 
 function overviewFor(range: RangeKey): OverviewStats {
-  const factor = { '1h': 1, '24h': 6, '7d': 18, '30d': 48, '90d': 90 }[range];
+  const factor = { '1h': 1, '24h': 6, '7d': 18, this_month: 42, last_month: 40, two_months_ago: 37 }[range];
   return {
     bytesUp: 28_742_314 * factor,
     bytesDown: 91_331_120 * factor,
     flowCount: 128 * factor,
     activeConnections: Math.max(12, Math.round((48 * factor) / 6)),
     activeProcesses: PROCESSES.filter((p) => p.pid > 0).length,
-    dataSource: range === '90d' ? 'usage_1h' : 'usage_1m',
+    dataSource: 'usage_1m',
     range,
   };
 }
@@ -373,16 +380,8 @@ function createFilteredUsage(query: UsageQuery) {
 }
 
 function normalizeUsageRows(range: RangeKey, rows: UsageRow[]) {
-  if (range !== '90d') {
-    return rows;
-  }
-  return rows.map((row) => ({
-    ...row,
-    pid: null,
-    exe: null,
-    remotePort: null,
-    attribution: null,
-  }));
+  void range;
+  return rows;
 }
 
 function createFilteredForward(query: ForwardUsageQuery) {
@@ -533,13 +532,13 @@ function processSummaries(
   range: RangeKey,
   query?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy },
 ): ProcessSummaryResponse {
-  const source = range === '90d' ? 'usage_1h' : 'usage_1m';
-  const effectiveGroupBy: ProcessGroupBy = source === 'usage_1h' ? 'comm' : (query?.groupBy ?? 'pid');
+  void range;
+  const effectiveGroupBy: ProcessGroupBy = query?.groupBy ?? 'pid';
 
-  const baseRows = PROCESSES.map((process) => ({
-    pid: source === 'usage_1h' ? null : process.pid,
+  const baseRows: ProcessSummaryResponse['rows'] = PROCESSES.map((process) => ({
+    pid: process.pid,
     comm: process.comm,
-    exe: source === 'usage_1h' ? null : process.exe,
+    exe: process.exe,
     bytesUp: Math.round(process.totalBytes * 0.34),
     bytesDown: Math.round(process.totalBytes * 0.66),
     flowCount: Math.max(1, Math.round(process.totalBytes / (32 * 1024 * 1024))),
@@ -565,10 +564,10 @@ function processSummaries(
       })()
     : baseRows;
 
-  const sortedRows = sortProcessRows(groupedRows, query?.sortBy, query?.sortOrder, effectiveGroupBy === 'pid' && source !== 'usage_1h');
+  const sortedRows = sortProcessRows(groupedRows, query?.sortBy, query?.sortOrder, effectiveGroupBy === 'pid');
   const page = paginate(sortedRows, query?.page ?? 1, query?.pageSize ?? 25);
   return {
-    dataSource: source,
+    dataSource: 'usage_1m',
     rows: page.rows,
     page: page.page,
     pageSize: page.pageSize,
@@ -601,7 +600,7 @@ function remoteSummaries(
   const sortedRows = sortRemoteRows(rows, options?.sortBy, options?.sortOrder);
   const page = paginate(sortedRows, options?.page ?? 1, options?.pageSize ?? 25);
   return {
-    dataSource: range === '90d' ? 'usage_1h' : 'usage_1m',
+    dataSource: 'usage_1m',
     rows: page.rows,
     page: page.page,
     pageSize: page.pageSize,
@@ -646,7 +645,7 @@ export function createMockApiClient(): TrafficApiClient {
       });
       const groups = buildGroupedSeries(basePoints, groupBy);
       return {
-        dataSource: range === '90d' ? 'usage_1h' : 'usage_1m',
+        dataSource: 'usage_1m',
         bucket: RANGE_TO_BUCKET[range],
         groupBy,
         points: basePoints,
@@ -657,7 +656,7 @@ export function createMockApiClient(): TrafficApiClient {
       const rows = normalizeUsageRows(query.range, createFilteredUsage(query));
       const page = paginate(rows, query.page ?? 1, query.pageSize ?? 25);
       return {
-        dataSource: query.range === '90d' ? 'usage_1h' : 'usage_1m',
+        dataSource: 'usage_1m',
         rows: page.rows,
         nextCursor: null,
         page: page.page,
@@ -676,7 +675,7 @@ export function createMockApiClient(): TrafficApiClient {
     },
     async getTopPorts(range) {
       return {
-        dataSource: range === '90d' ? 'usage_1h' : 'usage_1m',
+        dataSource: 'usage_1m',
         rows: topRowsFromUsage(createFilteredUsage({ range }), (row) => row.localPort ?? 'unknown').slice(0, 5),
       };
     },
@@ -689,7 +688,7 @@ export function createMockApiClient(): TrafficApiClient {
       const rows = createFilteredForward(query);
       const page = paginate(rows, query.page ?? 1, query.pageSize ?? 25);
       return {
-        dataSource: query.range === '90d' ? 'usage_1h_forward' : 'usage_1m_forward',
+        dataSource: 'usage_1m_forward',
         rows: page.rows,
         nextCursor: null,
         page: page.page,

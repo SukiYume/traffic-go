@@ -1,7 +1,7 @@
 import type { RangeKey } from '../types';
 import { rangeLabel } from '../utils';
 
-const ranges: RangeKey[] = ['1h', '24h', '7d', '30d', '90d'];
+const ranges: RangeKey[] = ['1h', '24h', '7d', 'this_month', 'last_month', 'two_months_ago'];
 
 export function RangeSelect({
   value,

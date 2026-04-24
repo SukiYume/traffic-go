@@ -9,7 +9,7 @@ import (
 
 func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	content := []byte("retention:\n  flows_days: 0\n  hourly_days: 0\n")
+	content := []byte("retention:\n  months: 0\n  flows_days: 0\n  hourly_days: 0\n")
 	if err := os.WriteFile(configPath, content, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -18,11 +18,8 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Retention.MinuteDays != 30 {
-		t.Fatalf("expected default minute retention, got %d", cfg.Retention.MinuteDays)
-	}
-	if cfg.Retention.HourlyDays != 180 {
-		t.Fatalf("expected default hourly retention, got %d", cfg.Retention.HourlyDays)
+	if cfg.Retention.Months != 3 {
+		t.Fatalf("expected default month retention, got %d", cfg.Retention.Months)
 	}
 	if cfg.NginxLogDir != "" {
 		t.Fatalf("expected empty nginx_log_dir by default, got %s", cfg.NginxLogDir)

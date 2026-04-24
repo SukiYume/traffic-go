@@ -39,10 +39,9 @@ process_log_dirs:
 shadowsocks_journal_fallback: true
 
 retention:
-  flows_days: 30
-  hourly_days: 180
-  # Queries longer than flows_days automatically fall back to hourly aggregates
-  # and lose pid/exe-level filtering.
+  months: 3
+  # Full detail is retained by UTC calendar month: current month plus the
+  # previous two months. Expired months are summarized before detail cleanup.
 
 prefetch:
   enabled: true

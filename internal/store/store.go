@@ -35,6 +35,22 @@ type Store struct {
 	now       func() time.Time
 }
 
+func effectiveRetentionMonths(retention config.Retention) int {
+	if retention.Months <= 0 {
+		return 3
+	}
+	return retention.Months
+}
+
+func monthStartUTC(value time.Time) time.Time {
+	year, month, _ := value.UTC().Date()
+	return time.Date(year, month, 1, 0, 0, 0, 0, time.UTC)
+}
+
+func retentionStartUTC(now time.Time, retention config.Retention) time.Time {
+	return monthStartUTC(now).AddDate(0, -(effectiveRetentionMonths(retention) - 1), 0)
+}
+
 func Open(cfg config.Config) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o755); err != nil && filepath.Dir(cfg.DBPath) != "." {
 		return nil, fmt.Errorf("create db directory: %w", err)
@@ -407,8 +423,7 @@ ON CONFLICT(hour_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO
 }
 
 func (s *Store) Cleanup(ctx context.Context) error {
-	minuteCutoff := s.now().Add(-time.Duration(s.retention.MinuteDays) * 24 * time.Hour).Unix()
-	hourCutoff := s.now().Add(-time.Duration(s.retention.HourlyDays) * 24 * time.Hour).Unix()
+	cutoff := retentionStartUTC(s.now(), s.retention).Unix()
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -416,17 +431,22 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 
+	if err := s.summarizeExpiredMonths(ctx, tx, cutoff); err != nil {
+		return err
+	}
+
 	statements := []struct {
 		query string
 		arg   int64
 	}{
-		{`DELETE FROM usage_1m WHERE minute_ts < ?`, minuteCutoff},
-		{`DELETE FROM usage_1h WHERE hour_ts < ?`, hourCutoff},
-		{`DELETE FROM usage_1m_forward WHERE minute_ts < ?`, minuteCutoff},
-		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, hourCutoff},
-		{`DELETE FROM usage_chain_1m WHERE minute_ts < ?`, minuteCutoff},
-		{`DELETE FROM usage_chain_1h WHERE hour_ts < ?`, hourCutoff},
-		{`DELETE FROM log_evidence WHERE created_at < ?`, minuteCutoff},
+		{`DELETE FROM usage_1m WHERE minute_ts < ?`, cutoff},
+		{`DELETE FROM usage_1h WHERE hour_ts < ?`, cutoff},
+		{`DELETE FROM usage_1m_forward WHERE minute_ts < ?`, cutoff},
+		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, cutoff},
+		{`DELETE FROM usage_chain_1m WHERE minute_ts < ?`, cutoff},
+		{`DELETE FROM usage_chain_1h WHERE hour_ts < ?`, cutoff},
+		{`DELETE FROM log_evidence WHERE event_ts < ?`, cutoff},
+		{`DELETE FROM dirty_chain_hours WHERE hour_ts < ?`, cutoff},
 	}
 
 	for _, stmt := range statements {
@@ -436,6 +456,128 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	}
 
 	return tx.Commit()
+}
+
+func (s *Store) summarizeExpiredMonths(ctx context.Context, tx *sql.Tx, cutoff int64) error {
+	updatedAt := s.now().UTC().Unix()
+	_, err := tx.ExecContext(ctx, `
+WITH minute_detail_months AS (
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_1m
+    WHERE minute_ts < ?
+),
+forward_detail_months AS (
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_1m_forward
+    WHERE minute_ts < ?
+),
+chain_detail_months AS (
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_chain_1m
+    WHERE minute_ts < ?
+),
+raw_months AS (
+    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           COALESCE(SUM(bytes_up), 0) AS bytes_up,
+           COALESCE(SUM(bytes_down), 0) AS bytes_down,
+           COALESCE(SUM(flow_count), 0) AS flow_count,
+           0 AS forward_bytes_orig,
+           0 AS forward_bytes_reply,
+           0 AS forward_flow_count,
+           0 AS evidence_count,
+           0 AS chain_count
+    FROM usage_1m
+    WHERE minute_ts < ?
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           COALESCE(SUM(bytes_up), 0),
+           COALESCE(SUM(bytes_down), 0),
+           COALESCE(SUM(flow_count), 0),
+           0, 0, 0, 0, 0
+    FROM usage_1h
+    WHERE hour_ts < ?
+      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
+          SELECT month_ts FROM minute_detail_months
+      )
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0,
+           COALESCE(SUM(bytes_orig), 0),
+           COALESCE(SUM(bytes_reply), 0),
+           COALESCE(SUM(flow_count), 0),
+           0,
+           0
+    FROM usage_1m_forward
+    WHERE minute_ts < ?
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0,
+           COALESCE(SUM(bytes_orig), 0),
+           COALESCE(SUM(bytes_reply), 0),
+           COALESCE(SUM(flow_count), 0),
+           0,
+           0
+    FROM usage_1h_forward
+    WHERE hour_ts < ?
+      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
+          SELECT month_ts FROM forward_detail_months
+      )
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(event_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0, 0, 0, 0,
+           COUNT(*),
+           0
+    FROM log_evidence
+    WHERE event_ts < ?
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0, 0, 0, 0, 0,
+           COUNT(*)
+    FROM usage_chain_1m
+    WHERE minute_ts < ?
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0, 0, 0, 0, 0,
+           COUNT(*)
+    FROM usage_chain_1h
+    WHERE hour_ts < ?
+      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
+          SELECT month_ts FROM chain_detail_months
+      )
+    GROUP BY month_ts
+),
+monthly AS (
+    SELECT month_ts,
+           COALESCE(SUM(bytes_up), 0) AS bytes_up,
+           COALESCE(SUM(bytes_down), 0) AS bytes_down,
+           COALESCE(SUM(flow_count), 0) AS flow_count,
+           COALESCE(SUM(forward_bytes_orig), 0) AS forward_bytes_orig,
+           COALESCE(SUM(forward_bytes_reply), 0) AS forward_bytes_reply,
+           COALESCE(SUM(forward_flow_count), 0) AS forward_flow_count,
+           COALESCE(SUM(evidence_count), 0) AS evidence_count,
+           COALESCE(SUM(chain_count), 0) AS chain_count
+    FROM raw_months
+    WHERE month_ts IS NOT NULL
+    GROUP BY month_ts
+)
+INSERT OR REPLACE INTO usage_monthly (
+    month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
+    forward_flow_count, evidence_count, chain_count, updated_at
+)
+SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
+       forward_flow_count, evidence_count, chain_count, ?
+FROM monthly
+`, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, updatedAt)
+	if err != nil {
+		return fmt.Errorf("summarize expired months: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) LastAggregatedHour(ctx context.Context) (time.Time, bool, error) {
@@ -542,9 +684,7 @@ func (s *Store) ResolveUsageSource(start, end time.Time, pidFilter bool, exeFilt
 	if end.Before(start) {
 		return "", fmt.Errorf("end before start")
 	}
-	minuteWindow := time.Duration(s.retention.MinuteDays) * 24 * time.Hour
-	minuteCutoff := s.now().UTC().Add(-minuteWindow)
-	if start.UTC().Before(minuteCutoff) || end.Sub(start) > minuteWindow {
+	if start.UTC().Before(retentionStartUTC(s.now(), s.retention)) {
 		if pidFilter || exeFilter {
 			return "", ErrDimensionUnavailable
 		}

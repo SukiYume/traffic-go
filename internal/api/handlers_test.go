@@ -91,9 +91,55 @@ func setProcessLogDir(server *Server, processKey string, dir string) {
 	server.processLogDirs[processKey] = dir
 }
 
+func TestParseWindowSupportsNaturalMonthRanges(t *testing.T) {
+	now := time.Date(2026, 4, 24, 10, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		rangeKey  string
+		wantLabel string
+		wantStart time.Time
+		wantEnd   time.Time
+	}{
+		{
+			name:      "this month",
+			rangeKey:  "this_month",
+			wantLabel: "this_month",
+			wantStart: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+			wantEnd:   time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:      "last month",
+			rangeKey:  "last_month",
+			wantLabel: "last_month",
+			wantStart: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+			wantEnd:   time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:      "two months ago",
+			rangeKey:  "two_months_ago",
+			wantLabel: "two_months_ago",
+			wantStart: time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC),
+			wantEnd:   time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats/overview?range="+tt.rangeKey, nil)
+			start, end, label, err := parseWindowAt(req, now)
+			if err != nil {
+				t.Fatalf("parse window: %v", err)
+			}
+			if label != tt.wantLabel || !start.Equal(tt.wantStart) || !end.Equal(tt.wantEnd) {
+				t.Fatalf("unexpected window: start=%s end=%s label=%s", start, end, label)
+			}
+		})
+	}
+}
+
 func TestUsageDimensionUnavailable(t *testing.T) {
 	server := newTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?range=90d&pid=12", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?start=0&end=3600&pid=12", nil)
 	rec := httptest.NewRecorder()
 
 	server.Handler().ServeHTTP(rec, req)
@@ -121,7 +167,7 @@ func TestHealthz(t *testing.T) {
 
 func TestTimeseriesDimensionUnavailable(t *testing.T) {
 	server := newTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats/timeseries?range=90d&pid=12", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats/timeseries?start=0&end=3600&pid=12", nil)
 	rec := httptest.NewRecorder()
 
 	server.Handler().ServeHTTP(rec, req)
@@ -169,7 +215,7 @@ func TestUsageRejectsCursorSortOverrides(t *testing.T) {
 
 func TestUsageRejectsRemotePortForHourlySource(t *testing.T) {
 	server := newTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?range=90d&remote_port=443", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?start=0&end=3600&remote_port=443", nil)
 	rec := httptest.NewRecorder()
 
 	server.Handler().ServeHTTP(rec, req)

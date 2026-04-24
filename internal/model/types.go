@@ -209,6 +209,19 @@ type CollectorDiagnostics struct {
 	ProcessHintCount           int              `json:"process_hint_count"`
 }
 
+type MonthlyUsageSummary struct {
+	MonthTS           int64 `json:"month_ts"`
+	BytesUp           int64 `json:"bytes_up"`
+	BytesDown         int64 `json:"bytes_down"`
+	FlowCount         int64 `json:"flow_count"`
+	ForwardBytesOrig  int64 `json:"forward_bytes_orig"`
+	ForwardBytesReply int64 `json:"forward_bytes_reply"`
+	ForwardFlowCount  int64 `json:"forward_flow_count"`
+	EvidenceCount     int64 `json:"evidence_count"`
+	ChainCount        int64 `json:"chain_count"`
+	UpdatedAt         int64 `json:"updated_at"`
+}
+
 type LogEvidence struct {
 	Source         string
 	EventTS        int64
