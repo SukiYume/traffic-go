@@ -25,7 +25,7 @@ process_log_dirs:
   ss-server: /var/log/shadowsocks
   ss-manager: /var/log/shadowsocks
   obfs-server: /var/log/shadowsocks
-  frps: /var/log/frps/*.log
+  frps: /root/frp_0630/*.log
   # rustdesk: /var/log/rustdesk
 
 # Legacy compatibility keys (optional).
