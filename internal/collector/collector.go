@@ -383,7 +383,8 @@ func (s *Service) updateSnapshot(
 		return snapshot, &delta, nil, true, false
 	}
 
-	if snapshotTupleChanged(prev, snapshot) || flow.OrigBytes < prev.LastOrig || flow.ReplyBytes < prev.LastReply {
+	newLineage := exists && !lineageContinues
+	if newLineage || snapshotTupleChanged(prev, snapshot) || flow.OrigBytes < prev.LastOrig || flow.ReplyBytes < prev.LastReply {
 		if lineageContinues {
 			// Reclassification or transient counter anomalies on the same conntrack
 			// lineage should not double-count the flow, but the caller still needs

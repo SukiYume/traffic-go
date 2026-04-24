@@ -735,6 +735,76 @@ func TestTupleReuseKeepsPreviousContributionInOriginalBucket(t *testing.T) {
 	}
 }
 
+func TestTupleReuseWithHigherCountersStartsNewLineage(t *testing.T) {
+	service := &Service{}
+	now := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	classified := classifiedFlow{
+		Proto:      "tcp",
+		Direction:  model.DirectionOut,
+		LocalIP:    "10.0.0.2",
+		LocalPort:  47920,
+		RemoteIP:   "198.51.100.44",
+		RemotePort: 443,
+		Connected:  true,
+	}
+	process := model.ProcessInfo{PID: 1088, Comm: "ss-server", Exe: "/usr/bin/ss-server"}
+
+	prev := model.FlowSnapshot{
+		CTID:          1001,
+		Proto:         "tcp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     47920,
+		RemoteIP:      "198.51.100.44",
+		RemotePort:    443,
+		PID:           process.PID,
+		Comm:          process.Comm,
+		Exe:           process.Exe,
+		Attribution:   model.AttributionExact,
+		StartedAt:     now,
+		BaselineOrig:  100,
+		BaselineReply: 200,
+		LastOrig:      100,
+		LastReply:     200,
+		BaselineOPkts: 1,
+		BaselineRPkts: 2,
+		LastOPkts:     1,
+		LastRPkts:     2,
+		Counted:       true,
+		LastSeen:      now,
+	}
+
+	snapshot, delta, _, countFlow, resetOwners := service.updateSnapshot(
+		now.Add(2*time.Second),
+		model.ConntrackFlow{
+			CTID:       2001,
+			Proto:      "tcp",
+			OrigBytes:  300,
+			ReplyBytes: 500,
+			OrigPkts:   3,
+			ReplyPkts:  5,
+		},
+		classified,
+		process,
+		prev,
+		true,
+		true,
+		false,
+	)
+	if !resetOwners {
+		t.Fatalf("expected changed conntrack lineage to reset ownership")
+	}
+	if !countFlow {
+		t.Fatalf("expected changed conntrack lineage to count a new flow")
+	}
+	if delta == nil || delta.upBytes != 300 || delta.downBytes != 500 || delta.upPkts != 3 || delta.downPkts != 5 {
+		t.Fatalf("expected new lineage to start from current counters, got delta=%+v", delta)
+	}
+	if snapshot.CTID != 2001 || !snapshot.Counted {
+		t.Fatalf("unexpected new lineage snapshot: %+v", snapshot)
+	}
+}
+
 func TestProcessResolverThrottlesRepeatedUnknownInodeScans(t *testing.T) {
 	base := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
 	current := base
