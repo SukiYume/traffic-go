@@ -38,6 +38,7 @@ func writeGzipFile(path string, text string) error {
 type stubRuntime struct {
 	processes []model.ProcessListItem
 	stats     model.ActiveStats
+	diag      model.CollectorDiagnostics
 }
 
 func (s stubRuntime) ActiveProcesses() []model.ProcessListItem {
@@ -46,6 +47,10 @@ func (s stubRuntime) ActiveProcesses() []model.ProcessListItem {
 
 func (s stubRuntime) ActiveStats() model.ActiveStats {
 	return s.stats
+}
+
+func (s stubRuntime) Diagnostics() model.CollectorDiagnostics {
+	return s.diag
 }
 
 func newTestServer(t *testing.T) *Server {
@@ -64,6 +69,18 @@ func newTestServer(t *testing.T) *Server {
 			{PID: 42, Comm: "ss-server", Exe: "/usr/bin/ss-server"},
 		},
 		stats: model.ActiveStats{Connections: 3, Processes: 1},
+		diag: model.CollectorDiagnostics{
+			ActiveConnections:          3,
+			ActiveProcesses:            1,
+			UnresolvedLocalConnections: 1,
+			AttributionCounts: map[string]int64{
+				string(model.AttributionExact):   2,
+				string(model.AttributionUnknown): 1,
+			},
+			SnapshotReady:    true,
+			SocketIndexReady: true,
+			LocalIPCount:     2,
+		},
 	}, nil, embed.StaticFS(), cfg.ProcessLogDirs, true)
 }
 
@@ -1097,6 +1114,34 @@ func TestProcessesAndOverviewUseRuntimeView(t *testing.T) {
 	overviewBody, _ := io.ReadAll(overviewRec.Body)
 	if !strings.Contains(string(overviewBody), "\"active_connections\":3") || !strings.Contains(string(overviewBody), "\"active_processes\":1") {
 		t.Fatalf("unexpected overview body: %s", string(overviewBody))
+	}
+}
+
+func TestCollectorDiagnosticsEndpointUsesRuntimeView(t *testing.T) {
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/diagnostics/collector", nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected diagnostics status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	for _, expected := range []string{
+		`"active_connections":3`,
+		`"active_processes":1`,
+		`"unresolved_local_connections":1`,
+		`"exact":2`,
+		`"unknown":1`,
+		`"snapshot_ready":true`,
+		`"socket_index_ready":true`,
+		`"local_ip_count":2`,
+	} {
+		if !strings.Contains(bodyText, expected) {
+			t.Fatalf("expected diagnostics body to contain %s, got %s", expected, bodyText)
+		}
 	}
 }
 

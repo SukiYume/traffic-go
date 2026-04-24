@@ -15,6 +15,7 @@ import (
 type runtimeProvider interface {
 	ActiveProcesses() []model.ProcessListItem
 	ActiveStats() model.ActiveStats
+	Diagnostics() model.CollectorDiagnostics
 }
 
 type shadowsocksJournalReader func(context.Context, time.Time, time.Time) ([]string, error)
@@ -71,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/top/remotes", s.handleTopRemotes)
 	mux.HandleFunc("/api/v1/top/ports", s.handleTopPorts)
 	mux.HandleFunc("/api/v1/forward/usage", s.handleForwardUsage)
+	mux.HandleFunc("/api/v1/diagnostics/collector", s.handleCollectorDiagnostics)
 	mux.Handle("/", s.spaHandler())
 	return loggingMiddleware(s.logger, mux)
 }

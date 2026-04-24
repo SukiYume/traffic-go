@@ -31,6 +31,12 @@ func (n *noopCollector) ActiveStats() model.ActiveStats {
 	return model.ActiveStats{}
 }
 
+func (n *noopCollector) Diagnostics() model.CollectorDiagnostics {
+	return model.CollectorDiagnostics{
+		AttributionCounts: make(map[string]int64),
+	}
+}
+
 func (m *mockCollector) Start(ctx context.Context) error {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -83,5 +89,16 @@ func (m *mockCollector) ActiveStats() model.ActiveStats {
 	return model.ActiveStats{
 		Connections: 1,
 		Processes:   1,
+	}
+}
+
+func (m *mockCollector) Diagnostics() model.CollectorDiagnostics {
+	return model.CollectorDiagnostics{
+		ActiveConnections: 1,
+		ActiveProcesses:   1,
+		AttributionCounts: map[string]int64{
+			string(model.AttributionExact): 1,
+		},
+		SnapshotReady: true,
 	}
 }

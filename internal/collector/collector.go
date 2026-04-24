@@ -20,6 +20,7 @@ type Runner interface {
 	Start(context.Context) error
 	ActiveProcesses() []model.ProcessListItem
 	ActiveStats() model.ActiveStats
+	Diagnostics() model.CollectorDiagnostics
 }
 
 type Service struct {
@@ -113,6 +114,12 @@ func (f *failingCollector) ActiveStats() model.ActiveStats {
 	return model.ActiveStats{}
 }
 
+func (f *failingCollector) Diagnostics() model.CollectorDiagnostics {
+	return model.CollectorDiagnostics{
+		AttributionCounts: make(map[string]int64),
+	}
+}
+
 func (s *Service) Start(ctx context.Context) error {
 	s.currentMinute = time.Now().UTC().Truncate(time.Minute)
 	if err := s.refreshLocalIPs(); err != nil {
@@ -148,7 +155,7 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 		s.currentMinute = minute
 	}
 
-	if now.Sub(s.lastIPRefresh) >= 30*time.Second || len(s.localIPs) == 0 {
+	if now.Sub(s.lastIPRefreshTime()) >= 30*time.Second || s.localIPCount() == 0 {
 		if err := s.refreshLocalIPs(); err != nil {
 			s.logger.Printf("refresh local IPs: %v", err)
 		}
@@ -169,7 +176,8 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 	s.pruneProcessHints(now)
 
 	inodesNeeded := make(map[uint64]struct{})
-	observed := normalizeObservedFlows(flows, s.localIPs, socketIndex)
+	localIPs := s.localIPSnapshot()
+	observed := normalizeObservedFlows(flows, localIPs, socketIndex)
 	for _, flow := range observed {
 		if flow.Classified.Inode > 0 {
 			inodesNeeded[flow.Classified.Inode] = struct{}{}
@@ -229,21 +237,29 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 }
 
 func (s *Service) socketIndexSnapshot(now time.Time) (socketIndex, error) {
+	s.runtimeMu.RLock()
 	if s.socketReady && now.Sub(s.lastSockRefresh) < defaultSocketIndexTTL {
-		return s.socketIndex, nil
+		index := s.socketIndex
+		s.runtimeMu.RUnlock()
+		return index, nil
 	}
+	socketReady := s.socketReady
+	cachedIndex := s.socketIndex
+	s.runtimeMu.RUnlock()
 
 	index, err := ReadSocketIndex(s.cfg.ProcFS)
 	if err != nil {
-		if s.socketReady {
-			return s.socketIndex, nil
+		if socketReady {
+			return cachedIndex, nil
 		}
 		return socketIndex{}, err
 	}
 
+	s.runtimeMu.Lock()
 	s.socketIndex = index
 	s.lastSockRefresh = now
 	s.socketReady = true
+	s.runtimeMu.Unlock()
 	return index, nil
 }
 
@@ -756,9 +772,34 @@ func (s *Service) refreshLocalIPs() error {
 			localIPs[ip.String()] = struct{}{}
 		}
 	}
+	s.runtimeMu.Lock()
 	s.localIPs = localIPs
 	s.lastIPRefresh = time.Now().UTC()
+	s.runtimeMu.Unlock()
 	return nil
+}
+
+func (s *Service) localIPSnapshot() map[string]struct{} {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+
+	copied := make(map[string]struct{}, len(s.localIPs))
+	for ip := range s.localIPs {
+		copied[ip] = struct{}{}
+	}
+	return copied
+}
+
+func (s *Service) localIPCount() int {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return len(s.localIPs)
+}
+
+func (s *Service) lastIPRefreshTime() time.Time {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return s.lastIPRefresh
 }
 
 func (s *Service) ActiveProcesses() []model.ProcessListItem {
@@ -806,6 +847,60 @@ func (s *Service) ActiveStats() model.ActiveStats {
 	}
 }
 
+func (s *Service) Diagnostics() model.CollectorDiagnostics {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+
+	byPID := make(map[int]struct{})
+	attributionCounts := map[string]int64{
+		string(model.AttributionExact):     0,
+		string(model.AttributionHeuristic): 0,
+		string(model.AttributionGuess):     0,
+		string(model.AttributionUnknown):   0,
+	}
+	var unresolvedLocal int64
+	for _, snapshot := range s.snapshots {
+		if snapshot.PID > 0 {
+			byPID[snapshot.PID] = struct{}{}
+		}
+		if snapshot.Direction != model.DirectionForward {
+			attribution := string(snapshot.Attribution)
+			if attribution == "" {
+				attribution = string(model.AttributionUnknown)
+			}
+			attributionCounts[attribution]++
+			if snapshot.PID <= 0 {
+				unresolvedLocal++
+			}
+		}
+	}
+
+	now := time.Now().UTC()
+	var socketAge *int64
+	if s.socketReady && !s.lastSockRefresh.IsZero() {
+		age := int64(now.Sub(s.lastSockRefresh).Seconds())
+		socketAge = &age
+	}
+	var localIPAge *int64
+	if !s.lastIPRefresh.IsZero() {
+		age := int64(now.Sub(s.lastIPRefresh).Seconds())
+		localIPAge = &age
+	}
+
+	return model.CollectorDiagnostics{
+		ActiveConnections:          int64(len(s.snapshots)),
+		ActiveProcesses:            int64(len(byPID)),
+		UnresolvedLocalConnections: unresolvedLocal,
+		AttributionCounts:          attributionCounts,
+		SnapshotReady:              s.snapshotReady,
+		SocketIndexReady:           s.socketReady,
+		SocketIndexAgeSeconds:      socketAge,
+		LocalIPCount:               len(s.localIPs),
+		LocalIPAgeSeconds:          localIPAge,
+		ProcessHintCount:           len(s.processHints),
+	}
+}
+
 func (s *Service) snapshotCopy() map[string]model.FlowSnapshot {
 	s.runtimeMu.RLock()
 	defer s.runtimeMu.RUnlock()
@@ -839,6 +934,8 @@ func (s *Service) lookupProcessHint(classified classifiedFlow, now time.Time) (m
 		return model.ProcessInfo{}, false
 	}
 	key := hintKey(classified.Proto, classified.Direction, classified.LocalIP, classified.LocalPort, classified.RemoteIP, classified.RemotePort)
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	hint, ok := s.processHints[key]
 	if !ok {
 		return model.ProcessInfo{}, false
@@ -855,6 +952,8 @@ func (s *Service) rememberProcessHint(snapshot model.FlowSnapshot, now time.Time
 		return
 	}
 	key := hintKey(snapshot.Proto, snapshot.Direction, snapshot.LocalIP, snapshot.LocalPort, snapshot.RemoteIP, snapshot.RemotePort)
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	s.processHints[key] = processHint{
 		process: model.ProcessInfo{PID: snapshot.PID, Comm: snapshot.Comm, Exe: snapshot.Exe},
 		expires: now.Add(defaultProcessHintTTL),
@@ -862,6 +961,8 @@ func (s *Service) rememberProcessHint(snapshot model.FlowSnapshot, now time.Time
 }
 
 func (s *Service) pruneProcessHints(now time.Time) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	for key, hint := range s.processHints {
 		if !hint.expires.After(now) {
 			delete(s.processHints, key)

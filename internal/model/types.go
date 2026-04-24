@@ -196,6 +196,19 @@ type ActiveStats struct {
 	Processes   int64
 }
 
+type CollectorDiagnostics struct {
+	ActiveConnections          int64            `json:"active_connections"`
+	ActiveProcesses            int64            `json:"active_processes"`
+	UnresolvedLocalConnections int64            `json:"unresolved_local_connections"`
+	AttributionCounts          map[string]int64 `json:"attribution_counts"`
+	SnapshotReady              bool             `json:"snapshot_ready"`
+	SocketIndexReady           bool             `json:"socket_index_ready"`
+	SocketIndexAgeSeconds      *int64           `json:"socket_index_age_seconds,omitempty"`
+	LocalIPCount               int              `json:"local_ip_count"`
+	LocalIPAgeSeconds          *int64           `json:"local_ip_age_seconds,omitempty"`
+	ProcessHintCount           int              `json:"process_hint_count"`
+}
+
 type LogEvidence struct {
 	Source         string
 	EventTS        int64

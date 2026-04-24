@@ -24,6 +24,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, envelope{"ok": true})
 }
 
+func (s *Server) handleCollectorDiagnostics(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, envelope{"data": s.runtime.Diagnostics()})
+}
+
 func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	processes, err := s.store.QueryKnownProcesses(r.Context(), processSuggestionLimit)
 	if err != nil {

@@ -380,6 +380,7 @@ location /traffic/ {
 主要接口：
 
 - `GET /api/v1/healthz`
+- `GET /api/v1/diagnostics/collector`
 - `GET /api/v1/processes`
 - `GET /api/v1/stats/overview`
 - `GET /api/v1/stats/timeseries`
@@ -407,6 +408,12 @@ LISTEN_ADDR=<listen-address>
 
 ```bash
 curl "http://${LISTEN_ADDR}/api/v1/healthz"
+```
+
+采集器诊断：
+
+```bash
+curl "http://${LISTEN_ADDR}/api/v1/diagnostics/collector"
 ```
 
 过去 1 小时总览：

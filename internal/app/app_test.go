@@ -324,3 +324,9 @@ func (c *blockingCollector) ActiveProcesses() []model.ProcessListItem {
 func (c *blockingCollector) ActiveStats() model.ActiveStats {
 	return model.ActiveStats{}
 }
+
+func (c *blockingCollector) Diagnostics() model.CollectorDiagnostics {
+	return model.CollectorDiagnostics{
+		AttributionCounts: make(map[string]int64),
+	}
+}
