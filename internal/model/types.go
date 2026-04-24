@@ -40,9 +40,10 @@ type ConntrackFlow struct {
 }
 
 type ProcessInfo struct {
-	PID  int
-	Comm string
-	Exe  string
+	PID       int
+	Comm      string
+	Exe       string
+	Ambiguous bool
 }
 
 type FlowSnapshot struct {

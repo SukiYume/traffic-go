@@ -22,7 +22,7 @@ const canonicalQueryAllowlist: Record<string, string[]> = {
   '/': ['range'],
   '/usage': ['range', 'comm', 'pid', 'exe', 'remoteIp', 'localPort', 'direction', 'proto', 'attribution'],
   '/processes': ['range'],
-  '/remotes': ['range', 'direction', 'include_loopback'],
+  '/remotes': ['range', 'direction', 'include_loopback', 'exclude_loopback'],
   '/forward': ['range', 'origSrcIp', 'origDstIp', 'proto'],
   '/history': [],
 };

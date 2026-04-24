@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,6 +33,7 @@ var ErrCursorSortUnsupported = errors.New("cursor pagination only supports time-
 
 type Store struct {
 	db        *sql.DB
+	readDB    *sql.DB
 	retention config.Retention
 	now       func() time.Time
 }
@@ -57,15 +59,10 @@ func Open(cfg config.Config) (*Store, error) {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", cfg.DBPath)
+	db, err := openSQLiteDB(cfg.DBPath, 1, false)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	// Keep the application on a single SQLite connection so WAL/busy-timeout
-	// settings stay consistent across HTTP queries, collector flushes, and
-	// background maintenance jobs.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 
 	store := &Store{
 		db:        db,
@@ -76,14 +73,67 @@ func Open(cfg config.Config) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+
+	readDB, err := openSQLiteDB(cfg.DBPath, 4, true)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open sqlite read pool: %w", err)
+	}
+	store.readDB = readDB
 	return store, nil
 }
 
 func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
 		return nil
 	}
-	return s.db.Close()
+	var firstErr error
+	if s.readDB != nil {
+		if err := s.readDB.Close(); err != nil {
+			firstErr = err
+		}
+	}
+	if s.db != nil {
+		if err := s.db.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func openSQLiteDB(path string, maxOpen int, queryOnly bool) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", sqliteDSN(path, queryOnly))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxOpen)
+	return db, nil
+}
+
+func sqliteDSN(path string, queryOnly bool) string {
+	values := url.Values{}
+	values.Add("_pragma", "busy_timeout=5000")
+	values.Add("_pragma", "journal_mode(WAL)")
+	values.Add("_pragma", "synchronous(NORMAL)")
+	if queryOnly {
+		values.Add("_pragma", "query_only(1)")
+	}
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + values.Encode()
+}
+
+func (s *Store) queryDB() *sql.DB {
+	if s != nil && s.readDB != nil {
+		return s.readDB
+	}
+	if s == nil {
+		return nil
+	}
+	return s.db
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -660,7 +710,8 @@ func ForwardDataSource(source string) string {
 
 func (s *Store) QueryKnownProcesses(ctx context.Context, limit int) ([]model.ProcessListItem, error) {
 	resolvedLimit := clampPageSize(limit)
-	rows, err := s.db.QueryContext(ctx, `
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, `
 WITH minute_processes AS (
     SELECT pid, comm, exe, MAX(minute_ts) AS seen_ts
     FROM usage_1m

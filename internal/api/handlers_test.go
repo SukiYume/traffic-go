@@ -82,7 +82,7 @@ func newTestServer(t *testing.T) *Server {
 			SocketIndexReady: true,
 			LocalIPCount:     2,
 		},
-	}, nil, embed.StaticFS(), cfg.ProcessLogDirs, true)
+	}, nil, embed.StaticFS(), cfg.ProcessLogDirs, BasicAuthConfig{}, true)
 }
 
 func setProcessLogDir(server *Server, processKey string, dir string) {
@@ -163,6 +163,41 @@ func TestHealthz(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+}
+
+func TestBasicAuthProtectsSensitiveRoutes(t *testing.T) {
+	server := newTestServer(t)
+	server.auth = BasicAuthConfig{Username: "admin", Password: "secret"}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/processes", nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized response, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Header().Get("WWW-Authenticate"), "Basic") {
+		t.Fatalf("expected basic auth challenge, got %q", rec.Header().Get("WWW-Authenticate"))
+	}
+
+	authedReq := httptest.NewRequest(http.MethodGet, "/api/v1/processes", nil)
+	authedReq.SetBasicAuth("admin", "secret")
+	authedRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(authedRec, authedReq)
+	if authedRec.Code != http.StatusOK {
+		t.Fatalf("expected authenticated request to pass, got %d body=%s", authedRec.Code, authedRec.Body.String())
+	}
+}
+
+func TestBasicAuthLeavesHealthzOpen(t *testing.T) {
+	server := newTestServer(t)
+	server.auth = BasicAuthConfig{Username: "admin", Password: "secret"}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/healthz", nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected healthz without credentials to pass, got %d", rec.Code)
 	}
 }
 
@@ -674,6 +709,24 @@ func TestTopRemotesResponseNormalizesPageMetadata(t *testing.T) {
 			PktsDown:  5,
 			FlowCount: 1,
 		},
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1045,
+			Comm:        "nginx",
+			Exe:         "/usr/sbin/nginx",
+			LocalPort:   52000,
+			RemoteIP:    "127.0.0.1",
+			RemotePort:  18080,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   4096,
+			BytesDown: 8192,
+			PktsUp:    8,
+			PktsDown:  12,
+			FlowCount: 2,
+		},
 	}, nil); err != nil {
 		t.Fatalf("seed top remote row: %v", err)
 	}
@@ -692,6 +745,20 @@ func TestTopRemotesResponseNormalizesPageMetadata(t *testing.T) {
 	bodyText := string(body)
 	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
 		t.Fatalf("expected normalized top-remote page metadata, got %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"remote_ip":"127.0.0.1"`) {
+		t.Fatalf("expected top-remotes to include loopback by default, got %s", bodyText)
+	}
+
+	excludeReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/top/remotes?start=%s&end=%s&exclude_loopback=1", start, end), nil)
+	excludeRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(excludeRec, excludeReq)
+	if excludeRec.Code != http.StatusOK {
+		t.Fatalf("unexpected exclude status: %d", excludeRec.Code)
+	}
+	excludeBody, _ := io.ReadAll(excludeRec.Body)
+	if strings.Contains(string(excludeBody), `"remote_ip":"127.0.0.1"`) {
+		t.Fatalf("expected exclude_loopback to hide loopback rows, got %s", string(excludeBody))
 	}
 }
 

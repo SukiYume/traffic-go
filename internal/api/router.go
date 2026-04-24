@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"io/fs"
 	"log"
 	"net/http"
@@ -20,12 +21,18 @@ type runtimeProvider interface {
 
 type shadowsocksJournalReader func(context.Context, time.Time, time.Time) ([]string, error)
 
+type BasicAuthConfig struct {
+	Username string
+	Password string
+}
+
 type Server struct {
 	store                   *store.Store
 	runtime                 runtimeProvider
 	logger                  *log.Logger
 	static                  fs.FS
 	processLogDirs          map[string]string
+	auth                    BasicAuthConfig
 	enableSSJournalFallback bool
 	readShadowsocksJournal  shadowsocksJournalReader
 }
@@ -36,6 +43,7 @@ func NewServer(
 	logger *log.Logger,
 	static fs.FS,
 	processLogDirs map[string]string,
+	auth BasicAuthConfig,
 	enableSSJournalFallback bool,
 ) *Server {
 	return &Server{
@@ -44,6 +52,7 @@ func NewServer(
 		logger:                  logger,
 		static:                  static,
 		processLogDirs:          cloneStringMap(processLogDirs),
+		auth:                    auth,
 		enableSSJournalFallback: enableSSJournalFallback,
 		readShadowsocksJournal:  defaultShadowsocksJournalReader,
 	}
@@ -75,7 +84,36 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/forward/usage", s.handleForwardUsage)
 	mux.HandleFunc("/api/v1/diagnostics/collector", s.handleCollectorDiagnostics)
 	mux.Handle("/", s.spaHandler())
-	return loggingMiddleware(s.logger, mux)
+	var handler http.Handler = mux
+	if s.auth.enabled() {
+		handler = s.basicAuthMiddleware(handler)
+	}
+	return loggingMiddleware(s.logger, handler)
+}
+
+func (a BasicAuthConfig) enabled() bool {
+	return strings.TrimSpace(a.Username) != "" || strings.TrimSpace(a.Password) != ""
+}
+
+func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		username, password, ok := r.BasicAuth()
+		if ok &&
+			subtle.ConstantTimeCompare([]byte(username), []byte(s.auth.Username)) == 1 &&
+			subtle.ConstantTimeCompare([]byte(password), []byte(s.auth.Password)) == 1 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="traffic-go"`)
+		writeJSON(w, http.StatusUnauthorized, envelope{
+			"error":   "unauthorized",
+			"message": "valid basic authentication credentials are required",
+		})
+	})
 }
 
 func (s *Server) spaHandler() http.Handler {

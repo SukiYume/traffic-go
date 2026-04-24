@@ -45,6 +45,13 @@ type resolvedUsageWindow struct {
 	Source     string
 }
 
+type resolvedPagedUsageWindow struct {
+	resolvedUsageWindow
+	Page     int
+	PageSize int
+	Offset   int
+}
+
 func (s *Server) resolveWindowSource(w http.ResponseWriter, r *http.Request, usesPID bool, usesExe bool) (resolvedUsageWindow, bool) {
 	start, end, rangeLabel, err := parseWindow(r)
 	if err != nil {
@@ -70,6 +77,24 @@ func (s *Server) resolveSourceForWindow(w http.ResponseWriter, start time.Time, 
 		return "", false
 	}
 	return source, true
+}
+
+func (s *Server) resolvePagedWindowSource(w http.ResponseWriter, r *http.Request, usesPID bool, usesExe bool) (resolvedPagedUsageWindow, bool) {
+	window, ok := s.resolveWindowSource(w, r, usesPID, usesExe)
+	if !ok {
+		return resolvedPagedUsageWindow{}, false
+	}
+	page, pageSize, err := parsePageParams(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err)
+		return resolvedPagedUsageWindow{}, false
+	}
+	return resolvedPagedUsageWindow{
+		resolvedUsageWindow: window,
+		Page:                page,
+		PageSize:            pageSize,
+		Offset:              (page - 1) * pageSize,
+	}, true
 }
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
@@ -178,13 +203,8 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
-	window, ok := s.resolveWindowSource(w, r, false, false)
+	window, ok := s.resolvePagedWindowSource(w, r, false, false)
 	if !ok {
-		return
-	}
-	page, pageSize, err := parsePageParams(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_query", err)
 		return
 	}
 	entries, totalRows, err := s.store.QueryTopProcesses(
@@ -195,33 +215,28 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("group_by"),
 		r.URL.Query().Get("sort_by"),
 		r.URL.Query().Get("sort_order"),
-		pageSize,
-		(page-1)*pageSize,
+		window.PageSize,
+		window.Offset,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope{
-		"data_source": window.Source,
-		"data":        entries,
-		"total_rows":  totalRows,
-		"page":        page,
-		"page_size":   pageSize,
-	})
+	writePagedData(w, window.Source, entries, totalRows, window.Page, window.PageSize)
 }
 
 func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
-	window, ok := s.resolveWindowSource(w, r, false, false)
+	window, ok := s.resolvePagedWindowSource(w, r, false, false)
 	if !ok {
 		return
 	}
-	page, pageSize, err := parsePageParams(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_query", err)
-		return
+	includeLoopback := true
+	if r.URL.Query().Has("include_loopback") {
+		includeLoopback = parseBoolFlag(r.URL.Query().Get("include_loopback"))
 	}
-	includeLoopback := parseBoolFlag(r.URL.Query().Get("include_loopback"))
+	if parseBoolFlag(r.URL.Query().Get("exclude_loopback")) {
+		includeLoopback = false
+	}
 	entries, totalRows, err := s.store.QueryTopRemotes(
 		r.Context(),
 		window.Start,
@@ -231,20 +246,14 @@ func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
 		includeLoopback,
 		r.URL.Query().Get("sort_by"),
 		r.URL.Query().Get("sort_order"),
-		pageSize,
-		(page-1)*pageSize,
+		window.PageSize,
+		window.Offset,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope{
-		"data_source": window.Source,
-		"data":        entries,
-		"total_rows":  totalRows,
-		"page":        page,
-		"page_size":   pageSize,
-	})
+	writePagedData(w, window.Source, entries, totalRows, window.Page, window.PageSize)
 }
 
 func (s *Server) handleTopPorts(w http.ResponseWriter, r *http.Request) {
@@ -301,6 +310,16 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writePagedData(w http.ResponseWriter, source string, data any, totalRows int, page int, pageSize int) {
+	writeJSON(w, http.StatusOK, envelope{
+		"data_source": source,
+		"data":        data,
+		"total_rows":  totalRows,
+		"page":        page,
+		"page_size":   pageSize,
+	})
 }
 
 func writeError(w http.ResponseWriter, status int, code string, err error) {

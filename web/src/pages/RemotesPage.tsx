@@ -12,7 +12,7 @@ import { normalizeRemoteSortKey } from '../sort-keys';
 import type { RemoteSummaryRow } from '../types';
 import { buildRangedPath, useRangeSearchParam } from '../useRangeSearchParam';
 import { useResettingPage } from '../useResettingPage';
-import { directionLabel, formatBytes, rangeLabel, safeText } from '../utils';
+import { directionLabel, formatBytes, isLoopbackIp, rangeLabel, safeText } from '../utils';
 
 const pageSize = 25;
 const columnHelper = createColumnHelper<RemoteSummaryRow>();
@@ -20,29 +20,23 @@ const columnHelper = createColumnHelper<RemoteSummaryRow>();
 export function RemotesPage() {
   const api = useApiClient();
   const navigate = useNavigate();
-  const { params, setParams, range, setRange } = useRangeSearchParam();
+  const { params, range, setRange, setRangedParams } = useRangeSearchParam();
   const direction = (params.get('direction') as 'in' | 'out' | null) ?? '';
-  const includeLoopback = params.get('include_loopback') === '1';
+  const includeLoopback = params.get('exclude_loopback') !== '1' && params.get('include_loopback') !== '0';
   const [sorting, setSorting] = useState<SortingState>([{ id: 'bytesTotal', desc: true }]);
 
   const setDirection = (next: '' | 'in' | 'out') => {
-    const nextParams = new URLSearchParams(params);
-    if (next) {
-      nextParams.set('direction', next);
-    } else {
-      nextParams.delete('direction');
-    }
-    setParams(nextParams, { replace: true });
+    setRangedParams({
+      direction: next,
+      exclude_loopback: includeLoopback ? undefined : '1',
+    });
   };
 
   const setIncludeLoopback = (next: boolean) => {
-    const nextParams = new URLSearchParams(params);
-    if (next) {
-      nextParams.set('include_loopback', '1');
-    } else {
-      nextParams.delete('include_loopback');
-    }
-    setParams(nextParams, { replace: true });
+    setRangedParams({
+      direction,
+      exclude_loopback: next ? undefined : '1',
+    });
   };
 
   const currentSort = sorting[0];
@@ -74,7 +68,15 @@ export function RemotesPage() {
         id: 'remoteIp',
         header: '对端 IP',
         meta: { className: 'col-remote-ip col-remote-ip-plain', nowrap: false },
-        cell: (info) => safeText(info.getValue()),
+        cell: (info) => {
+          const ip = info.getValue();
+          return (
+            <span className="ip-cell">
+              <span>{safeText(ip)}</span>
+              {isLoopbackIp(ip) ? <span className="inline-tag">本机回环</span> : null}
+            </span>
+          );
+        },
       }),
       columnHelper.accessor('bytesUp', {
         id: 'bytesUp',
@@ -135,7 +137,7 @@ export function RemotesPage() {
           出站目标
         </button>
         <button type="button" className={includeLoopback ? 'chip active' : 'chip'} onClick={() => setIncludeLoopback(!includeLoopback)}>
-          {includeLoopback ? '隐藏本机回环' : '显示本机回环'}
+          {includeLoopback ? '排除本机回环' : '显示本机回环'}
         </button>
       </section>
 

@@ -25,7 +25,7 @@ import type {
   UsageExplain,
 } from '../types';
 import { RANGE_TO_BUCKET } from '../ranges';
-import { executableName } from '../utils';
+import { executableName, isLoopbackIp } from '../utils';
 
 const BASE_TS = 1_735_689_600;
 const MINUTE = 60;
@@ -656,7 +656,7 @@ function remoteSummaries(
   const grouped = new Map<string, { direction: 'in' | 'out'; remoteIp: string; bytesUp: number; bytesDown: number; flowCount: number }>();
   for (const row of createFilteredUsage({ range })) {
     if (options?.direction && row.direction !== options.direction) continue;
-    if (!options?.includeLoopback && (row.remoteIp === '127.0.0.1' || row.remoteIp === '::1')) continue;
+    if (options?.includeLoopback === false && isLoopbackIp(row.remoteIp)) continue;
     const key = `${row.direction}:${row.remoteIp}`;
     const current = grouped.get(key) ?? {
       direction: row.direction,

@@ -133,7 +133,8 @@ func appendCursorPagination(builder *strings.Builder, args *[]any, timeCol strin
 
 func (s *Store) QueryOverview(ctx context.Context, start, end time.Time, source string) (model.OverviewStats, error) {
 	info := usageSourceInfo(source)
-	row := s.db.QueryRowContext(ctx, fmt.Sprintf(`
+	db := s.queryDB()
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 SELECT COALESCE(SUM(bytes_up), 0), COALESCE(SUM(bytes_down), 0), COALESCE(SUM(flow_count), 0)
 FROM %s
 WHERE %s >= ? AND %s < ?
@@ -168,7 +169,8 @@ FROM combined
 ORDER BY month_ts DESC
 `
 	args := append(monthlyDetailAggregateArgs(liveStart), liveUpdatedAt)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query monthly usage: %w", err)
 	}
@@ -262,7 +264,8 @@ WHERE %[1]s >= ? AND %[1]s < ?
 	}
 	builder.WriteString(" GROUP BY bucket_ts, group_value ORDER BY bucket_ts ASC, group_value ASC")
 
-	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, builder.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query timeseries: %w", err)
 	}
@@ -369,13 +372,14 @@ WHERE %s >= ? AND %s < ?
 	appendUsageFiltersDetailed(&builder, &args, query, source == DataSourceHour)
 	appendUsageFiltersDetailed(&countBuilder, &countArgs, query, source == DataSourceHour)
 	if query.UsePage {
-		totalRows, err := countRows(ctx, s.db, countBuilder.String(), countArgs, "usage")
+		db := s.queryDB()
+		totalRows, err := countRows(ctx, db, countBuilder.String(), countArgs, "usage")
 		if err != nil {
 			return nil, "", 0, err
 		}
 		appendOffsetPagination(&builder, &args, usageOrderClause(source, query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize)
 
-		rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+		rows, err := db.QueryContext(ctx, builder.String(), args...)
 		if err != nil {
 			return nil, "", 0, fmt.Errorf("query usage: %w", err)
 		}
@@ -389,7 +393,8 @@ WHERE %s >= ? AND %s < ?
 	}
 	limit := appendCursorPagination(&builder, &args, info.TimeCol, query.CursorTS, query.CursorRowID, query.Limit)
 
-	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, builder.String(), args...)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("query usage: %w", err)
 	}
@@ -479,7 +484,8 @@ SELECT COUNT(*) FROM (
     GROUP BY %s
 )`, info.Table, info.TimeCol, info.TimeCol, groupExpr)
 	var totalRows int
-	if err := s.db.QueryRowContext(ctx, countSQL, start.Unix(), end.Unix()).Scan(&totalRows); err != nil {
+	db := s.queryDB()
+	if err := db.QueryRowContext(ctx, countSQL, start.Unix(), end.Unix()).Scan(&totalRows); err != nil {
 		return nil, 0, fmt.Errorf("count top processes: %w", err)
 	}
 
@@ -502,7 +508,7 @@ SELECT COUNT(*) FROM (
 	}
 	order := normalizeSortOrder(sortOrder)
 
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
 SELECT %s,
        COALESCE(SUM(bytes_up), 0),
        COALESCE(SUM(bytes_down), 0),
@@ -557,7 +563,8 @@ func (s *Store) QueryTopRemotes(ctx context.Context, start, end time.Time, sourc
 
 	countSQL := "SELECT COUNT(*) FROM (SELECT 1 " + filterBuilder.String() + " GROUP BY direction, remote_ip)"
 	var totalRows int
-	if err := s.db.QueryRowContext(ctx, countSQL, args...).Scan(&totalRows); err != nil {
+	db := s.queryDB()
+	if err := db.QueryRowContext(ctx, countSQL, args...).Scan(&totalRows); err != nil {
 		return nil, 0, fmt.Errorf("count top remotes: %w", err)
 	}
 
@@ -586,7 +593,7 @@ ORDER BY %s %s, remote_ip ASC
 LIMIT ? OFFSET ?
 `, filterBuilder.String(), sortExpr, order)
 	queryArgs := append(append([]any{}, args...), pageSize, pageOffset)
-	rows, err := s.db.QueryContext(ctx, querySQL, queryArgs...)
+	rows, err := db.QueryContext(ctx, querySQL, queryArgs...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query top remotes: %w", err)
 	}
@@ -618,7 +625,8 @@ func (s *Store) queryTop(ctx context.Context, start, end time.Time, source strin
 		sortExpr = "SUM(bytes_down)"
 	}
 
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
 SELECT %s AS item_key,
        COALESCE(SUM(bytes_up), 0),
        COALESCE(SUM(bytes_down), 0),
@@ -682,13 +690,14 @@ WHERE %s >= ? AND %s < ?
 		countArgs = append(countArgs, query.OrigDstIP)
 	}
 	if query.UsePage {
-		totalRows, err := countRows(ctx, s.db, countBuilder.String(), countArgs, "forward usage")
+		db := s.queryDB()
+		totalRows, err := countRows(ctx, db, countBuilder.String(), countArgs, "forward usage")
 		if err != nil {
 			return nil, "", 0, err
 		}
 		appendOffsetPagination(&builder, &args, forwardOrderClause(query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize)
 
-		rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+		rows, err := db.QueryContext(ctx, builder.String(), args...)
 		if err != nil {
 			return nil, "", 0, fmt.Errorf("query forward usage: %w", err)
 		}
@@ -702,7 +711,8 @@ WHERE %s >= ? AND %s < ?
 	}
 	limit := appendCursorPagination(&builder, &args, info.TimeCol, query.CursorTS, query.CursorRowID, query.Limit)
 
-	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, builder.String(), args...)
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("query forward usage: %w", err)
 	}

@@ -139,6 +139,10 @@ export function safeText(value?: string | null) {
   return value && value.trim() ? value : '未知';
 }
 
+export function isLoopbackIp(ip?: string | null) {
+  return ip === '::1' || ip?.startsWith('127.') === true;
+}
+
 export function executableName(value?: string | null): string | null {
   if (!value || !value.trim()) return null;
   const trimmed = value.trim().replace(/^['"]+|['"]+$/g, '');

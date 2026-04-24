@@ -10,7 +10,7 @@ import { QueryErrorState } from "../components/QueryErrorState";
 import { RangeSelect } from "../components/RangeSelect";
 import { isDimensionUnavailableError, normalizeUsageSortKey } from "../api";
 import { useApiClient } from "../api-context";
-import type { DataSource, UsageRow } from "../types";
+import type { DataSource, UsageExplain, UsageRow } from "../types";
 import { useRangeSearchParam } from "../useRangeSearchParam";
 import { useResettingPage } from "../useResettingPage";
 import {
@@ -22,6 +22,7 @@ import {
   formatBytes,
   formatDateTime,
   formatNumber,
+  isLoopbackIp,
   minuteDimensionsUnavailable,
   rangeLabel,
   safeText,
@@ -46,8 +47,65 @@ function usageRowKey(row: UsageRow) {
   ]);
 }
 
+function uniqueNonLoopbackIps(values: Array<string | null | undefined>) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const ip = value?.trim();
+    if (!ip || isLoopbackIp(ip) || seen.has(ip)) continue;
+    seen.add(ip);
+    result.push(ip);
+  }
+  return result;
+}
+
+function loopbackEndpoint(row: UsageRow) {
+  const port = row.remotePort ?? row.localPort;
+  return port != null ? `本机回环:${port}` : "本机回环";
+}
+
+function loopbackLinks(row: UsageRow, explain: UsageExplain) {
+  const endpoint = loopbackEndpoint(row);
+  const links: Array<{ key: string; title: string; detail: string }> = [];
+  const sourceIps = uniqueNonLoopbackIps([
+    ...explain.sourceIps,
+    ...explain.nginxRequests.map((request) => request.clientIp),
+  ]);
+  const targetIps = uniqueNonLoopbackIps(explain.targetIps);
+
+  for (const ip of sourceIps.slice(0, 3)) {
+    links.push({
+      key: `source-${ip}`,
+      title: `${ip} → ${endpoint}`,
+      detail: "入口 IP 候选，通常来自 Web/代理访问日志或同窗口关联流。",
+    });
+  }
+  for (const ip of targetIps.slice(0, 3)) {
+    links.push({
+      key: `target-${ip}`,
+      title: `${endpoint} → ${ip}`,
+      detail: "出口 IP 候选，通常来自代理外连或同进程对端关联。",
+    });
+  }
+
+  for (const peer of explain.relatedPeers) {
+    if (!peer.remoteIp || isLoopbackIp(peer.remoteIp)) continue;
+    const port = peer.remotePort != null ? `:${peer.remotePort}` : "";
+    const key = `peer-${peer.direction}-${peer.remoteIp}-${peer.localPort ?? ""}-${peer.remotePort ?? ""}`;
+    if (links.some((link) => link.key === key || link.title.includes(peer.remoteIp))) continue;
+    links.push({
+      key,
+      title: `${endpoint} ↔ ${peer.remoteIp}${port}`,
+      detail: `${directionLabel(peer.direction)}关联样本 · ${peer.flowCount} flows · ${formatBytes(peer.bytesTotal)}`,
+    });
+    if (links.length >= 6) break;
+  }
+
+  return links;
+}
+
 function useUsageFilters() {
-  const { params, setParams, range, setRange } = useRangeSearchParam();
+  const { params, range, setRange, setRangedParams } = useRangeSearchParam();
 
   const filters = {
     comm: params.get("comm") ?? "",
@@ -61,11 +119,7 @@ function useUsageFilters() {
   };
 
   const setFilters = (next: typeof filters) => {
-    const nextParams = new URLSearchParams({ range });
-    for (const [key, value] of Object.entries(next)) {
-      if (value) nextParams.set(key, value);
-    }
-    setParams(nextParams, { replace: true });
+    setRangedParams(next);
   };
 
   return { range, filters, setRange, setFilters };
@@ -83,6 +137,9 @@ function clearMinuteOnlyFilters(
 }
 
 function processAnalysis(row: UsageRow) {
+  if (isLoopbackIp(row.remoteIp)) {
+    return `本机回环流量：这是主机内部真实 socket 流量，会计入本机进程用量；但它不是网卡外发/外收带宽，通常是 nginx、代理、面板或本地服务之间的一段链路。展开后的关联分析会尝试把它连接到具体入口或出口 IP。`;
+  }
   if (
     row.comm === "nginx" ||
     row.comm === "caddy" ||
@@ -172,6 +229,8 @@ function UsageExpandPanel({
   });
   const explain = explainQuery.data;
   const canDeepScan = dataSource === "usage_1m" && !allowScan;
+  const loopbackCandidates =
+    explain && isLoopbackIp(row.remoteIp) ? loopbackLinks(row, explain) : [];
 
   return (
     <div className="row-expand">
@@ -311,6 +370,18 @@ function UsageExpandPanel({
                     </div>
                   );
                 })}
+              </div>
+            ) : null}
+
+            {loopbackCandidates.length > 0 ? (
+              <div className="row-expand-analysis-list">
+                <span>回环链路候选</span>
+                {loopbackCandidates.map((candidate) => (
+                  <div key={candidate.key} className="usage-chain">
+                    <strong>{candidate.title}</strong>
+                    <span>{candidate.detail}</span>
+                  </div>
+                ))}
               </div>
             ) : null}
 
@@ -486,16 +557,19 @@ export function UsagePage() {
           const ip = info.getValue();
           if (!ip) return "未知";
           return (
-            <button
-              type="button"
-              className="ip-link"
-              onClick={(e) => {
-                e.stopPropagation();
-                onFilterByIp(ip);
-              }}
-            >
-              {ip}
-            </button>
+            <span className="ip-cell">
+              <button
+                type="button"
+                className="ip-link"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onFilterByIp(ip);
+                }}
+              >
+                {ip}
+              </button>
+              {isLoopbackIp(ip) ? <span className="inline-tag">本机回环</span> : null}
+            </span>
           );
         },
       }),

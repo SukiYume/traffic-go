@@ -136,7 +136,8 @@ WHERE source = ? AND event_ts >= ? AND event_ts <= ?
 	sqlText += " ORDER BY event_ts DESC LIMIT ?"
 	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, sqlText, args...)
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query log evidence: %w", err)
 	}
@@ -188,7 +189,8 @@ LIMIT ?`
 	args = append(args, query.AnyIP)
 	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, sqlText, args...)
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query any-ip log evidence: %w", err)
 	}

@@ -349,7 +349,64 @@ describe("traffic-go web ui", () => {
     expect(screen.getByText("平均速率")).toBeInTheDocument();
   });
 
-  it("shows loopback remotes when the toggle is enabled", async () => {
+  it("shows loopback linkage candidates in usage details", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage() {
+        return {
+          dataSource: "usage_1m",
+          nextCursor: null,
+          page: 1,
+          pageSize: 25,
+          totalRows: 1,
+          rows: [
+            {
+              minuteTs: 1710000000,
+              proto: "tcp",
+              direction: "out",
+              pid: null,
+              comm: null,
+              exe: null,
+              localPort: 52000,
+              remoteIp: "127.0.0.1",
+              remotePort: 18080,
+              attribution: "unknown",
+              bytesUp: 1024,
+              bytesDown: 4096,
+              pktsUp: 10,
+              pktsDown: 12,
+              flowCount: 2,
+            },
+          ],
+        };
+      },
+      async getUsageExplain() {
+        return {
+          process: "unknown",
+          confidence: "medium",
+          sourceIps: ["112.0.38.89"],
+          targetIps: [],
+          chains: [],
+          relatedPeers: [],
+          nginxRequests: [],
+          notes: [],
+        };
+      },
+    };
+
+    renderWithProviders("/usage", <UsagePage />, client);
+    expect(await screen.findByText("本机回环")).toBeInTheDocument();
+
+    const rows = await screen.findAllByRole("row");
+    await user.click(rows[1]);
+
+    expect(await screen.findByText("回环链路候选")).toBeInTheDocument();
+    expect(screen.getByText("112.0.38.89 → 本机回环:18080")).toBeInTheDocument();
+  });
+
+  it("shows loopback remotes by default and can exclude them", async () => {
     const user = userEvent.setup();
     const base = createMockApiClient();
     const client: TrafficApiClient = {
@@ -375,11 +432,10 @@ describe("traffic-go web ui", () => {
     };
 
     renderWithProviders("/remotes", <RemotesPage />, client);
-    expect(await screen.findByText("203.0.113.24")).toBeInTheDocument();
-    expect(screen.queryByText("127.0.0.1")).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "显示本机回环" }));
     expect(await screen.findByText("127.0.0.1")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "排除本机回环" }));
+    expect(await screen.findByText("203.0.113.24")).toBeInTheDocument();
   });
 
   it("renders the processes investigation page", async () => {

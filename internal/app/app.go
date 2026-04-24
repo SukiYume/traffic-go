@@ -46,6 +46,10 @@ func New(cfg config.Config, logger *log.Logger) (*App, error) {
 		logger,
 		embedfs.StaticFS(),
 		cfg.ProcessLogDirs,
+		api.BasicAuthConfig{
+			Username: cfg.Auth.Username,
+			Password: cfg.Auth.Password,
+		},
 		enableSSJournalFallback,
 	)
 	return &App{

@@ -5,6 +5,7 @@ import {
   dataSourceLabel,
   displayExecutableName,
   executableName,
+  isLoopbackIp,
   minuteDimensionsUnavailable,
   serviceNameForPort,
 } from '../utils';
@@ -68,6 +69,15 @@ describe('executableName', () => {
 describe('displayExecutableName', () => {
   it('returns fallback for empty input', () => {
     expect(displayExecutableName(undefined)).toBe('未知');
+  });
+});
+
+describe('isLoopbackIp', () => {
+  it('matches IPv4 loopback range and IPv6 loopback', () => {
+    expect(isLoopbackIp('127.0.0.1')).toBe(true);
+    expect(isLoopbackIp('127.10.0.2')).toBe(true);
+    expect(isLoopbackIp('::1')).toBe(true);
+    expect(isLoopbackIp('203.0.113.24')).toBe(false);
   });
 });
 

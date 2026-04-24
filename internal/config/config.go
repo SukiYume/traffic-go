@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,10 +13,11 @@ import (
 )
 
 const (
-	defaultListen       = "127.0.0.1:8080"
-	defaultDBPath       = "traffic.db"
-	defaultTickInterval = 2 * time.Second
-	defaultProcFS       = "/proc"
+	defaultListen              = "127.0.0.1:8080"
+	defaultDBPath              = "traffic.db"
+	defaultTickInterval        = 2 * time.Second
+	defaultSocketIndexInterval = 10 * time.Second
+	defaultProcFS              = "/proc"
 )
 
 type Retention struct {
@@ -36,12 +38,18 @@ type Prefetch struct {
 	MaxScanLinesPerFile int           `yaml:"max_scan_lines_per_file"`
 }
 
+type Auth struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+}
+
 type Config struct {
-	Listen        string        `yaml:"listen"`
-	DBPath        string        `yaml:"db_path"`
-	TickInterval  time.Duration `yaml:"tick_interval"`
-	ProcFS        string        `yaml:"proc_fs"`
-	ConntrackPath string        `yaml:"conntrack_path"`
+	Listen              string        `yaml:"listen"`
+	DBPath              string        `yaml:"db_path"`
+	TickInterval        time.Duration `yaml:"tick_interval"`
+	SocketIndexInterval time.Duration `yaml:"socket_index_interval"`
+	ProcFS              string        `yaml:"proc_fs"`
+	ConntrackPath       string        `yaml:"conntrack_path"`
 	// Legacy fields kept for backward compatibility. Their values are merged
 	// into ProcessLogDirs when explicit per-process entries are not provided.
 	NginxLogDir    string            `yaml:"nginx_log_dir"`
@@ -53,6 +61,7 @@ type Config struct {
 	ShadowsocksJournalFallback *bool     `yaml:"shadowsocks_journal_fallback"`
 	MockData                   bool      `yaml:"mock_data"`
 	LogLevel                   string    `yaml:"log_level"`
+	Auth                       Auth      `yaml:"auth"`
 	Retention                  Retention `yaml:"retention"`
 	Prefetch                   Prefetch  `yaml:"prefetch"`
 }
@@ -63,6 +72,7 @@ func Default() Config {
 		Listen:                     defaultListen,
 		DBPath:                     defaultDBPath,
 		TickInterval:               defaultTickInterval,
+		SocketIndexInterval:        defaultSocketIndexInterval,
 		ProcFS:                     defaultProcFS,
 		ShadowsocksJournalFallback: &enableShadowsocksJournalFallback,
 		LogLevel:                   "info",
@@ -118,6 +128,9 @@ func withDerivedDefaults(cfg Config) Config {
 	if cfg.TickInterval <= 0 {
 		cfg.TickInterval = defaultTickInterval
 	}
+	if cfg.SocketIndexInterval <= 0 {
+		cfg.SocketIndexInterval = defaultSocketIndexInterval
+	}
 	if cfg.ProcFS == "" {
 		cfg.ProcFS = defaultProcFS
 	}
@@ -150,6 +163,8 @@ func withDerivedDefaults(cfg Config) Config {
 	if cfg.Prefetch.MaxScanLinesPerFile <= 0 {
 		cfg.Prefetch.MaxScanLinesPerFile = 250000
 	}
+	cfg.Auth.Username = strings.TrimSpace(cfg.Auth.Username)
+	cfg.Auth.Password = strings.TrimSpace(cfg.Auth.Password)
 	return cfg
 }
 
@@ -196,6 +211,7 @@ func withConfiguredProcessLogDirs(values map[string]string, nginxLogDir string, 
 }
 
 func (c Config) Validate() error {
+	authConfigured := c.Auth.Username != "" || c.Auth.Password != ""
 	switch {
 	case c.Listen == "":
 		return errors.New("listen must not be empty")
@@ -203,6 +219,12 @@ func (c Config) Validate() error {
 		return errors.New("db_path must not be empty")
 	case c.TickInterval <= 0:
 		return errors.New("tick_interval must be positive")
+	case c.SocketIndexInterval <= 0:
+		return errors.New("socket_index_interval must be positive")
+	case authConfigured && (c.Auth.Username == "" || c.Auth.Password == ""):
+		return errors.New("auth.username and auth.password must both be set when auth is configured")
+	case !authConfigured && !isLoopbackListenAddress(c.Listen):
+		return errors.New("auth.username and auth.password are required when listen is not loopback")
 	case c.Prefetch.Interval <= 0:
 		return errors.New("prefetch.interval must be positive")
 	case c.Prefetch.EvidenceLookback <= 0:
@@ -218,4 +240,20 @@ func (c Config) Validate() error {
 	default:
 		return nil
 	}
+}
+
+func isLoopbackListenAddress(listen string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(listen))
+	if err != nil {
+		host = strings.TrimSpace(listen)
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

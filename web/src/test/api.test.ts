@@ -367,6 +367,33 @@ describe('http api client', () => {
     );
   });
 
+  it('sends an explicit exclude flag when remote summaries hide loopback', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data_source: 'usage_1m',
+          page: 1,
+          page_size: 10,
+          total_rows: 0,
+          data: [],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    await client.getTopRemotes('24h', {
+      page: 1,
+      pageSize: 10,
+      includeLoopback: false,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/top/remotes?range=24h&page=1&page_size=10&sort_by=bytes_total&exclude_loopback=1',
+      expect.any(Object),
+    );
+  });
+
   it('maps forward filters to backend query params', async () => {
     vi.stubGlobal('fetch', fetchMock);
     fetchMock.mockResolvedValue(

@@ -204,7 +204,7 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 		if exists && now.Sub(prev.LastSeen) > defaultFlowGraceTTL {
 			exists = false
 		}
-		lineageContinues := observedLineageContinues(prev, flow.RawIDs)
+		lineageContinues := observedLineageContinues(prev, flow.Flow.CTID, flow.RawIDs)
 		snapshot, delta, forwardDelta, countFlow, resetOwners := s.updateSnapshot(now, flow.Flow, classified, process, prev, exists, baselineReady, lineageContinues)
 		nextSnapshots[flowID] = snapshot
 		if snapshot.Direction != model.DirectionForward && snapshot.PID > 0 {
@@ -238,7 +238,7 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 
 func (s *Service) socketIndexSnapshot(now time.Time) (socketIndex, error) {
 	s.runtimeMu.RLock()
-	if s.socketReady && now.Sub(s.lastSockRefresh) < defaultSocketIndexTTL {
+	if ttl := s.socketIndexTTL(); s.socketReady && ttl > 0 && now.Sub(s.lastSockRefresh) < ttl {
 		index := s.socketIndex
 		s.runtimeMu.RUnlock()
 		return index, nil
@@ -261,6 +261,13 @@ func (s *Service) socketIndexSnapshot(now time.Time) (socketIndex, error) {
 	s.socketReady = true
 	s.runtimeMu.Unlock()
 	return index, nil
+}
+
+func (s *Service) socketIndexTTL() time.Duration {
+	if s.cfg.SocketIndexInterval > 0 {
+		return s.cfg.SocketIndexInterval
+	}
+	return defaultSocketIndexTTL
 }
 
 func (s *Service) carryForwardSnapshots(prev map[string]model.FlowSnapshot, now time.Time) map[string]model.FlowSnapshot {
@@ -304,6 +311,8 @@ func (s *Service) updateSnapshot(
 	if classified.Direction != model.DirectionForward {
 		if process.PID > 0 {
 			switch {
+			case process.Ambiguous:
+				attribution = model.AttributionHeuristic
 			case classified.MatchedByHint:
 				attribution = model.AttributionGuess
 			case classified.MatchedByLocal:
@@ -514,8 +523,11 @@ func snapshotTupleChanged(prev, next model.FlowSnapshot) bool {
 		prev.RemotePort != next.RemotePort
 }
 
-func observedLineageContinues(prev model.FlowSnapshot, rawIDs map[uint64]struct{}) bool {
+func observedLineageContinues(prev model.FlowSnapshot, selectedCTID uint64, rawIDs map[uint64]struct{}) bool {
 	if prev.CTID == 0 || len(rawIDs) == 0 {
+		return false
+	}
+	if selectedCTID != 0 && selectedCTID != prev.CTID {
 		return false
 	}
 	_, ok := rawIDs[prev.CTID]

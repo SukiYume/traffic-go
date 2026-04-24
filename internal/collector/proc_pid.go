@@ -200,15 +200,34 @@ func (r *processResolver) scanProcSockets(ctx context.Context) (map[uint64]model
 				exe = readProcessExe(r.procFS, entry.Name())
 				loaded = true
 			}
-			cache[inode] = model.ProcessInfo{
+			cache[inode] = mergeProcessOwner(cache[inode], model.ProcessInfo{
 				PID:  pid,
 				Comm: comm,
 				Exe:  exe,
-			}
+			})
 		}
 	}
 
 	return cache, true
+}
+
+func mergeProcessOwner(existing model.ProcessInfo, next model.ProcessInfo) model.ProcessInfo {
+	if next.PID <= 0 {
+		return existing
+	}
+	if existing.PID <= 0 {
+		return next
+	}
+	if existing.PID == next.PID && existing.Comm == next.Comm && existing.Exe == next.Exe {
+		return existing
+	}
+
+	selected := existing
+	if next.PID < existing.PID {
+		selected = next
+	}
+	selected.Ambiguous = true
+	return selected
 }
 
 func readSocketInodesFromFDDir(fdDir string) (map[uint64]struct{}, bool) {

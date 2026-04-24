@@ -44,10 +44,23 @@ func TestResolveUsageSource(t *testing.T) {
 	}
 }
 
-func TestOpenUsesSingleSQLiteConnection(t *testing.T) {
+func TestOpenSplitsSQLiteReadAndWriteConnections(t *testing.T) {
 	store := newTestStore(t)
 	if store.db.Stats().MaxOpenConnections != 1 {
-		t.Fatalf("expected sqlite store to use one open connection, got %+v", store.db.Stats())
+		t.Fatalf("expected sqlite write pool to use one open connection, got %+v", store.db.Stats())
+	}
+	if store.readDB == nil {
+		t.Fatalf("expected sqlite read pool")
+	}
+	if store.readDB.Stats().MaxOpenConnections <= 1 {
+		t.Fatalf("expected sqlite read pool to allow concurrent readers, got %+v", store.readDB.Stats())
+	}
+	var queryOnly int
+	if err := store.readDB.QueryRow(`PRAGMA query_only`).Scan(&queryOnly); err != nil {
+		t.Fatalf("read query_only pragma: %v", err)
+	}
+	if queryOnly != 1 {
+		t.Fatalf("expected read pool to be query_only, got %d", queryOnly)
 	}
 }
 
@@ -1241,7 +1254,7 @@ func TestQueryUsageChainsSupportsExeBasenameFilter(t *testing.T) {
 	}
 }
 
-func TestQueryTopRemotesExcludesLoopbackByDefault(t *testing.T) {
+func TestQueryTopRemotesCanExcludeLoopback(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 

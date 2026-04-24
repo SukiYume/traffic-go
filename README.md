@@ -57,7 +57,7 @@ flowchart LR
 
 ### 1. 连接采集
 
-collector 按 `tick_interval` 周期读取 `/proc/net/nf_conntrack`，解析出每条连接的协议、源/目的 IP、端口、字节数和包数。
+collector 按 `tick_interval` 周期读取 `/proc/net/nf_conntrack`，解析出每条连接的协议、源/目的 IP、端口、字节数和包数。用于 PID 归因的 `/proc` socket index 按 `socket_index_interval` 单独刷新，避免在每次 conntrack 采样时重扫所有 PID/net namespace。
 
 这里读到的是内核维护的连接跟踪状态，而不是镜像流量或 socket hook，所以它的优点是：
 
@@ -357,9 +357,11 @@ location /traffic/ {
 - `listen`：HTTP 监听地址，默认 `127.0.0.1:8080`
 - `db_path`：SQLite 文件路径
 - `tick_interval`：采集周期，默认 `2s`
+- `socket_index_interval`：PID 归因 socket index 刷新周期，默认 `10s`；调低会提高短连接归因实时性，但会增加 `/proc` 扫描 CPU/syscall 成本
 - `proc_fs`：procfs 根目录，默认 `/proc`
 - `conntrack_path`：conntrack 文件路径，默认 `/proc/net/nf_conntrack`
 - `mock_data`：显式启用 mock collector
+- `auth.username` / `auth.password`：HTTP Basic Auth；当 `listen` 不是 loopback 地址时必须配置
 - `process_log_dirs`：进程日志路径映射，key 为进程名，大小写不敏感
 - `shadowsocks_journal_fallback`：Shadowsocks 文件日志未命中时，是否回退到 systemd journal
 - `retention.months`：完整明细保留的 UTC 自然月数量，默认 `3`，即当前月和前两个月

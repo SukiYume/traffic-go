@@ -337,7 +337,8 @@ function buildTopRemotesQuery(
     ['sort_by', remoteSortParam(options?.sortBy)],
     ['sort_order', options?.sortOrder ?? undefined],
     ['direction', options?.direction],
-    ['include_loopback', options?.includeLoopback ? 1 : undefined],
+    ['include_loopback', options?.includeLoopback === true ? 1 : undefined],
+    ['exclude_loopback', options?.includeLoopback === false ? 1 : undefined],
   ]);
 }
 

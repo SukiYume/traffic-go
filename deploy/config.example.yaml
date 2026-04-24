@@ -10,7 +10,17 @@ listen: "127.0.0.1:18080"
 # install-centos7.sh rewrites this to <script-dir>/traffic.db during install.
 db_path: ./traffic.db
 tick_interval: 2s
+# Controls how often the collector rebuilds the /proc socket index used for
+# PID attribution. Keep this independent from tick_interval to avoid scanning
+# every PID/net namespace on each conntrack sample.
+socket_index_interval: 10s
 log_level: info
+
+# Optional HTTP Basic Auth for the bundled WebUI and API. Required if listen
+# is changed to a non-loopback address such as 0.0.0.0:18080.
+# auth:
+#   username: traffic
+#   password: change-me
 
 # Process-specific log directories for usage/explain log correlation.
 # Keys are process names (comm/exe basename, case-insensitive).

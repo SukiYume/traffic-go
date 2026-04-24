@@ -6,7 +6,7 @@ const defaultRange = '24h' satisfies RangeKey;
 
 type SearchParamValue = string | number | boolean | null | undefined;
 
-export function buildRangedPath(path: string, range: RangeKey, extra?: Record<string, SearchParamValue>) {
+function buildRangedSearchParams(range: RangeKey, extra?: Record<string, SearchParamValue>) {
   const params = new URLSearchParams();
   params.set('range', range);
   for (const [key, value] of Object.entries(extra ?? {})) {
@@ -14,6 +14,11 @@ export function buildRangedPath(path: string, range: RangeKey, extra?: Record<st
       params.set(key, String(value));
     }
   }
+  return params;
+}
+
+export function buildRangedPath(path: string, range: RangeKey, extra?: Record<string, SearchParamValue>) {
+  const params = buildRangedSearchParams(range, extra);
   return `${path}?${params.toString()}`;
 }
 
@@ -25,5 +30,8 @@ export function useRangeSearchParam(fallback: RangeKey = defaultRange) {
     nextParams.set('range', next);
     setParams(nextParams, { replace: true });
   };
-  return { params, setParams, range, setRange } as const;
+  const setRangedParams = (extra?: Record<string, SearchParamValue>) => {
+    setParams(buildRangedSearchParams(range, extra), { replace: true });
+  };
+  return { params, setParams, range, setRange, setRangedParams } as const;
 }

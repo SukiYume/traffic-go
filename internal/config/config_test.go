@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -53,6 +54,9 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	}
 	if cfg.Prefetch.MaxScanLinesPerFile != 250000 {
 		t.Fatalf("expected default max scan lines 250000, got %d", cfg.Prefetch.MaxScanLinesPerFile)
+	}
+	if cfg.SocketIndexInterval != 10*time.Second {
+		t.Fatalf("expected default socket index interval 10s, got %s", cfg.SocketIndexInterval)
 	}
 }
 
@@ -188,6 +192,22 @@ func TestDeriveMergesLegacyDirsIntoProcessLogDirs(t *testing.T) {
 	}
 }
 
+func TestLoadSocketIndexIntervalOverride(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := []byte("socket_index_interval: 3s\n")
+	if err := os.WriteFile(configPath, content, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.SocketIndexInterval != 3*time.Second {
+		t.Fatalf("expected socket index interval 3s, got %s", cfg.SocketIndexInterval)
+	}
+}
+
 func TestLoadPrefetchOverrides(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	content := []byte("prefetch:\n  enabled: false\n  interval: 2m\n  evidence_lookback: 45m\n  chain_lookback: 15m\n  scan_budget: 3s\n  max_scan_files: 9\n  max_scan_lines_per_file: 123456\n")
@@ -222,8 +242,49 @@ func TestLoadPrefetchOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadAuthConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := []byte("auth:\n  username: admin\n  password: secret\n")
+	if err := os.WriteFile(configPath, content, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Auth.Username != "admin" || cfg.Auth.Password != "secret" {
+		t.Fatalf("expected auth config to load, got %+v", cfg.Auth)
+	}
+}
+
+func TestValidateRequiresAuthForNonLoopbackListen(t *testing.T) {
+	cfg := Default()
+	cfg.Listen = "0.0.0.0:18080"
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "auth.username") {
+		t.Fatalf("expected auth requirement for non-loopback listen, got %v", err)
+	}
+
+	cfg.Auth.Username = "admin"
+	cfg.Auth.Password = "secret"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected auth-protected non-loopback listen to validate: %v", err)
+	}
+}
+
+func TestValidateRequiresPositiveSocketIndexInterval(t *testing.T) {
+	cfg := Default()
+	cfg.SocketIndexInterval = -time.Second
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "socket_index_interval") {
+		t.Fatalf("expected socket index interval validation error, got %v", err)
+	}
+}
+
 func TestDeriveRestoresPrefetchDefaultsForZeroValues(t *testing.T) {
 	cfg := Default()
+	cfg.SocketIndexInterval = 0
 	cfg.Prefetch.Interval = 0
 	cfg.Prefetch.EvidenceLookback = 0
 	cfg.Prefetch.ChainLookback = 0
@@ -250,5 +311,8 @@ func TestDeriveRestoresPrefetchDefaultsForZeroValues(t *testing.T) {
 	}
 	if derived.Prefetch.MaxScanLinesPerFile != 250000 {
 		t.Fatalf("expected derived max scan lines 250000, got %d", derived.Prefetch.MaxScanLinesPerFile)
+	}
+	if derived.SocketIndexInterval != 10*time.Second {
+		t.Fatalf("expected derived socket index interval 10s, got %s", derived.SocketIndexInterval)
 	}
 }

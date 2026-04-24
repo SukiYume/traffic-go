@@ -24,7 +24,7 @@ const protoOptions = [
 
 export function ForwardPage() {
   const api = useApiClient();
-  const { params, setParams, range, setRange } = useRangeSearchParam();
+  const { params, range, setRange, setRangedParams } = useRangeSearchParam();
   const filters = {
     origSrcIp: params.get('origSrcIp') ?? '',
     origDstIp: params.get('origDstIp') ?? '',
@@ -33,14 +33,7 @@ export function ForwardPage() {
   const [sorting, setSorting] = useState<SortingState>([{ id: 'minuteTs', desc: true }]);
 
   const setFilter = (key: keyof typeof filters, value: string) => {
-    const nextParams = new URLSearchParams(params);
-    nextParams.set('range', range);
-    if (value) {
-      nextParams.set(key, value);
-    } else {
-      nextParams.delete(key);
-    }
-    setParams(nextParams, { replace: true });
+    setRangedParams({ ...filters, [key]: value });
   };
 
   const currentSort = sorting[0];

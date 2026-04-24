@@ -164,7 +164,8 @@ WHERE %[1]s = ?
 	}
 	builder.WriteString(" ORDER BY bytes_total DESC, evidence_count DESC, chain_id ASC")
 
-	rows, err := s.db.QueryContext(ctx, builder.String(), args...)
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, builder.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query usage chains: %w", err)
 	}

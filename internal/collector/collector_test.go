@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -228,6 +229,34 @@ func TestUpdateSnapshotUsesHeuristicAttributionForTCPLocalFallback(t *testing.T)
 	}
 	if snapshot.PID != 27896 || snapshot.Comm != "ss-server" {
 		t.Fatalf("expected ss-server process mapping, got %+v", snapshot)
+	}
+}
+
+func TestUpdateSnapshotUsesHeuristicAttributionForAmbiguousProcessOwner(t *testing.T) {
+	service := &Service{}
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+
+	snapshot, _, _, _, _ := service.updateSnapshot(
+		now,
+		model.ConntrackFlow{Proto: "tcp", OrigBytes: 10, ReplyBytes: 20, OrigPkts: 1, ReplyPkts: 2},
+		classifiedFlow{
+			Proto:      "tcp",
+			Direction:  model.DirectionIn,
+			LocalIP:    "217.69.7.251",
+			LocalPort:  443,
+			RemoteIP:   "159.226.171.226",
+			RemotePort: 44598,
+			Connected:  true,
+		},
+		model.ProcessInfo{PID: 100, Comm: "nginx", Exe: "/usr/sbin/nginx", Ambiguous: true},
+		model.FlowSnapshot{},
+		false,
+		false,
+		false,
+	)
+
+	if snapshot.Attribution != model.AttributionHeuristic {
+		t.Fatalf("expected ambiguous owner to downgrade attribution to heuristic, got %s", snapshot.Attribution)
 	}
 }
 
@@ -566,6 +595,95 @@ func TestNormalizeObservedFlowsDedupesDuplicateTupleByMaxCounters(t *testing.T) 
 	}
 }
 
+func TestSocketIndexSnapshotDefaultIntervalIsIndependentOfCollectorTick(t *testing.T) {
+	procFS := t.TempDir()
+	writeProcTCP(t, procFS, 11111)
+
+	service := &Service{
+		cfg: config.Config{
+			ProcFS:       procFS,
+			TickInterval: 2 * time.Second,
+		},
+	}
+	now := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	key := tuple{
+		Proto:      "tcp",
+		LocalIP:    "127.0.0.1",
+		LocalPort:  12345,
+		RemoteIP:   "198.51.100.2",
+		RemotePort: 443,
+	}.key()
+
+	first, err := service.socketIndexSnapshot(now)
+	if err != nil {
+		t.Fatalf("read first socket index: %v", err)
+	}
+	if entry := first.ByTuple[key]; entry.Inode != 11111 {
+		t.Fatalf("expected first inode 11111, got %+v", entry)
+	}
+
+	writeProcTCP(t, procFS, 22222)
+	second, err := service.socketIndexSnapshot(now.Add(1500 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("read second socket index: %v", err)
+	}
+	if entry := second.ByTuple[key]; entry.Inode != 11111 {
+		t.Fatalf("expected default socket index cache to outlive next collector tick, got %+v", entry)
+	}
+}
+
+func TestSocketIndexSnapshotUsesConfiguredInterval(t *testing.T) {
+	procFS := t.TempDir()
+	writeProcTCP(t, procFS, 11111)
+
+	service := &Service{
+		cfg: config.Config{
+			ProcFS:              procFS,
+			TickInterval:        2 * time.Second,
+			SocketIndexInterval: 1500 * time.Millisecond,
+		},
+	}
+	now := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	key := tuple{
+		Proto:      "tcp",
+		LocalIP:    "127.0.0.1",
+		LocalPort:  12345,
+		RemoteIP:   "198.51.100.2",
+		RemotePort: 443,
+	}.key()
+
+	first, err := service.socketIndexSnapshot(now)
+	if err != nil {
+		t.Fatalf("read first socket index: %v", err)
+	}
+	if entry := first.ByTuple[key]; entry.Inode != 11111 {
+		t.Fatalf("expected first inode 11111, got %+v", entry)
+	}
+
+	writeProcTCP(t, procFS, 22222)
+	second, err := service.socketIndexSnapshot(now.Add(1500 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("read second socket index: %v", err)
+	}
+	if entry := second.ByTuple[key]; entry.Inode != 22222 {
+		t.Fatalf("expected socket index to refresh after configured interval, got %+v", entry)
+	}
+}
+
+func writeProcTCP(t *testing.T, procFS string, inode uint64) {
+	t.Helper()
+	netDir := filepath.Join(procFS, "net")
+	if err := os.MkdirAll(netDir, 0o755); err != nil {
+		t.Fatalf("create proc net dir: %v", err)
+	}
+	content := fmt.Sprintf(`  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:3039 026433C6:01BB 01 00000000:00000000 00:00000000 00000000 1000 0 %d
+`, inode)
+	if err := os.WriteFile(filepath.Join(netDir, "tcp"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write proc tcp: %v", err)
+	}
+}
+
 func TestCarryForwardSnapshotsPreventsRecountAfterTransientGap(t *testing.T) {
 	service := &Service{}
 	start := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
@@ -802,6 +920,105 @@ func TestTupleReuseWithHigherCountersStartsNewLineage(t *testing.T) {
 	}
 	if snapshot.CTID != 2001 || !snapshot.Counted {
 		t.Fatalf("unexpected new lineage snapshot: %+v", snapshot)
+	}
+}
+
+func TestTupleReuseWithOverlappingCTIDsStartsNewLineage(t *testing.T) {
+	service := &Service{}
+	now := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	process := model.ProcessInfo{PID: 1088, Comm: "ss-server", Exe: "/usr/bin/ss-server"}
+	prev := model.FlowSnapshot{
+		CTID:          1001,
+		Proto:         "tcp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     47920,
+		RemoteIP:      "198.51.100.44",
+		RemotePort:    443,
+		PID:           process.PID,
+		Comm:          process.Comm,
+		Exe:           process.Exe,
+		Attribution:   model.AttributionExact,
+		StartedAt:     now,
+		BaselineOrig:  100,
+		BaselineReply: 200,
+		LastOrig:      100,
+		LastReply:     200,
+		BaselineOPkts: 1,
+		BaselineRPkts: 2,
+		LastOPkts:     1,
+		LastRPkts:     2,
+		Counted:       true,
+		LastSeen:      now,
+	}
+
+	observed := normalizeObservedFlows([]model.ConntrackFlow{
+		{
+			CTID:          1001,
+			Family:        "ipv4",
+			Proto:         "tcp",
+			OrigSrcIP:     "10.0.0.2",
+			OrigDstIP:     "198.51.100.44",
+			OrigSrcPort:   47920,
+			OrigDstPort:   443,
+			ReplySrcIP:    "198.51.100.44",
+			ReplyDstIP:    "10.0.0.2",
+			ReplySrcPort:  443,
+			ReplyDstPort:  47920,
+			OrigBytes:     100,
+			ReplyBytes:    200,
+			OrigPkts:      1,
+			ReplyPkts:     2,
+			HasAccounting: true,
+		},
+		{
+			CTID:          2001,
+			Family:        "ipv4",
+			Proto:         "tcp",
+			OrigSrcIP:     "10.0.0.2",
+			OrigDstIP:     "198.51.100.44",
+			OrigSrcPort:   47920,
+			OrigDstPort:   443,
+			ReplySrcIP:    "198.51.100.44",
+			ReplyDstIP:    "10.0.0.2",
+			ReplySrcPort:  443,
+			ReplyDstPort:  47920,
+			OrigBytes:     300,
+			ReplyBytes:    500,
+			OrigPkts:      3,
+			ReplyPkts:     5,
+			HasAccounting: true,
+		},
+	}, map[string]struct{}{"10.0.0.2": {}}, socketIndex{})
+	if len(observed) != 1 {
+		t.Fatalf("expected overlapping tuple to normalize to one candidate, got %d", len(observed))
+	}
+	if observed[0].Flow.CTID != 2001 {
+		t.Fatalf("expected strongest candidate CTID to be selected, got %+v", observed[0].Flow)
+	}
+
+	lineageContinues := observedLineageContinues(prev, observed[0].Flow.CTID, observed[0].RawIDs)
+	if lineageContinues {
+		t.Fatalf("expected selected new CTID to break lineage even when previous CTID is still in RawIDs")
+	}
+	snapshot, delta, _, countFlow, resetOwners := service.updateSnapshot(
+		now.Add(2*time.Second),
+		observed[0].Flow,
+		observed[0].Classified,
+		process,
+		prev,
+		true,
+		true,
+		lineageContinues,
+	)
+	if !resetOwners || !countFlow {
+		t.Fatalf("expected overlapping new CTID to reset owners and count a new flow, reset=%v count=%v", resetOwners, countFlow)
+	}
+	if delta == nil || delta.upBytes != 300 || delta.downBytes != 500 || delta.upPkts != 3 || delta.downPkts != 5 {
+		t.Fatalf("expected new lineage to count current counters, got %+v", delta)
+	}
+	if snapshot.CTID != 2001 {
+		t.Fatalf("expected snapshot to move to selected CTID, got %+v", snapshot)
 	}
 }
 

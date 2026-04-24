@@ -164,6 +164,19 @@ func TestProcessResolverScanFailureDoesNotWriteNegativeCache(t *testing.T) {
 	}
 }
 
+func TestMergeProcessOwnerMarksSharedInodeAmbiguous(t *testing.T) {
+	merged := mergeProcessOwner(
+		processInfo(200, "nginx"),
+		processInfo(100, "nginx"),
+	)
+	if merged.PID != 100 {
+		t.Fatalf("expected deterministic lower PID owner, got %+v", merged)
+	}
+	if !merged.Ambiguous {
+		t.Fatalf("expected shared inode owner to be marked ambiguous")
+	}
+}
+
 func processInfo(pid int, comm string) model.ProcessInfo {
 	return model.ProcessInfo{
 		PID:  pid,
