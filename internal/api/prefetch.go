@@ -12,10 +12,9 @@ import (
 )
 
 const (
-	// Background prefetch is a cache warmer, not the main request path. Keep it
-	// focused on the newest activity so a busy host does not re-run thousands of
-	// explain queries every minute.
-	backgroundPrefetchReplayWindow = 3 * time.Minute
+	// Background prefetch is a cache warmer, not the main request path. Keep row
+	// count bounded so a busy host does not re-run thousands of explain queries
+	// every minute.
 	backgroundPrefetchMaxUsageRows = 256
 )
 
@@ -116,11 +115,6 @@ func (s *Server) RunBackgroundPrefetch(ctx context.Context, options BackgroundPr
 	}
 
 	chainStart := now.Add(-options.ChainLookback)
-	replayFloor := now.Add(-backgroundPrefetchReplayWindow)
-	if chainStart.Before(replayFloor) {
-		chainStart = replayFloor
-	}
-
 	usageRows, truncated, err := s.queryUsageRowsForPrefetch(ctx, chainStart, now.Add(time.Minute), backgroundPrefetchMaxUsageRows)
 	if err != nil {
 		summary.Errors++
@@ -128,7 +122,7 @@ func (s *Server) RunBackgroundPrefetch(ctx context.Context, options BackgroundPr
 		return summary
 	}
 	if truncated {
-		s.logPrefetchf("prefetch usage replay capped at %d rows within %s", backgroundPrefetchMaxUsageRows, backgroundPrefetchReplayWindow)
+		s.logPrefetchf("prefetch usage replay capped at %d rows within %s", backgroundPrefetchMaxUsageRows, options.ChainLookback)
 	}
 	queries := dedupePrefetchExplainQueries(usageRows)
 	for _, query := range queries {

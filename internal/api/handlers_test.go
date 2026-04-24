@@ -741,17 +741,19 @@ func TestRunBackgroundPrefetchDedupesEquivalentUsageQueries(t *testing.T) {
 	}
 }
 
-func TestRunBackgroundPrefetchLimitsUsageReplayWindow(t *testing.T) {
+func TestRunBackgroundPrefetchHonorsChainLookback(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	logDir := t.TempDir()
 	setProcessLogDir(server, "ss-server", logDir)
 
 	now := time.Date(2026, 4, 18, 12, 10, 30, 0, time.UTC)
-	oldMinute := now.Add(-backgroundPrefetchReplayWindow).Add(-time.Minute).Truncate(time.Minute)
+	outsideMinute := now.Add(-21 * time.Minute).Truncate(time.Minute)
+	lookbackMinute := now.Add(-10 * time.Minute).Truncate(time.Minute)
 	recentMinute := now.Add(-time.Minute).Truncate(time.Minute)
 	logLines := []string{
-		fmt.Sprintf("%s /usr/bin/ss-server[27896]: [12096] connect to stale.example.com:443", oldMinute.Add(10*time.Second).Format(time.RFC3339)),
+		fmt.Sprintf("%s /usr/bin/ss-server[27896]: [12096] connect to outside.example.com:443", outsideMinute.Add(10*time.Second).Format(time.RFC3339)),
+		fmt.Sprintf("%s /usr/bin/ss-server[27896]: [12096] connect to lookback.example.com:443", lookbackMinute.Add(10*time.Second).Format(time.RFC3339)),
 		fmt.Sprintf("%s /usr/bin/ss-server[27896]: [12096] connect to chatgpt.com:443", recentMinute.Add(10*time.Second).Format(time.RFC3339)),
 	}
 	if err := os.WriteFile(filepath.Join(logDir, "ss-server.log"), []byte(strings.Join(logLines, "\n")+"\n"), 0o644); err != nil {
@@ -759,9 +761,9 @@ func TestRunBackgroundPrefetchLimitsUsageReplayWindow(t *testing.T) {
 	}
 
 	pid := 1088
-	if err := server.store.FlushMinute(ctx, oldMinute.Unix(), map[model.UsageKey]model.UsageDelta{
+	if err := server.store.FlushMinute(ctx, outsideMinute.Unix(), map[model.UsageKey]model.UsageDelta{
 		{
-			MinuteTS:    oldMinute.Unix(),
+			MinuteTS:    outsideMinute.Unix(),
 			Proto:       "tcp",
 			Direction:   model.DirectionOut,
 			PID:         pid,
@@ -779,7 +781,29 @@ func TestRunBackgroundPrefetchLimitsUsageReplayWindow(t *testing.T) {
 			FlowCount: 1,
 		},
 	}, nil); err != nil {
-		t.Fatalf("seed old usage row: %v", err)
+		t.Fatalf("seed outside usage row: %v", err)
+	}
+	if err := server.store.FlushMinute(ctx, lookbackMinute.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    lookbackMinute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         pid,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "203.0.113.20",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1536,
+			BytesDown: 6144,
+			PktsUp:    6,
+			PktsDown:  9,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed lookback usage row: %v", err)
 	}
 	if err := server.store.FlushMinute(ctx, recentMinute.Unix(), map[model.UsageKey]model.UsageDelta{
 		{
@@ -813,8 +837,8 @@ func TestRunBackgroundPrefetchLimitsUsageReplayWindow(t *testing.T) {
 		MaxScanFiles:        4,
 		MaxScanLinesPerFile: 1000,
 	})
-	if summary.UsageRows != 1 {
-		t.Fatalf("expected replay window to prefetch only the newest usage row, got %+v", summary)
+	if summary.UsageRows != 2 {
+		t.Fatalf("expected chain lookback to prefetch recent and lookback rows, got %+v", summary)
 	}
 
 	recentChains, err := server.store.QueryUsageChainsForProcess(ctx, recentMinute.Unix(), &pid, "ss-server", "/usr/bin/ss-server", store.DataSourceMinuteChain)
@@ -825,12 +849,20 @@ func TestRunBackgroundPrefetchLimitsUsageReplayWindow(t *testing.T) {
 		t.Fatalf("expected recent usage row to be prefetched into chains")
 	}
 
-	oldChains, err := server.store.QueryUsageChainsForProcess(ctx, oldMinute.Unix(), &pid, "ss-server", "/usr/bin/ss-server", store.DataSourceMinuteChain)
+	lookbackChains, err := server.store.QueryUsageChainsForProcess(ctx, lookbackMinute.Unix(), &pid, "ss-server", "/usr/bin/ss-server", store.DataSourceMinuteChain)
 	if err != nil {
-		t.Fatalf("query old chains: %v", err)
+		t.Fatalf("query lookback chains: %v", err)
 	}
-	if len(oldChains) != 0 {
-		t.Fatalf("expected old usage row outside replay window to be skipped, got %+v", oldChains)
+	if len(lookbackChains) == 0 {
+		t.Fatalf("expected usage row inside chain lookback to be prefetched into chains")
+	}
+
+	outsideChains, err := server.store.QueryUsageChainsForProcess(ctx, outsideMinute.Unix(), &pid, "ss-server", "/usr/bin/ss-server", store.DataSourceMinuteChain)
+	if err != nil {
+		t.Fatalf("query outside chains: %v", err)
+	}
+	if len(outsideChains) != 0 {
+		t.Fatalf("expected usage row outside chain lookback to be skipped, got %+v", outsideChains)
 	}
 }
 
