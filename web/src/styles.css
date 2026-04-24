@@ -353,6 +353,34 @@ button {
   color: var(--accent-success);
 }
 
+.archive-state {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.archive-state.live {
+  color: var(--accent-success);
+  background: rgba(52, 211, 153, 0.08);
+  border: 1px solid rgba(52, 211, 153, 0.16);
+}
+
+.archive-state.archived {
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--panel-border);
+}
+
+.archive-note {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
 /* Input Controls */
 .range-select,
 .segmented-control {

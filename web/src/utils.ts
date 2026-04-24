@@ -65,6 +65,14 @@ export function formatLongDateTime(ts: number) {
   return formatDateTime(ts);
 }
 
+export function formatMonth(ts: number) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    timeZone: 'UTC',
+  }).format(ts * 1000);
+}
+
 export function rangeLabel(range: RangeKey) {
   return {
     '1h': '1 小时',

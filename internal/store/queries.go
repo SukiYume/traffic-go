@@ -147,6 +147,188 @@ WHERE %s >= ? AND %s < ?
 	return stats, nil
 }
 
+func (s *Store) QueryMonthlyUsage(ctx context.Context) ([]model.MonthlyUsageSummary, error) {
+	now := s.now().UTC()
+	liveStart := retentionStartUTC(now, s.retention).Unix()
+	liveUpdatedAt := now.Unix()
+	rows, err := s.db.QueryContext(ctx, `
+WITH minute_detail_months AS (
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_1m
+    WHERE minute_ts >= ?
+),
+forward_detail_months AS (
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_1m_forward
+    WHERE minute_ts >= ?
+),
+chain_detail_months AS (
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_chain_1m
+    WHERE minute_ts >= ?
+),
+live_raw AS (
+    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           COALESCE(SUM(bytes_up), 0) AS bytes_up,
+           COALESCE(SUM(bytes_down), 0) AS bytes_down,
+           COALESCE(SUM(flow_count), 0) AS flow_count,
+           0 AS forward_bytes_orig,
+           0 AS forward_bytes_reply,
+           0 AS forward_flow_count,
+           0 AS evidence_count,
+           0 AS chain_count
+    FROM usage_1m
+    WHERE minute_ts >= ?
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           COALESCE(SUM(bytes_up), 0),
+           COALESCE(SUM(bytes_down), 0),
+           COALESCE(SUM(flow_count), 0),
+           0, 0, 0, 0, 0
+    FROM usage_1h
+    WHERE hour_ts >= ?
+      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
+          SELECT month_ts FROM minute_detail_months
+      )
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0,
+           COALESCE(SUM(bytes_orig), 0),
+           COALESCE(SUM(bytes_reply), 0),
+           COALESCE(SUM(flow_count), 0),
+           0,
+           0
+    FROM usage_1m_forward
+    WHERE minute_ts >= ?
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0,
+           COALESCE(SUM(bytes_orig), 0),
+           COALESCE(SUM(bytes_reply), 0),
+           COALESCE(SUM(flow_count), 0),
+           0,
+           0
+    FROM usage_1h_forward
+    WHERE hour_ts >= ?
+      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
+          SELECT month_ts FROM forward_detail_months
+      )
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(event_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0, 0, 0, 0,
+           COUNT(*),
+           0
+    FROM log_evidence
+    WHERE event_ts >= ?
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0, 0, 0, 0, 0,
+           COUNT(*)
+    FROM usage_chain_1m
+    WHERE minute_ts >= ?
+    GROUP BY month_ts
+    UNION ALL
+    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
+           0, 0, 0, 0, 0, 0, 0,
+           COUNT(*)
+    FROM usage_chain_1h
+    WHERE hour_ts >= ?
+      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
+          SELECT month_ts FROM chain_detail_months
+      )
+    GROUP BY month_ts
+),
+live_monthly AS (
+    SELECT month_ts,
+           COALESCE(SUM(bytes_up), 0) AS bytes_up,
+           COALESCE(SUM(bytes_down), 0) AS bytes_down,
+           COALESCE(SUM(flow_count), 0) AS flow_count,
+           COALESCE(SUM(forward_bytes_orig), 0) AS forward_bytes_orig,
+           COALESCE(SUM(forward_bytes_reply), 0) AS forward_bytes_reply,
+           COALESCE(SUM(forward_flow_count), 0) AS forward_flow_count,
+           COALESCE(SUM(evidence_count), 0) AS evidence_count,
+           COALESCE(SUM(chain_count), 0) AS chain_count
+    FROM live_raw
+    WHERE month_ts IS NOT NULL
+    GROUP BY month_ts
+),
+combined AS (
+    SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
+           forward_flow_count, evidence_count, chain_count, updated_at, 1 AS archived
+    FROM usage_monthly
+    WHERE month_ts NOT IN (SELECT month_ts FROM live_monthly)
+    UNION ALL
+    SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
+           forward_flow_count, evidence_count, chain_count, ? AS updated_at, 0 AS archived
+    FROM live_monthly
+)
+SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
+       forward_flow_count, evidence_count, chain_count, updated_at, archived
+FROM combined
+ORDER BY month_ts DESC
+`, liveStart, liveStart, liveStart, liveStart, liveStart, liveStart, liveStart, liveStart, liveStart, liveStart, liveUpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("query monthly usage: %w", err)
+	}
+	defer rows.Close()
+
+	summaries := make([]model.MonthlyUsageSummary, 0)
+	for rows.Next() {
+		var summary model.MonthlyUsageSummary
+		var archived int
+		if err := rows.Scan(
+			&summary.MonthTS,
+			&summary.BytesUp,
+			&summary.BytesDown,
+			&summary.FlowCount,
+			&summary.ForwardBytesOrig,
+			&summary.ForwardBytesReply,
+			&summary.ForwardFlowCount,
+			&summary.EvidenceCount,
+			&summary.ChainCount,
+			&summary.UpdatedAt,
+			&archived,
+		); err != nil {
+			return nil, fmt.Errorf("scan monthly usage: %w", err)
+		}
+		summary.Archived = archived != 0
+		if !summary.Archived {
+			summary.DetailRange, summary.DetailAvailable = s.detailRangeForMonth(summary.MonthTS)
+		}
+		summaries = append(summaries, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate monthly usage: %w", err)
+	}
+	return summaries, nil
+}
+
+func (s *Store) detailRangeForMonth(monthTS int64) (string, bool) {
+	now := s.now().UTC()
+	month := monthStartUTC(time.Unix(monthTS, 0))
+	current := monthStartUTC(now)
+	if month.Before(retentionStartUTC(now, s.retention)) || !month.Before(current.AddDate(0, 1, 0)) {
+		return "", false
+	}
+
+	diff := (current.Year()-month.Year())*12 + int(current.Month()-month.Month())
+	switch diff {
+	case 0:
+		return "this_month", true
+	case 1:
+		return "last_month", true
+	case 2:
+		return "two_months_ago", true
+	default:
+		return "", true
+	}
+}
+
 func (s *Store) QueryTimeseries(ctx context.Context, query model.TimeseriesQuery, source string) ([]model.TimeseriesPoint, error) {
 	info := usageSourceInfo(source)
 	bucketSeconds := int64(query.Bucket / time.Second)

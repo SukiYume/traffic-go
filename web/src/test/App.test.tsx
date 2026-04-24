@@ -12,6 +12,7 @@ import { ProcessesPage } from "../pages/ProcessesPage";
 import { RemotesPage } from "../pages/RemotesPage";
 import { UsagePage } from "../pages/UsagePage";
 import { DashboardPage } from "../pages/DashboardPage";
+import { HistoryPage } from "../pages/HistoryPage";
 import type { ProcessGroupBy, TrafficApiClient } from "../types";
 
 function renderWithProviders(
@@ -314,6 +315,20 @@ describe("traffic-go web ui", () => {
     expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Usage" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Forward" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "History" })).toBeInTheDocument();
+  });
+
+  it("shows monthly history and links retained months to detail", async () => {
+    renderWithProviders("/history", <HistoryPage />);
+
+    expect(await screen.findByText("月度归档")).toBeInTheDocument();
+    expect(await screen.findByText("历史总流量")).toBeInTheDocument();
+    expect(screen.getByText("已归档")).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "查看明细" })[0]).toHaveAttribute(
+      "href",
+      "/usage?range=this_month",
+    );
+    expect(screen.getByText("仅月度汇总")).toBeInTheDocument();
   });
 
   it("expands a usage row to show detail panel on click", async () => {

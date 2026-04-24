@@ -5,6 +5,7 @@ import type {
   ForwardUsageRow,
   ForwardSortKey,
   GroupBy,
+  MonthlyUsageResponse,
   OverviewStats,
   ProcessGroupBy,
   ProcessSortKey,
@@ -61,6 +62,24 @@ type RawOverviewResponse = {
     active_connections: number;
     active_processes: number;
   };
+};
+
+type RawMonthlyUsageResponse = {
+  data: Array<{
+    month_ts: number;
+    bytes_up: number;
+    bytes_down: number;
+    flow_count: number;
+    forward_bytes_orig: number;
+    forward_bytes_reply: number;
+    forward_flow_count: number;
+    evidence_count: number;
+    chain_count: number;
+    updated_at: number;
+    archived: boolean;
+    detail_available: boolean;
+    detail_range?: RangeKey | '';
+  }>;
 };
 
 type RawTimeseriesResponse = {
@@ -392,6 +411,29 @@ function decodeOverview(raw: unknown): OverviewStats {
   };
 }
 
+function decodeMonthlyUsage(raw: unknown): MonthlyUsageResponse {
+  const payload = raw as RawMonthlyUsageResponse;
+  return {
+    rows: (payload.data ?? []).map((row) => ({
+      monthTs: row.month_ts,
+      bytesUp: row.bytes_up,
+      bytesDown: row.bytes_down,
+      flowCount: row.flow_count,
+      forwardBytesOrig: row.forward_bytes_orig,
+      forwardBytesReply: row.forward_bytes_reply,
+      forwardFlowCount: row.forward_flow_count,
+      evidenceCount: row.evidence_count,
+      chainCount: row.chain_count,
+      updatedAt: row.updated_at,
+      archived: Boolean(row.archived),
+      detailAvailable: Boolean(row.detail_available),
+      detailRange: row.detail_range || null,
+      totalBytes: row.bytes_up + row.bytes_down,
+      forwardTotalBytes: row.forward_bytes_orig + row.forward_bytes_reply,
+    })),
+  };
+}
+
 function decodeTimeSeries(raw: unknown, bucket: BucketKey, groupBy: GroupBy): TimeSeriesResponse {
   const payload = raw as RawTimeseriesResponse;
   const byBucket = new Map<number, { up: number; down: number; flowCount: number }>();
@@ -611,6 +653,9 @@ export function createHttpClient(): TrafficApiClient {
   return {
     getOverview(range, requestOptions) {
       return requestJson(withAppBase(`/api/v1/stats/overview${buildQuery([['range', range]])}`), decodeOverview, requestOptions);
+    },
+    getMonthlyUsage(requestOptions) {
+      return requestJson(withAppBase('/api/v1/stats/monthly'), decodeMonthlyUsage, requestOptions);
     },
     getTimeSeries(range, groupBy: GroupBy = 'direction', filters, requestOptions) {
       const bucket = RANGE_TO_BUCKET[range];

@@ -3,6 +3,7 @@ package api
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -162,6 +163,52 @@ func TestHealthz(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+}
+
+func TestMonthlyUsageEndpoint(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Minute)
+	if err := server.store.FlushMinute(ctx, now.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    now.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         42,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   50500,
+			RemoteIP:    "1.1.1.1",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 100, BytesDown: 200, PktsUp: 1, PktsDown: 2, FlowCount: 3},
+	}, nil); err != nil {
+		t.Fatalf("seed current month detail: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats/monthly", nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	var body struct {
+		Data []model.MonthlyUsageSummary `json:"data"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode monthly response: %v", err)
+	}
+	if len(body.Data) != 1 {
+		t.Fatalf("unexpected monthly response: %+v", body)
+	}
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).Unix()
+	if body.Data[0].MonthTS != monthStart || body.Data[0].Archived || !body.Data[0].DetailAvailable || body.Data[0].DetailRange != "this_month" {
+		t.Fatalf("unexpected monthly status: %+v", body.Data[0])
+	}
+	if body.Data[0].BytesUp != 100 || body.Data[0].BytesDown != 200 || body.Data[0].FlowCount != 3 {
+		t.Fatalf("unexpected monthly row: %+v", body.Data[0])
 	}
 }
 

@@ -285,6 +285,78 @@ WHERE month_ts = ?
 	}
 }
 
+func TestQueryMonthlyUsageCombinesArchiveAndLiveMonths(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	store.now = func() time.Time { return time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC) }
+	store.retention.Months = 3
+
+	january := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	march := time.Date(2026, 3, 12, 8, 15, 0, 0, time.UTC)
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO usage_monthly (
+	month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
+	forward_flow_count, evidence_count, chain_count, updated_at
+) VALUES
+	(?, 100, 200, 3, 400, 500, 6, 7, 8, 9),
+	(?, 999, 999, 99, 0, 0, 0, 0, 0, 10)
+`, january, time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC).Unix()); err != nil {
+		t.Fatalf("seed monthly archive: %v", err)
+	}
+
+	if err := store.FlushMinute(ctx, march.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    march.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         42,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   50500,
+			RemoteIP:    "1.1.1.1",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 11, BytesDown: 22, PktsUp: 1, PktsDown: 2, FlowCount: 1},
+	}, map[model.ForwardUsageKey]model.UsageDelta{
+		{
+			MinuteTS:  march.Unix(),
+			Proto:     "tcp",
+			OrigSrcIP: "10.0.0.2",
+			OrigDstIP: "1.1.1.1",
+			OrigSPort: 50000,
+			OrigDPort: 443,
+		}: {BytesUp: 33, BytesDown: 44, PktsUp: 3, PktsDown: 4, FlowCount: 2},
+	}); err != nil {
+		t.Fatalf("flush march details: %v", err)
+	}
+
+	summaries, err := store.QueryMonthlyUsage(ctx)
+	if err != nil {
+		t.Fatalf("query monthly usage: %v", err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("unexpected summary count: %+v", summaries)
+	}
+	if summaries[0].MonthTS != time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC).Unix() {
+		t.Fatalf("expected march first, got %+v", summaries[0])
+	}
+	if summaries[0].Archived || !summaries[0].DetailAvailable || summaries[0].DetailRange != "last_month" {
+		t.Fatalf("unexpected march detail status: %+v", summaries[0])
+	}
+	if summaries[0].BytesUp != 11 || summaries[0].BytesDown != 22 || summaries[0].FlowCount != 1 {
+		t.Fatalf("live details should override stale monthly archive: %+v", summaries[0])
+	}
+	if summaries[0].ForwardBytesOrig != 33 || summaries[0].ForwardBytesReply != 44 || summaries[0].ForwardFlowCount != 2 {
+		t.Fatalf("unexpected live forward summary: %+v", summaries[0])
+	}
+	if !summaries[1].Archived || summaries[1].DetailAvailable || summaries[1].DetailRange != "" {
+		t.Fatalf("unexpected january archive status: %+v", summaries[1])
+	}
+	if summaries[1].BytesUp != 100 || summaries[1].BytesDown != 200 || summaries[1].EvidenceCount != 7 || summaries[1].ChainCount != 8 {
+		t.Fatalf("unexpected january archive summary: %+v", summaries[1])
+	}
+}
+
 func TestNextPendingAggregationHourIncludesForwardOnlyMinutes(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

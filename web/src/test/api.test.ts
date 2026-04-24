@@ -97,6 +97,45 @@ describe('http api client', () => {
     );
   });
 
+  it('decodes monthly archive rows', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              month_ts: 1769904000,
+              bytes_up: 100,
+              bytes_down: 250,
+              flow_count: 3,
+              forward_bytes_orig: 40,
+              forward_bytes_reply: 60,
+              forward_flow_count: 2,
+              evidence_count: 7,
+              chain_count: 5,
+              updated_at: 1772323200,
+              archived: false,
+              detail_available: true,
+              detail_range: 'last_month',
+            },
+          ],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    const response = await client.getMonthlyUsage();
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/stats/monthly', expect.any(Object));
+    expect(response.rows[0]).toMatchObject({
+      monthTs: 1769904000,
+      totalBytes: 350,
+      forwardTotalBytes: 100,
+      detailRange: 'last_month',
+      archived: false,
+    });
+  });
+
   it('preserves grouped timeseries semantics while aggregating total buckets', async () => {
     vi.stubGlobal('fetch', fetchMock);
     fetchMock

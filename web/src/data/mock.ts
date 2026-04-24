@@ -20,6 +20,7 @@ import type {
   OverviewStats,
   UsageRow,
   ForwardUsageRow,
+  MonthlyUsageResponse,
   ProcessOption,
   UsageExplain,
 } from '../types';
@@ -37,6 +38,79 @@ const PROCESSES: MockProcessSeed[] = [
   { pid: 3312, comm: 'nginx', exe: '/usr/sbin/nginx', totalBytes: 188_220_416 },
   { pid: 4920, comm: 'dockerd', exe: '/usr/bin/dockerd', totalBytes: 93_114_880 },
   { pid: 0, comm: 'unknown', exe: '', totalBytes: 41_562_112 },
+];
+
+const monthTs = (year: number, month: number) => Date.UTC(year, month - 1, 1) / 1000;
+
+const MONTHLY_ROWS: MonthlyUsageResponse['rows'] = [
+  {
+    monthTs: monthTs(2026, 4),
+    bytesUp: 1_208_742_000,
+    bytesDown: 3_835_906_000,
+    flowCount: 6_144,
+    forwardBytesOrig: 310_421_000,
+    forwardBytesReply: 812_330_000,
+    forwardFlowCount: 420,
+    evidenceCount: 1_318,
+    chainCount: 274,
+    updatedAt: BASE_TS,
+    archived: false,
+    detailAvailable: true,
+    detailRange: 'this_month',
+    totalBytes: 5_044_648_000,
+    forwardTotalBytes: 1_122_751_000,
+  },
+  {
+    monthTs: monthTs(2026, 3),
+    bytesUp: 4_402_130_000,
+    bytesDown: 12_840_520_000,
+    flowCount: 18_924,
+    forwardBytesOrig: 1_930_088_000,
+    forwardBytesReply: 4_406_220_000,
+    forwardFlowCount: 1_208,
+    evidenceCount: 5_841,
+    chainCount: 1_092,
+    updatedAt: BASE_TS - 1_800,
+    archived: false,
+    detailAvailable: true,
+    detailRange: 'last_month',
+    totalBytes: 17_242_650_000,
+    forwardTotalBytes: 6_336_308_000,
+  },
+  {
+    monthTs: monthTs(2026, 2),
+    bytesUp: 3_980_044_000,
+    bytesDown: 10_112_774_000,
+    flowCount: 16_310,
+    forwardBytesOrig: 1_504_992_000,
+    forwardBytesReply: 3_808_331_000,
+    forwardFlowCount: 976,
+    evidenceCount: 4_228,
+    chainCount: 834,
+    updatedAt: BASE_TS - 3_600,
+    archived: false,
+    detailAvailable: true,
+    detailRange: 'two_months_ago',
+    totalBytes: 14_092_818_000,
+    forwardTotalBytes: 5_313_323_000,
+  },
+  {
+    monthTs: monthTs(2026, 1),
+    bytesUp: 3_214_500_000,
+    bytesDown: 9_748_120_000,
+    flowCount: 14_009,
+    forwardBytesOrig: 1_140_300_000,
+    forwardBytesReply: 3_554_880_000,
+    forwardFlowCount: 802,
+    evidenceCount: 3_902,
+    chainCount: 646,
+    updatedAt: BASE_TS - 7_200,
+    archived: true,
+    detailAvailable: false,
+    detailRange: null,
+    totalBytes: 12_962_620_000,
+    forwardTotalBytes: 4_695_180_000,
+  },
 ];
 
 const USAGE_ROWS: UsageRow[] = [
@@ -631,6 +705,9 @@ export function createMockApiClient(): TrafficApiClient {
   return {
     async getOverview(range) {
       return overviewFor(range);
+    },
+    async getMonthlyUsage() {
+      return { rows: MONTHLY_ROWS };
     },
     async getTimeSeries(range, groupBy = 'direction', filters?: TimeSeriesFilters) {
       const basePoints = aggregateSeries(range, RANGE_TO_BUCKET[range]).map((point, index) => {

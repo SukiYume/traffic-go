@@ -10,6 +10,7 @@ const links = [
   { to: '/processes', label: 'Processes' },
   { to: '/remotes', label: 'Remotes' },
   { to: '/forward', label: 'Forward' },
+  { to: '/history', label: 'History' },
 ];
 
 type RouteMeta = {
@@ -23,6 +24,7 @@ const canonicalQueryAllowlist: Record<string, string[]> = {
   '/processes': ['range'],
   '/remotes': ['range', 'direction', 'include_loopback'],
   '/forward': ['range', 'origSrcIp', 'origDstIp', 'proto'],
+  '/history': [],
 };
 
 const defaultRouteMeta: RouteMeta = {
@@ -53,6 +55,12 @@ function resolveRouteMeta(pathname: string): RouteMeta {
     return {
       title: '转发流量',
       subtitle: '核对 NAT 或转发表入口出口关系，排查异常转发路径。',
+    };
+  }
+  if (pathname === '/history') {
+    return {
+      title: '月度归档',
+      subtitle: '按 UTC 自然月查看所有历史总量，并区分可下钻明细和已归档月份。',
     };
   }
   return defaultRouteMeta;
@@ -168,7 +176,7 @@ export function Layout({ children }: { children: ReactNode }) {
         </nav>
         <div className="sidebar-note">
           <strong>范围规则</strong>
-          <span>完整明细按 UTC 自然月保留：本月、上月和上上月。</span>
+          <span>完整明细保留本月、上月和上上月；更早月份在 History 中查看月度汇总。</span>
         </div>
       </aside>
       <main className="content">{children}</main>

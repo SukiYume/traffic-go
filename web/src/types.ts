@@ -21,6 +21,28 @@ export interface OverviewStats {
   range: RangeKey;
 }
 
+export interface MonthlyUsageSummary {
+  monthTs: number;
+  bytesUp: number;
+  bytesDown: number;
+  flowCount: number;
+  forwardBytesOrig: number;
+  forwardBytesReply: number;
+  forwardFlowCount: number;
+  evidenceCount: number;
+  chainCount: number;
+  updatedAt: number;
+  archived: boolean;
+  detailAvailable: boolean;
+  detailRange: RangeKey | null;
+  totalBytes: number;
+  forwardTotalBytes: number;
+}
+
+export interface MonthlyUsageResponse {
+  rows: MonthlyUsageSummary[];
+}
+
 export interface TimeSeriesPoint {
   ts: number;
   up: number;
@@ -252,6 +274,7 @@ export interface ApiRequestOptions {
 
 export interface TrafficApiClient {
   getOverview(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<OverviewStats>;
+  getMonthlyUsage(requestOptions?: ApiRequestOptions): Promise<MonthlyUsageResponse>;
   getTimeSeries(range: RangeKey, groupBy?: GroupBy, filters?: TimeSeriesFilters, requestOptions?: ApiRequestOptions): Promise<TimeSeriesResponse>;
   getUsage(query: UsageQuery, requestOptions?: ApiRequestOptions): Promise<UsageResponse>;
   getUsageExplain(row: UsageRow, options?: { dataSource?: DataSource; allowScan?: boolean }, requestOptions?: ApiRequestOptions): Promise<UsageExplain>;

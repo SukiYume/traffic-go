@@ -61,6 +61,15 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, envelope{"data": stats})
 }
 
+func (s *Server) handleMonthlyUsage(w http.ResponseWriter, r *http.Request) {
+	summaries, err := s.store.QueryMonthlyUsage(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope{"data": summaries})
+}
+
 func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 	start, end, _, err := parseWindow(r)
 	if err != nil {

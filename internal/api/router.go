@@ -65,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/v1/processes", s.handleProcesses)
 	mux.HandleFunc("/api/v1/stats/overview", s.handleOverview)
+	mux.HandleFunc("/api/v1/stats/monthly", s.handleMonthlyUsage)
 	mux.HandleFunc("/api/v1/stats/timeseries", s.handleTimeseries)
 	mux.HandleFunc("/api/v1/usage", s.handleUsage)
 	mux.HandleFunc("/api/v1/usage/explain", s.handleUsageExplain)
