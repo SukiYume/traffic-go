@@ -191,6 +191,40 @@ func TestPrefetchWindowPersistsScannedRows(t *testing.T) {
 	}
 }
 
+func TestListLogFilesKeepsActiveUndatedLogDespiteMtime(t *testing.T) {
+	dir := t.TempDir()
+	active := filepath.Join(dir, "ss-server.log")
+	rotated := filepath.Join(dir, "ss-server.log-20260301.gz")
+	if err := os.WriteFile(active, []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("write active log: %v", err)
+	}
+	if err := os.WriteFile(rotated, []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("write rotated log: %v", err)
+	}
+	mtime := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(active, mtime, mtime); err != nil {
+		t.Fatalf("set active mtime: %v", err)
+	}
+	if err := os.Chtimes(rotated, mtime, mtime); err != nil {
+		t.Fatalf("set rotated mtime: %v", err)
+	}
+
+	start := time.Date(2026, 4, 18, 11, 59, 0, 0, time.UTC).Unix()
+	end := time.Date(2026, 4, 18, 12, 1, 0, 0, time.UTC).Unix()
+	files, err := ListLogFiles(dir, func(lowerName string) bool {
+		return strings.Contains(lowerName, ".log")
+	}, start, end, 10)
+	if err != nil {
+		t.Fatalf("list log files: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected only active undated log, got %+v", files)
+	}
+	if filepath.Base(files[0].Path) != "ss-server.log" {
+		t.Fatalf("expected active ss-server.log, got %+v", files[0])
+	}
+}
+
 func TestScanFilesPrefersTailOfLargePlainTextLogs(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "ss-server.log")

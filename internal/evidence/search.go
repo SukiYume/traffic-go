@@ -586,6 +586,10 @@ func IsLikelyFileInTimeRange(lowerName string, modTime time.Time, startTS int64,
 		return false
 	}
 
+	if isActiveUndatedLogFile(lowerName) {
+		return true
+	}
+
 	if modTime.IsZero() {
 		return true
 	}
@@ -597,6 +601,10 @@ func IsLikelyFileInTimeRange(lowerName string, modTime time.Time, startTS int64,
 		return false
 	}
 	return true
+}
+
+func isActiveUndatedLogFile(lowerName string) bool {
+	return strings.HasSuffix(strings.TrimSpace(lowerName), ".log")
 }
 
 func extractDateCandidatesFromFileName(lowerName string) []time.Time {
