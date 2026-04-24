@@ -491,42 +491,13 @@ func (s *Store) summarizeCleanupMonthsIfMissing(ctx context.Context, tx *sql.Tx,
 }
 
 func (s *Store) missingCleanupSummaryMonths(ctx context.Context, tx *sql.Tx, cutoff int64) ([]int64, error) {
-	rows, err := tx.QueryContext(ctx, `
-WITH months_to_delete AS (
-    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_1m
-    WHERE minute_ts < ?
-    UNION
-    SELECT DISTINCT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_1h
-    WHERE hour_ts < ?
-    UNION
-    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_1m_forward
-    WHERE minute_ts < ?
-    UNION
-    SELECT DISTINCT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_1h_forward
-    WHERE hour_ts < ?
-    UNION
-    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_chain_1m
-    WHERE minute_ts < ?
-    UNION
-    SELECT DISTINCT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_chain_1h
-    WHERE hour_ts < ?
-    UNION
-    SELECT DISTINCT CAST(strftime('%s', datetime(event_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM log_evidence
-    WHERE event_ts < ?
-)
+	query := monthlyDetailAggregateCTE(monthlyDetailBeforeExclusive) + `
 SELECT month_ts
-FROM months_to_delete
-WHERE month_ts IS NOT NULL
-  AND month_ts NOT IN (SELECT month_ts FROM usage_monthly)
+FROM monthly_detail
+WHERE month_ts NOT IN (SELECT month_ts FROM usage_monthly)
 ORDER BY month_ts ASC
-`, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff)
+`
+	rows, err := tx.QueryContext(ctx, query, monthlyDetailAggregateArgs(cutoff)...)
 	if err != nil {
 		return nil, fmt.Errorf("verify monthly summaries before cleanup: %w", err)
 	}
@@ -548,120 +519,17 @@ ORDER BY month_ts ASC
 
 func (s *Store) summarizeClosedMonths(ctx context.Context, tx *sql.Tx, before int64, now time.Time) error {
 	updatedAt := now.UTC().Unix()
-	_, err := tx.ExecContext(ctx, `
-WITH minute_detail_months AS (
-    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_1m
-    WHERE minute_ts < ?
-),
-forward_detail_months AS (
-    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_1m_forward
-    WHERE minute_ts < ?
-),
-chain_detail_months AS (
-    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
-    FROM usage_chain_1m
-    WHERE minute_ts < ?
-),
-raw_months AS (
-    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
-           COALESCE(SUM(bytes_up), 0) AS bytes_up,
-           COALESCE(SUM(bytes_down), 0) AS bytes_down,
-           COALESCE(SUM(flow_count), 0) AS flow_count,
-           0 AS forward_bytes_orig,
-           0 AS forward_bytes_reply,
-           0 AS forward_flow_count,
-           0 AS evidence_count,
-           0 AS chain_count
-    FROM usage_1m
-    WHERE minute_ts < ?
-    GROUP BY month_ts
-    UNION ALL
-    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
-           COALESCE(SUM(bytes_up), 0),
-           COALESCE(SUM(bytes_down), 0),
-           COALESCE(SUM(flow_count), 0),
-           0, 0, 0, 0, 0
-    FROM usage_1h
-    WHERE hour_ts < ?
-      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
-          SELECT month_ts FROM minute_detail_months
-      )
-    GROUP BY month_ts
-    UNION ALL
-    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
-           0, 0, 0,
-           COALESCE(SUM(bytes_orig), 0),
-           COALESCE(SUM(bytes_reply), 0),
-           COALESCE(SUM(flow_count), 0),
-           0,
-           0
-    FROM usage_1m_forward
-    WHERE minute_ts < ?
-    GROUP BY month_ts
-    UNION ALL
-    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
-           0, 0, 0,
-           COALESCE(SUM(bytes_orig), 0),
-           COALESCE(SUM(bytes_reply), 0),
-           COALESCE(SUM(flow_count), 0),
-           0,
-           0
-    FROM usage_1h_forward
-    WHERE hour_ts < ?
-      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
-          SELECT month_ts FROM forward_detail_months
-      )
-    GROUP BY month_ts
-    UNION ALL
-    SELECT CAST(strftime('%s', datetime(event_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
-           0, 0, 0, 0, 0, 0,
-           COUNT(*),
-           0
-    FROM log_evidence
-    WHERE event_ts < ?
-    GROUP BY month_ts
-    UNION ALL
-    SELECT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
-           0, 0, 0, 0, 0, 0, 0,
-           COUNT(*)
-    FROM usage_chain_1m
-    WHERE minute_ts < ?
-    GROUP BY month_ts
-    UNION ALL
-    SELECT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts,
-           0, 0, 0, 0, 0, 0, 0,
-           COUNT(*)
-    FROM usage_chain_1h
-    WHERE hour_ts < ?
-      AND CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) NOT IN (
-          SELECT month_ts FROM chain_detail_months
-      )
-    GROUP BY month_ts
-),
-monthly AS (
-    SELECT month_ts,
-           COALESCE(SUM(bytes_up), 0) AS bytes_up,
-           COALESCE(SUM(bytes_down), 0) AS bytes_down,
-           COALESCE(SUM(flow_count), 0) AS flow_count,
-           COALESCE(SUM(forward_bytes_orig), 0) AS forward_bytes_orig,
-           COALESCE(SUM(forward_bytes_reply), 0) AS forward_bytes_reply,
-           COALESCE(SUM(forward_flow_count), 0) AS forward_flow_count,
-           COALESCE(SUM(evidence_count), 0) AS evidence_count,
-           COALESCE(SUM(chain_count), 0) AS chain_count
-    FROM raw_months
-    WHERE month_ts IS NOT NULL
-    GROUP BY month_ts
-)
+	query := monthlyDetailAggregateCTE(monthlyDetailBeforeExclusive) + `
 INSERT OR REPLACE INTO usage_monthly (
     month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
     forward_flow_count, evidence_count, chain_count, updated_at
 )
 SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
        forward_flow_count, evidence_count, chain_count, ?
-FROM monthly
-`, before, before, before, before, before, before, before, before, before, before, updatedAt)
+FROM monthly_detail
+`
+	args := append(monthlyDetailAggregateArgs(before), updatedAt)
+	_, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("summarize closed months: %w", err)
 	}

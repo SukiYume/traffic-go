@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
-import { useSearchParams } from 'react-router-dom';
 import { ChartPanel } from '../components/ChartPanel';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { DataTable } from '../components/DataTable';
@@ -9,13 +8,12 @@ import { EmptyState } from '../components/EmptyState';
 import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
-import { normalizeRangeKey } from '../ranges';
 import { normalizeProcessSortKey } from '../sort-keys';
-import type { ProcessSummaryRow, RangeKey } from '../types';
+import type { ProcessSummaryRow } from '../types';
+import { useRangeSearchParam } from '../useRangeSearchParam';
 import { useResettingPage } from '../useResettingPage';
 import { formatBytes, rangeLabel, safeText } from '../utils';
 
-const defaultRange = '24h' satisfies RangeKey;
 const pageSize = 25;
 const columnHelper = createColumnHelper<ProcessSummaryRow>();
 
@@ -59,17 +57,10 @@ function findSelectedRow(rows: ProcessSummaryRow[], selected: SelectedProcessSta
 
 export function ProcessesPage() {
   const api = useApiClient();
-  const [params, setParams] = useSearchParams();
-  const range = normalizeRangeKey(params.get('range'), defaultRange);
+  const { range, setRange } = useRangeSearchParam();
   const [pidSorting, setPidSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
   const [commSorting, setCommSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
   const [selected, setSelected] = useState<SelectedProcessState | null>(null);
-
-  const setRange = (next: RangeKey) => {
-    const nextParams = new URLSearchParams(params);
-    nextParams.set('range', next);
-    setParams(nextParams, { replace: true });
-  };
 
   const currentPIDSort = pidSorting[0];
   const currentCommSort = commSorting[0];

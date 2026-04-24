@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { ChartPanel } from '../components/ChartPanel';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { EmptyState } from '../components/EmptyState';
@@ -7,37 +7,12 @@ import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { StatCard } from '../components/StatCard';
 import { useApiClient } from '../api-context';
-import { normalizeRangeKey } from '../ranges';
+import { buildRangedPath, useRangeSearchParam } from '../useRangeSearchParam';
 import { displayExecutableName, formatBytes, peerRoleLabel, rangeLabel, safeText } from '../utils';
-import type { RangeKey } from '../types';
-
-const defaultRange = '24h' satisfies RangeKey;
-
-function buildDrilldownPath(path: string, range: RangeKey, extra?: Record<string, string>) {
-  const params = new URLSearchParams();
-  params.set('range', range);
-  for (const [key, value] of Object.entries(extra ?? {})) {
-    if (value) {
-      params.set(key, value);
-    }
-  }
-  return `${path}?${params.toString()}`;
-}
-
-function useRangeParam() {
-  const [params, setParams] = useSearchParams();
-  const range = normalizeRangeKey(params.get('range'), defaultRange);
-  const setRange = (next: RangeKey) => {
-    const nextParams = new URLSearchParams(params);
-    nextParams.set('range', next);
-    setParams(nextParams, { replace: true });
-  };
-  return [range, setRange] as const;
-}
 
 export function DashboardPage() {
   const api = useApiClient();
-  const [range, setRange] = useRangeParam();
+  const { range, setRange } = useRangeSearchParam();
 
   const overview = useQuery({
     queryKey: ['overview', range],
@@ -123,7 +98,7 @@ export function DashboardPage() {
         <section className="panel">
           <div className="panel-head">
             <h2>Top 进程</h2>
-            <Link to={buildDrilldownPath('/processes', range)}>查看全部</Link>
+            <Link to={buildRangedPath('/processes', range)}>查看全部</Link>
           </div>
           {topProcesses.isError ? (
             <QueryErrorState error={topProcesses.error} title="Top 进程加载失败" compact />
@@ -149,7 +124,7 @@ export function DashboardPage() {
         <section className="panel">
           <div className="panel-head">
             <h2>Top 入站来源 IP</h2>
-            <Link to={buildDrilldownPath('/remotes', range, { direction: 'in', include_loopback: '1' })}>查看全部</Link>
+            <Link to={buildRangedPath('/remotes', range, { direction: 'in', include_loopback: '1' })}>查看全部</Link>
           </div>
           {topInboundRemotes.isError ? (
             <QueryErrorState error={topInboundRemotes.error} title="入站排行加载失败" compact />
@@ -175,7 +150,7 @@ export function DashboardPage() {
         <section className="panel">
           <div className="panel-head">
             <h2>Top 出站目标 IP</h2>
-            <Link to={buildDrilldownPath('/remotes', range, { direction: 'out', include_loopback: '1' })}>查看全部</Link>
+            <Link to={buildRangedPath('/remotes', range, { direction: 'out', include_loopback: '1' })}>查看全部</Link>
           </div>
           {topOutboundRemotes.isError ? (
             <QueryErrorState error={topOutboundRemotes.error} title="出站排行加载失败" compact />
@@ -201,7 +176,7 @@ export function DashboardPage() {
         <section className="panel">
           <div className="panel-head">
             <h2>Top 端口</h2>
-            <Link to={buildDrilldownPath('/usage', range)}>查看全部</Link>
+            <Link to={buildRangedPath('/usage', range)}>查看全部</Link>
           </div>
           {topPorts.isError ? (
             <QueryErrorState error={topPorts.error} title="端口排行加载失败" compact />

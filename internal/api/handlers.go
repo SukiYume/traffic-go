@@ -38,18 +38,46 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, envelope{"data": processes})
 }
 
-func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+type resolvedUsageWindow struct {
+	Start      time.Time
+	End        time.Time
+	RangeLabel string
+	Source     string
+}
+
+func (s *Server) resolveWindowSource(w http.ResponseWriter, r *http.Request, usesPID bool, usesExe bool) (resolvedUsageWindow, bool) {
 	start, end, rangeLabel, err := parseWindow(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_range", err)
-		return
+		return resolvedUsageWindow{}, false
 	}
-	source, err := s.store.ResolveUsageSource(start, end, false, false)
+	source, ok := s.resolveSourceForWindow(w, start, end, usesPID, usesExe)
+	if !ok {
+		return resolvedUsageWindow{}, false
+	}
+	return resolvedUsageWindow{
+		Start:      start,
+		End:        end,
+		RangeLabel: rangeLabel,
+		Source:     source,
+	}, true
+}
+
+func (s *Server) resolveSourceForWindow(w http.ResponseWriter, start time.Time, end time.Time, usesPID bool, usesExe bool) (string, bool) {
+	source, err := s.store.ResolveUsageSource(start, end, usesPID, usesExe)
 	if err != nil {
 		writeDimensionError(w, err)
+		return "", false
+	}
+	return source, true
+}
+
+func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+	window, ok := s.resolveWindowSource(w, r, false, false)
+	if !ok {
 		return
 	}
-	stats, err := s.store.QueryOverview(r.Context(), start, end, source)
+	stats, err := s.store.QueryOverview(r.Context(), window.Start, window.End, window.Source)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
@@ -57,7 +85,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	activeStats := s.runtime.ActiveStats()
 	stats.ActiveConnections = activeStats.Connections
 	stats.ActiveProcesses = activeStats.Processes
-	stats.Range = rangeLabel
+	stats.Range = window.RangeLabel
 	writeJSON(w, http.StatusOK, envelope{"data": stats})
 }
 
@@ -86,9 +114,8 @@ func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 		pidFilter = &pid
 	}
 	exeFilter := r.URL.Query().Get("exe")
-	source, err := s.store.ResolveUsageSource(start, end, pidFilter != nil, exeFilter != "")
-	if err != nil {
-		writeDimensionError(w, err)
+	source, ok := s.resolveSourceForWindow(w, start, end, pidFilter != nil, exeFilter != "")
+	if !ok {
 		return
 	}
 	bucket := parseBucket(r.URL.Query().Get("bucket"))
@@ -123,9 +150,8 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_usage_query", err)
 		return
 	}
-	source, err := s.store.ResolveUsageSource(query.Start, query.End, query.PID != nil, query.Exe != "")
-	if err != nil {
-		writeDimensionError(w, err)
+	source, ok := s.resolveSourceForWindow(w, query.Start, query.End, query.PID != nil, query.Exe != "")
+	if !ok {
 		return
 	}
 	records, nextCursor, totalRows, err := s.store.QueryUsage(r.Context(), query, source)
@@ -152,14 +178,8 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
-	start, end, _, err := parseWindow(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_range", err)
-		return
-	}
-	source, err := s.store.ResolveUsageSource(start, end, false, false)
-	if err != nil {
-		writeDimensionError(w, err)
+	window, ok := s.resolveWindowSource(w, r, false, false)
+	if !ok {
 		return
 	}
 	page, pageSize, err := parsePageParams(r)
@@ -169,9 +189,9 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, totalRows, err := s.store.QueryTopProcesses(
 		r.Context(),
-		start,
-		end,
-		source,
+		window.Start,
+		window.End,
+		window.Source,
 		r.URL.Query().Get("group_by"),
 		r.URL.Query().Get("sort_by"),
 		r.URL.Query().Get("sort_order"),
@@ -183,7 +203,7 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope{
-		"data_source": source,
+		"data_source": window.Source,
 		"data":        entries,
 		"total_rows":  totalRows,
 		"page":        page,
@@ -192,14 +212,8 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
-	start, end, _, err := parseWindow(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_range", err)
-		return
-	}
-	source, err := s.store.ResolveUsageSource(start, end, false, false)
-	if err != nil {
-		writeDimensionError(w, err)
+	window, ok := s.resolveWindowSource(w, r, false, false)
+	if !ok {
 		return
 	}
 	page, pageSize, err := parsePageParams(r)
@@ -210,9 +224,9 @@ func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
 	includeLoopback := parseBoolFlag(r.URL.Query().Get("include_loopback"))
 	entries, totalRows, err := s.store.QueryTopRemotes(
 		r.Context(),
-		start,
-		end,
-		source,
+		window.Start,
+		window.End,
+		window.Source,
 		model.Direction(r.URL.Query().Get("direction")),
 		includeLoopback,
 		r.URL.Query().Get("sort_by"),
@@ -225,7 +239,7 @@ func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope{
-		"data_source": source,
+		"data_source": window.Source,
 		"data":        entries,
 		"total_rows":  totalRows,
 		"page":        page,
@@ -242,22 +256,16 @@ func (s *Server) handleTop(
 	r *http.Request,
 	queryFunc func(context.Context, time.Time, time.Time, string, string) ([]model.TopEntry, error),
 ) {
-	start, end, _, err := parseWindow(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_range", err)
+	window, ok := s.resolveWindowSource(w, r, false, false)
+	if !ok {
 		return
 	}
-	source, err := s.store.ResolveUsageSource(start, end, false, false)
-	if err != nil {
-		writeDimensionError(w, err)
-		return
-	}
-	entries, err := queryFunc(r.Context(), start, end, source, r.URL.Query().Get("by"))
+	entries, err := queryFunc(r.Context(), window.Start, window.End, window.Source, r.URL.Query().Get("by"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope{"data_source": source, "data": entries})
+	writeJSON(w, http.StatusOK, envelope{"data_source": window.Source, "data": entries})
 }
 
 func (s *Server) handleForwardUsage(w http.ResponseWriter, r *http.Request) {
@@ -266,9 +274,8 @@ func (s *Server) handleForwardUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_forward_query", err)
 		return
 	}
-	source, err := s.store.ResolveUsageSource(query.Start, query.End, false, false)
-	if err != nil {
-		writeDimensionError(w, err)
+	source, ok := s.resolveSourceForWindow(w, query.Start, query.End, false, false)
+	if !ok {
 		return
 	}
 	records, nextCursor, totalRows, err := s.store.QueryForwardUsage(r.Context(), query, source)

@@ -2,7 +2,6 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { createColumnHelper, type SortingState } from "@tanstack/react-table";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import { useSearchParams } from "react-router-dom";
 import { DataSourceBadge } from "../components/DataSourceBadge";
 import { DataTable } from "../components/DataTable";
 import { EmptyState } from "../components/EmptyState";
@@ -11,8 +10,8 @@ import { QueryErrorState } from "../components/QueryErrorState";
 import { RangeSelect } from "../components/RangeSelect";
 import { isDimensionUnavailableError, normalizeUsageSortKey } from "../api";
 import { useApiClient } from "../api-context";
-import { normalizeRangeKey } from "../ranges";
-import type { DataSource, RangeKey, UsageRow } from "../types";
+import type { DataSource, UsageRow } from "../types";
+import { useRangeSearchParam } from "../useRangeSearchParam";
 import { useResettingPage } from "../useResettingPage";
 import {
   attributionDescription,
@@ -29,7 +28,6 @@ import {
   serviceNameForPort,
 } from "../utils";
 
-const defaultRange = "24h" satisfies RangeKey;
 const pageSize = 25;
 const columnHelper = createColumnHelper<UsageRow>();
 
@@ -49,8 +47,7 @@ function usageRowKey(row: UsageRow) {
 }
 
 function useUsageFilters() {
-  const [params, setParams] = useSearchParams();
-  const range = normalizeRangeKey(params.get("range"), defaultRange);
+  const { params, setParams, range, setRange } = useRangeSearchParam();
 
   const filters = {
     comm: params.get("comm") ?? "",
@@ -61,12 +58,6 @@ function useUsageFilters() {
     direction: params.get("direction") ?? "",
     proto: params.get("proto") ?? "",
     attribution: params.get("attribution") ?? "",
-  };
-
-  const setRange = (next: RangeKey) => {
-    const nextParams = new URLSearchParams(params);
-    nextParams.set("range", next);
-    setParams(nextParams, { replace: true });
   };
 
   const setFilters = (next: typeof filters) => {

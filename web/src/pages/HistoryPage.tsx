@@ -8,6 +8,7 @@ import { QueryErrorState } from '../components/QueryErrorState';
 import { StatCard } from '../components/StatCard';
 import { useApiClient } from '../api-context';
 import type { MonthlyUsageSummary } from '../types';
+import { buildRangedPath } from '../useRangeSearchParam';
 import { formatBytes, formatMonth, formatNumber, rangeLabel } from '../utils';
 
 const columnHelper = createColumnHelper<MonthlyUsageSummary>();
@@ -16,7 +17,7 @@ function detailPath(row: MonthlyUsageSummary) {
   if (!row.detailRange) {
     return null;
   }
-  return `/usage?range=${row.detailRange}`;
+  return buildRangedPath('/usage', row.detailRange);
 }
 
 function MonthStatus({ row }: { row: MonthlyUsageSummary }) {

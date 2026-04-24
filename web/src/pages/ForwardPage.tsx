@@ -1,7 +1,6 @@
 import { useMemo, useState } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
-import { useSearchParams } from 'react-router-dom';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { CustomSelect } from '../components/CustomSelect';
 import { DataTable } from '../components/DataTable';
@@ -9,13 +8,12 @@ import { EmptyState } from '../components/EmptyState';
 import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
-import { normalizeRangeKey } from '../ranges';
 import { normalizeForwardSortKey } from '../sort-keys';
-import type { ForwardUsageRow, RangeKey } from '../types';
+import type { ForwardUsageRow } from '../types';
+import { useRangeSearchParam } from '../useRangeSearchParam';
 import { useResettingPage } from '../useResettingPage';
 import { formatBytes, formatDateTime, rangeLabel } from '../utils';
 
-const defaultRange = '24h' satisfies RangeKey;
 const pageSize = 25;
 const columnHelper = createColumnHelper<ForwardUsageRow>();
 const protoOptions = [
@@ -26,20 +24,13 @@ const protoOptions = [
 
 export function ForwardPage() {
   const api = useApiClient();
-  const [params, setParams] = useSearchParams();
-  const range = normalizeRangeKey(params.get('range'), defaultRange);
+  const { params, setParams, range, setRange } = useRangeSearchParam();
   const filters = {
     origSrcIp: params.get('origSrcIp') ?? '',
     origDstIp: params.get('origDstIp') ?? '',
     proto: params.get('proto') ?? '',
   };
   const [sorting, setSorting] = useState<SortingState>([{ id: 'minuteTs', desc: true }]);
-
-  const setRange = (next: RangeKey) => {
-    const nextParams = new URLSearchParams(params);
-    nextParams.set('range', next);
-    setParams(nextParams, { replace: true });
-  };
 
   const setFilter = (key: keyof typeof filters, value: string) => {
     const nextParams = new URLSearchParams(params);

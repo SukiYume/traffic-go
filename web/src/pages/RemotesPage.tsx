@@ -1,37 +1,29 @@
 import { useMemo, useState } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { createColumnHelper, type SortingState } from '@tanstack/react-table';
-import { useSearchParams, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { DataTable } from '../components/DataTable';
 import { EmptyState } from '../components/EmptyState';
 import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
 import { useApiClient } from '../api-context';
-import { normalizeRangeKey } from '../ranges';
 import { normalizeRemoteSortKey } from '../sort-keys';
-import type { RangeKey, RemoteSummaryRow } from '../types';
+import type { RemoteSummaryRow } from '../types';
+import { buildRangedPath, useRangeSearchParam } from '../useRangeSearchParam';
 import { useResettingPage } from '../useResettingPage';
 import { directionLabel, formatBytes, rangeLabel, safeText } from '../utils';
 
-const defaultRange = '24h' satisfies RangeKey;
 const pageSize = 25;
 const columnHelper = createColumnHelper<RemoteSummaryRow>();
 
 export function RemotesPage() {
   const api = useApiClient();
   const navigate = useNavigate();
-  const [params, setParams] = useSearchParams();
-  const range = normalizeRangeKey(params.get('range'), defaultRange);
+  const { params, setParams, range, setRange } = useRangeSearchParam();
   const direction = (params.get('direction') as 'in' | 'out' | null) ?? '';
   const includeLoopback = params.get('include_loopback') === '1';
   const [sorting, setSorting] = useState<SortingState>([{ id: 'bytesTotal', desc: true }]);
-
-  const setRange = (next: RangeKey) => {
-    const nextParams = new URLSearchParams(params);
-    nextParams.set('range', next);
-    setParams(nextParams, { replace: true });
-  };
 
   const setDirection = (next: '' | 'in' | 'out') => {
     const nextParams = new URLSearchParams(params);
@@ -164,11 +156,10 @@ export function RemotesPage() {
           onSortingChange={setSorting}
           manualSorting
           onRowClick={(row) => {
-            const nextParams = new URLSearchParams();
-            nextParams.set('range', range);
-            if (row.remoteIp) nextParams.set('remoteIp', row.remoteIp);
-            if (row.direction) nextParams.set('direction', row.direction);
-            navigate(`/usage?${nextParams.toString()}`);
+            navigate(buildRangedPath('/usage', range, {
+              remoteIp: row.remoteIp,
+              direction: row.direction,
+            }));
           }}
           pagination={{
             page: query.data.page,

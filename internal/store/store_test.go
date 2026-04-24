@@ -381,6 +381,52 @@ WHERE month_ts = ?
 	}
 }
 
+func TestCleanupFallbackSummarizesEvidenceOnlyMonthBeforeDelete(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	store.now = func() time.Time { return time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC) }
+	store.retention.Months = 3
+
+	february := time.Date(2026, 2, 18, 10, 15, 0, 0, time.UTC)
+	if err := store.UpsertLogEvidenceBatch(ctx, []model.LogEvidence{{
+		Source:      "nginx",
+		EventTS:     february.Unix(),
+		ClientIP:    "203.0.113.24",
+		TargetIP:    "198.51.100.44",
+		Host:        "example.test",
+		Path:        "/",
+		Method:      "GET",
+		Message:     "evidence-only",
+		Fingerprint: "monthly-evidence-only-feb",
+	}}); err != nil {
+		t.Fatalf("upsert february evidence: %v", err)
+	}
+
+	if err := store.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	var evidenceCount int64
+	if err := store.db.QueryRow(`
+SELECT evidence_count
+FROM usage_monthly
+WHERE month_ts = ?
+`, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC).Unix()).Scan(&evidenceCount); err != nil {
+		t.Fatalf("query evidence-only monthly summary: %v", err)
+	}
+	if evidenceCount != 1 {
+		t.Fatalf("unexpected evidence-only monthly summary count: %d", evidenceCount)
+	}
+
+	var remainingEvidence int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM log_evidence WHERE event_ts < ?`, time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC).Unix()).Scan(&remainingEvidence); err != nil {
+		t.Fatalf("count expired evidence: %v", err)
+	}
+	if remainingEvidence != 0 {
+		t.Fatalf("expected expired evidence to be deleted after fallback summary, got %d", remainingEvidence)
+	}
+}
+
 func TestCleanupSummarizesExpiredHourOnlyMonth(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
