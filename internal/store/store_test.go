@@ -237,6 +237,84 @@ WHERE month_ts = ?
 	}
 }
 
+func TestCleanupSummarizesClosedMonthBeforeItExpires(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	february := time.Date(2026, 2, 18, 10, 15, 0, 0, time.UTC)
+	april := time.Date(2026, 4, 20, 12, 30, 0, 0, time.UTC)
+	store.now = func() time.Time { return time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC) }
+	store.retention.Months = 3
+
+	if err := store.FlushMinute(ctx, february.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    february.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         42,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   50500,
+			RemoteIP:    "1.1.1.1",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 100, BytesDown: 200, PktsUp: 1, PktsDown: 2, FlowCount: 1},
+	}, nil); err != nil {
+		t.Fatalf("flush february details: %v", err)
+	}
+	if err := store.FlushMinute(ctx, april.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    april.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         42,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   50501,
+			RemoteIP:    "8.8.8.8",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 300, BytesDown: 400, PktsUp: 3, PktsDown: 4, FlowCount: 2},
+	}, nil); err != nil {
+		t.Fatalf("flush april details: %v", err)
+	}
+
+	if err := store.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	var aprilSummary model.MonthlyUsageSummary
+	if err := store.db.QueryRow(`
+SELECT month_ts, bytes_up, bytes_down, flow_count
+FROM usage_monthly
+WHERE month_ts = ?
+`, time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC).Unix()).Scan(
+		&aprilSummary.MonthTS,
+		&aprilSummary.BytesUp,
+		&aprilSummary.BytesDown,
+		&aprilSummary.FlowCount,
+	); err != nil {
+		t.Fatalf("query april monthly summary: %v", err)
+	}
+	if aprilSummary.BytesUp != 300 || aprilSummary.BytesDown != 400 || aprilSummary.FlowCount != 2 {
+		t.Fatalf("unexpected april monthly summary: %+v", aprilSummary)
+	}
+
+	var aprilDetails, februaryDetails, februarySummaryBytes int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_1m WHERE minute_ts >= ? AND minute_ts < ?`, april.Unix(), april.Add(time.Minute).Unix()).Scan(&aprilDetails); err != nil {
+		t.Fatalf("count april details: %v", err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_1m WHERE minute_ts < ?`, time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC).Unix()).Scan(&februaryDetails); err != nil {
+		t.Fatalf("count february details: %v", err)
+	}
+	if err := store.db.QueryRow(`SELECT bytes_up FROM usage_monthly WHERE month_ts = ?`, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC).Unix()).Scan(&februarySummaryBytes); err != nil {
+		t.Fatalf("query february monthly summary: %v", err)
+	}
+	if aprilDetails != 1 || februaryDetails != 0 || februarySummaryBytes != 100 {
+		t.Fatalf("unexpected cleanup result: aprilDetails=%d februaryDetails=%d februarySummaryBytes=%d", aprilDetails, februaryDetails, februarySummaryBytes)
+	}
+}
+
 func TestCleanupSummarizesExpiredHourOnlyMonth(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

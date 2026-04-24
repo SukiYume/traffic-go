@@ -423,7 +423,9 @@ ON CONFLICT(hour_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO
 }
 
 func (s *Store) Cleanup(ctx context.Context) error {
-	cutoff := retentionStartUTC(s.now(), s.retention).Unix()
+	now := s.now().UTC()
+	cutoff := retentionStartUTC(now, s.retention).Unix()
+	closedMonthCutoff := monthStartUTC(now).Unix()
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -431,7 +433,7 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 
-	if err := s.summarizeExpiredMonths(ctx, tx, cutoff); err != nil {
+	if err := s.summarizeClosedMonths(ctx, tx, closedMonthCutoff, now); err != nil {
 		return err
 	}
 
@@ -458,8 +460,8 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	return tx.Commit()
 }
 
-func (s *Store) summarizeExpiredMonths(ctx context.Context, tx *sql.Tx, cutoff int64) error {
-	updatedAt := s.now().UTC().Unix()
+func (s *Store) summarizeClosedMonths(ctx context.Context, tx *sql.Tx, before int64, now time.Time) error {
+	updatedAt := now.UTC().Unix()
 	_, err := tx.ExecContext(ctx, `
 WITH minute_detail_months AS (
     SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
@@ -573,9 +575,9 @@ INSERT OR REPLACE INTO usage_monthly (
 SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
        forward_flow_count, evidence_count, chain_count, ?
 FROM monthly
-`, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, updatedAt)
+`, before, before, before, before, before, before, before, before, before, before, updatedAt)
 	if err != nil {
-		return fmt.Errorf("summarize expired months: %w", err)
+		return fmt.Errorf("summarize closed months: %w", err)
 	}
 	return nil
 }
