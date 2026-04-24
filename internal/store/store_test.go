@@ -315,6 +315,72 @@ WHERE month_ts = ?
 	}
 }
 
+func TestCleanupFallbackSummarizesMissingMonthBeforeDelete(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	february := time.Date(2026, 2, 18, 10, 15, 0, 0, time.UTC)
+	now := time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC)
+	cutoff := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC).Unix()
+	if err := store.FlushMinute(ctx, february.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    february.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         42,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   50500,
+			RemoteIP:    "1.1.1.1",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 500, BytesDown: 600, PktsUp: 5, PktsDown: 6, FlowCount: 7},
+	}, nil); err != nil {
+		t.Fatalf("flush february details: %v", err)
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	if err := store.summarizeCleanupMonthsIfMissing(ctx, tx, cutoff, now); err != nil {
+		t.Fatalf("summarize cleanup months if missing: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_1m WHERE minute_ts < ?`, cutoff); err != nil {
+		t.Fatalf("delete expired details: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit cleanup fallback: %v", err)
+	}
+
+	var summary model.MonthlyUsageSummary
+	if err := store.db.QueryRow(`
+SELECT month_ts, bytes_up, bytes_down, flow_count
+FROM usage_monthly
+WHERE month_ts = ?
+`, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC).Unix()).Scan(
+		&summary.MonthTS,
+		&summary.BytesUp,
+		&summary.BytesDown,
+		&summary.FlowCount,
+	); err != nil {
+		t.Fatalf("query february fallback summary: %v", err)
+	}
+	if summary.BytesUp != 500 || summary.BytesDown != 600 || summary.FlowCount != 7 {
+		t.Fatalf("unexpected fallback summary: %+v", summary)
+	}
+
+	var detailRows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_1m WHERE minute_ts < ?`, cutoff).Scan(&detailRows); err != nil {
+		t.Fatalf("count expired details: %v", err)
+	}
+	if detailRows != 0 {
+		t.Fatalf("expected expired details to be deleted after fallback summary, got %d", detailRows)
+	}
+}
+
 func TestCleanupSummarizesExpiredHourOnlyMonth(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

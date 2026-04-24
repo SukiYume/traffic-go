@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -436,6 +437,9 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	if err := s.summarizeClosedMonths(ctx, tx, closedMonthCutoff, now); err != nil {
 		return err
 	}
+	if err := s.summarizeCleanupMonthsIfMissing(ctx, tx, cutoff, now); err != nil {
+		return err
+	}
 
 	statements := []struct {
 		query string
@@ -458,6 +462,88 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	}
 
 	return tx.Commit()
+}
+
+func (s *Store) summarizeCleanupMonthsIfMissing(ctx context.Context, tx *sql.Tx, cutoff int64, now time.Time) error {
+	missingMonths, err := s.missingCleanupSummaryMonths(ctx, tx, cutoff)
+	if err != nil {
+		return err
+	}
+	if len(missingMonths) == 0 {
+		return nil
+	}
+
+	if err := s.summarizeClosedMonths(ctx, tx, cutoff, now); err != nil {
+		return fmt.Errorf("summarize missing cleanup months: %w", err)
+	}
+	missingMonths, err = s.missingCleanupSummaryMonths(ctx, tx, cutoff)
+	if err != nil {
+		return err
+	}
+	if len(missingMonths) > 0 {
+		labels := make([]string, 0, len(missingMonths))
+		for _, monthTS := range missingMonths {
+			labels = append(labels, time.Unix(monthTS, 0).UTC().Format("2006-01"))
+		}
+		return fmt.Errorf("monthly summary missing before cleanup after fallback for months: %s", strings.Join(labels, ", "))
+	}
+	return nil
+}
+
+func (s *Store) missingCleanupSummaryMonths(ctx context.Context, tx *sql.Tx, cutoff int64) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `
+WITH months_to_delete AS (
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_1m
+    WHERE minute_ts < ?
+    UNION
+    SELECT DISTINCT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_1h
+    WHERE hour_ts < ?
+    UNION
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_1m_forward
+    WHERE minute_ts < ?
+    UNION
+    SELECT DISTINCT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_1h_forward
+    WHERE hour_ts < ?
+    UNION
+    SELECT DISTINCT CAST(strftime('%s', datetime(minute_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_chain_1m
+    WHERE minute_ts < ?
+    UNION
+    SELECT DISTINCT CAST(strftime('%s', datetime(hour_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM usage_chain_1h
+    WHERE hour_ts < ?
+    UNION
+    SELECT DISTINCT CAST(strftime('%s', datetime(event_ts, 'unixepoch', 'start of month')) AS INTEGER) AS month_ts
+    FROM log_evidence
+    WHERE event_ts < ?
+)
+SELECT month_ts
+FROM months_to_delete
+WHERE month_ts IS NOT NULL
+  AND month_ts NOT IN (SELECT month_ts FROM usage_monthly)
+ORDER BY month_ts ASC
+`, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("verify monthly summaries before cleanup: %w", err)
+	}
+	defer rows.Close()
+
+	missingMonths := make([]int64, 0)
+	for rows.Next() {
+		var monthTS int64
+		if err := rows.Scan(&monthTS); err != nil {
+			return nil, fmt.Errorf("scan missing monthly summaries: %w", err)
+		}
+		missingMonths = append(missingMonths, monthTS)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate missing monthly summaries: %w", err)
+	}
+	return missingMonths, nil
 }
 
 func (s *Store) summarizeClosedMonths(ctx context.Context, tx *sql.Tx, before int64, now time.Time) error {
