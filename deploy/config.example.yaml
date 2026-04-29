@@ -14,7 +14,6 @@ tick_interval: 2s
 # PID attribution. Keep this independent from tick_interval to avoid scanning
 # every PID/net namespace on each conntrack sample.
 socket_index_interval: 10s
-log_level: info
 
 # Optional HTTP Basic Auth for the bundled WebUI and API. Required if listen
 # is changed to a non-loopback address such as 0.0.0.0:18080.
@@ -37,11 +36,6 @@ process_log_dirs:
   obfs-server: /var/log/shadowsocks
   frps: /root/frp_0630/*.log
   # rustdesk: /var/log/rustdesk
-
-# Legacy compatibility keys (optional).
-# If process_log_dirs already contains nginx/ss-server, those entries win.
-# nginx_log_dir: /var/log/nginx
-# ss_log_dir: /var/log/shadowsocks
 
 # Keep this true on hosts where Shadowsocks only logs to systemd journal.
 # Set false once rsyslog or the service itself already writes usable files

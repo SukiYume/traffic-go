@@ -39,6 +39,38 @@ func TestNormalizeLogMessageForDisplayTextEscapes(t *testing.T) {
 	}
 }
 
+func TestParseNginxEvidenceLineUsesForwardedIPWhenRemoteAddrIsLoopback(t *testing.T) {
+	line := `127.0.0.1 - - [29/Apr/2026:22:02:00 +0800] "GET /traffic/ HTTP/2.0" 200 1024 "-" "Mozilla/5.0" xff="203.0.113.24, 127.0.0.1" realip="127.0.0.1"`
+	evidence, ok := parseNginxEvidenceLine(evidenceSourceNginx, line, time.Time{})
+	if !ok {
+		t.Fatalf("expected nginx parse success")
+	}
+	if evidence.ClientIP != "203.0.113.24" {
+		t.Fatalf("expected forwarded client IP, got %+v", evidence)
+	}
+	if evidence.Path != "/traffic/" || evidence.Method != "GET" {
+		t.Fatalf("unexpected nginx request evidence: %+v", evidence)
+	}
+}
+
+func TestParseGenericEvidenceLineFRPSUserConnection(t *testing.T) {
+	line := `2026-04-29 22:02:10.161 [I] [proxy/proxy.go:204] [5d8d225ac885e00d] [pc_ssh] get a user connection [213.209.159.235:47700]`
+	reference := time.Date(2026, 4, 29, 22, 3, 0, 0, time.Local)
+	evidence, ok := parseGenericEvidenceLine(customEvidenceSource("frps"), line, reference)
+	if !ok {
+		t.Fatalf("expected frps parse success")
+	}
+	if evidence.ClientIP != "213.209.159.235" {
+		t.Fatalf("expected frps user connection source IP, got %+v", evidence)
+	}
+	if evidence.Host != "pc_ssh" || evidence.Method != "frps-user-connection" {
+		t.Fatalf("expected frps proxy name evidence, got %+v", evidence)
+	}
+	if evidence.TargetIP != "" || evidence.TargetPort != 0 {
+		t.Fatalf("did not expect frps user connection line to invent target endpoint, got %+v", evidence)
+	}
+}
+
 func TestListLogFilesFiltersByDateRange(t *testing.T) {
 	dir := t.TempDir()
 	inside := filepath.Join(dir, "ss-server.log-20260416.gz")
@@ -207,6 +239,27 @@ func TestParseSSEvidenceLineUDPCacheMiss(t *testing.T) {
 	}
 	if evidence.ClientIP != "223.104.41.114" {
 		t.Fatalf("expected client ip from udp pair, got %+v", evidence)
+	}
+	if evidence.EntryPort != 12096 {
+		t.Fatalf("expected entry port 12096, got %+v", evidence)
+	}
+}
+
+func TestParseSSEvidenceLineUDPCacheHitKeepsClientAndTargetDirection(t *testing.T) {
+	line := "Apr 29 21:37:22 217 /usr/local/bin/ss-server[993]: [12096] [udp] cache hit: 216.239.36.223:443 <-> 159.226.171.226:51699"
+	reference := time.Date(2026, 4, 29, 21, 38, 0, 0, time.Local)
+	evidence, ok := parseSSEvidenceLine(evidenceSourceSS, line, reference)
+	if !ok {
+		t.Fatalf("expected parse success")
+	}
+	if evidence.Method != "udp-cache-hit" {
+		t.Fatalf("expected udp-cache-hit method, got %+v", evidence)
+	}
+	if evidence.ClientIP != "159.226.171.226" || evidence.TargetIP != "216.239.36.223" {
+		t.Fatalf("expected target/client direction to be preserved, got %+v", evidence)
+	}
+	if evidence.TargetPort != 443 || evidence.Path != "443" {
+		t.Fatalf("expected target port 443, got %+v", evidence)
 	}
 	if evidence.EntryPort != 12096 {
 		t.Fatalf("expected entry port 12096, got %+v", evidence)

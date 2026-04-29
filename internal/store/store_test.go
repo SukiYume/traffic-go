@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -24,6 +23,21 @@ func newTestStore(t *testing.T) *Store {
 		_ = store.Close()
 	})
 	return store
+}
+
+func TestSchemaCreatesLogEvidenceHostPortIndexes(t *testing.T) {
+	store := newTestStore(t)
+
+	for _, indexName := range []string{"idx_log_evidence_entry_port", "idx_log_evidence_host_port"} {
+		row := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, indexName)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", indexName, err)
+		}
+		if count != 1 {
+			t.Fatalf("expected %s to exist, found %d", indexName, count)
+		}
+	}
 }
 
 func TestResolveUsageSource(t *testing.T) {
@@ -106,7 +120,16 @@ func TestFlushAndAggregate(t *testing.T) {
 	}
 
 	hourStart := time.Unix(minute, 0).Truncate(time.Hour)
-	top, totalRows, err := store.QueryTopProcesses(ctx, hourStart, hourStart.Add(time.Hour), DataSourceHour, "comm", "total", "desc", 10, 0)
+	dayStart := time.Unix(minute, 0).UTC().Truncate(24 * time.Hour)
+	dayStats, err := store.QueryOverview(ctx, dayStart, dayStart.Add(24*time.Hour), DataSourceDay)
+	if err != nil {
+		t.Fatalf("query daily overview: %v", err)
+	}
+	if dayStats.BytesUp != 100 || dayStats.BytesDown != 200 || dayStats.DataSource != DataSourceDay {
+		t.Fatalf("unexpected daily overview: %+v", dayStats)
+	}
+
+	top, totalRows, err := store.QueryTopProcesses(ctx, hourStart, hourStart.Add(time.Hour), DataSourceHour, "comm", "total", "desc", 10, 0, true)
 	if err != nil {
 		t.Fatalf("query top: %v", err)
 	}
@@ -728,8 +751,8 @@ func TestResolveUsageSourceUsesHourlyForLongWindowWithinRetention(t *testing.T) 
 	if err != nil {
 		t.Fatalf("resolve source: %v", err)
 	}
-	if source != DataSourceHour {
-		t.Fatalf("expected long retained window to use hour source, got %s", source)
+	if source != DataSourceDay {
+		t.Fatalf("expected very long retained window to use day source, got %s", source)
 	}
 
 	source, err = store.ResolveUsageSource(start, end, true)
@@ -907,169 +930,6 @@ func TestQueryTimeseriesSupportsExeBasenameFilter(t *testing.T) {
 	}
 	if points[0].BytesUp != 1024 || points[0].BytesDown != 2048 {
 		t.Fatalf("unexpected point values: %+v", points[0])
-	}
-}
-
-func TestMigrateDropsLegacyFlowSnapshotTable(t *testing.T) {
-	cfg := config.Default()
-	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
-
-	db, err := sql.Open("sqlite", cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open raw sqlite: %v", err)
-	}
-	_, err = db.Exec(`
-CREATE TABLE flows_snapshot (
-    ct_id INTEGER PRIMARY KEY,
-    proto TEXT NOT NULL
-);
-`)
-	if err != nil {
-		t.Fatalf("create legacy table: %v", err)
-	}
-	_ = db.Close()
-
-	store, err := Open(cfg)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
-
-	row := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'flows_snapshot'`)
-	var count int
-	if err := row.Scan(&count); err != nil {
-		t.Fatalf("count tables: %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("expected legacy flows_snapshot table to be dropped, found %d", count)
-	}
-}
-
-func TestMigrateLegacyLogEvidenceAddsHostPortColumnsAndIndex(t *testing.T) {
-	cfg := config.Default()
-	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
-
-	db, err := sql.Open("sqlite", cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open raw sqlite: %v", err)
-	}
-	_, err = db.Exec(`
-CREATE TABLE log_evidence (
-    source TEXT NOT NULL,
-    event_ts INTEGER NOT NULL,
-    client_ip TEXT NOT NULL,
-    target_ip TEXT NOT NULL,
-    host TEXT NOT NULL,
-    path TEXT NOT NULL,
-    method TEXT NOT NULL,
-    status INTEGER,
-    message TEXT NOT NULL,
-    fingerprint TEXT NOT NULL PRIMARY KEY,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-);
-CREATE INDEX IF NOT EXISTS idx_log_evidence_lookup ON log_evidence (source, event_ts, client_ip, target_ip);
-CREATE INDEX IF NOT EXISTS idx_log_evidence_created_at ON log_evidence (created_at);
-`)
-	if err != nil {
-		t.Fatalf("create legacy log_evidence table: %v", err)
-	}
-	_ = db.Close()
-
-	store, err := Open(cfg)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
-
-	hasHostNormalized, err := store.tableHasColumn(context.Background(), "log_evidence", "host_normalized")
-	if err != nil {
-		t.Fatalf("check host_normalized column: %v", err)
-	}
-	if !hasHostNormalized {
-		t.Fatalf("expected host_normalized column to be added")
-	}
-
-	hasEntryPort, err := store.tableHasColumn(context.Background(), "log_evidence", "entry_port")
-	if err != nil {
-		t.Fatalf("check entry_port column: %v", err)
-	}
-	if !hasEntryPort {
-		t.Fatalf("expected entry_port column to be added")
-	}
-
-	hasTargetPort, err := store.tableHasColumn(context.Background(), "log_evidence", "target_port")
-	if err != nil {
-		t.Fatalf("check target_port column: %v", err)
-	}
-	if !hasTargetPort {
-		t.Fatalf("expected target_port column to be added")
-	}
-
-	row := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_log_evidence_host_port'`)
-	var count int
-	if err := row.Scan(&count); err != nil {
-		t.Fatalf("count host/port index: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("expected idx_log_evidence_host_port to exist, found %d", count)
-	}
-}
-
-func TestMigratePrunesHistoricalZeroUsageRows(t *testing.T) {
-	cfg := config.Default()
-	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
-
-	db, err := sql.Open("sqlite", cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open raw sqlite: %v", err)
-	}
-	if _, err := db.Exec(schemaSQL); err != nil {
-		t.Fatalf("apply schema: %v", err)
-	}
-	if _, err := db.Exec(`
-INSERT INTO usage_1m (
-	minute_ts, proto, direction, pid, comm, exe, local_port, remote_ip, remote_port, attribution,
-	bytes_up, bytes_down, pkts_up, pkts_down, flow_count
-) VALUES
-	(1710000000, 'tcp', 'out', 0, '', '', 0, '203.0.113.8', 443, 'unknown', 0, 0, 0, 0, 0),
-	(1710000060, 'tcp', 'out', 1088, 'ss-server', '/usr/bin/ss-server', 8388, '203.0.113.9', 443, 'exact', 10, 20, 1, 2, 1);
-INSERT INTO usage_1m_forward (
-	minute_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport,
-	bytes_orig, bytes_reply, pkts_orig, pkts_reply, flow_count
-) VALUES
-	(1710000000, 'tcp', '10.0.0.2', '203.0.113.8', 51000, 443, 0, 0, 0, 0, 0),
-	(1710000060, 'tcp', '10.0.0.3', '203.0.113.9', 51001, 443, 10, 20, 1, 2, 1);
-`); err != nil {
-		t.Fatalf("seed zero usage rows: %v", err)
-	}
-	_ = db.Close()
-
-	store, err := Open(cfg)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
-
-	var usageRows int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_1m`).Scan(&usageRows); err != nil {
-		t.Fatalf("count usage rows after migrate: %v", err)
-	}
-	if usageRows != 1 {
-		t.Fatalf("expected zero-valued usage rows to be pruned, found %d rows", usageRows)
-	}
-
-	var forwardRows int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_1m_forward`).Scan(&forwardRows); err != nil {
-		t.Fatalf("count forward rows after migrate: %v", err)
-	}
-	if forwardRows != 1 {
-		t.Fatalf("expected zero-valued forward rows to be pruned, found %d rows", forwardRows)
 	}
 }
 
@@ -1329,6 +1189,7 @@ func TestQueryTopRemotesCanExcludeLoopback(t *testing.T) {
 		"desc",
 		10,
 		0,
+		true,
 	)
 	if err != nil {
 		t.Fatalf("query top remotes: %v", err)
@@ -1398,6 +1259,7 @@ func TestQueryTopProcessesSeparatesPidAndEmptyComm(t *testing.T) {
 		"desc",
 		10,
 		0,
+		true,
 	)
 	if err != nil {
 		t.Fatalf("query top processes: %v", err)

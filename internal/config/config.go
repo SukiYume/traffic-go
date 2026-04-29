@@ -22,10 +22,6 @@ const (
 
 type Retention struct {
 	Months int `yaml:"months"`
-	// Legacy day-based settings are still parsed so existing config files load,
-	// but retention is now enforced by UTC calendar months.
-	MinuteDays int `yaml:"flows_days"`
-	HourlyDays int `yaml:"hourly_days"`
 }
 
 type Prefetch struct {
@@ -44,23 +40,18 @@ type Auth struct {
 }
 
 type Config struct {
-	Listen              string        `yaml:"listen"`
-	DBPath              string        `yaml:"db_path"`
-	TickInterval        time.Duration `yaml:"tick_interval"`
-	SocketIndexInterval time.Duration `yaml:"socket_index_interval"`
-	ProcFS              string        `yaml:"proc_fs"`
-	ConntrackPath       string        `yaml:"conntrack_path"`
-	// Legacy fields kept for backward compatibility. Their values are merged
-	// into ProcessLogDirs when explicit per-process entries are not provided.
-	NginxLogDir    string            `yaml:"nginx_log_dir"`
-	SSLogDir       string            `yaml:"ss_log_dir"`
-	ProcessLogDirs map[string]string `yaml:"process_log_dirs"`
+	Listen              string            `yaml:"listen"`
+	DBPath              string            `yaml:"db_path"`
+	TickInterval        time.Duration     `yaml:"tick_interval"`
+	SocketIndexInterval time.Duration     `yaml:"socket_index_interval"`
+	ProcFS              string            `yaml:"proc_fs"`
+	ConntrackPath       string            `yaml:"conntrack_path"`
+	ProcessLogDirs      map[string]string `yaml:"process_log_dirs"`
 	// Keep systemd journal fallback enabled by default for hosts where
 	// shadowsocks still logs only to journald. Set false once rsyslog or the
 	// service itself writes usable files under process_log_dirs.
 	ShadowsocksJournalFallback *bool     `yaml:"shadowsocks_journal_fallback"`
 	MockData                   bool      `yaml:"mock_data"`
-	LogLevel                   string    `yaml:"log_level"`
 	Auth                       Auth      `yaml:"auth"`
 	Retention                  Retention `yaml:"retention"`
 	Prefetch                   Prefetch  `yaml:"prefetch"`
@@ -75,7 +66,6 @@ func Default() Config {
 		SocketIndexInterval:        defaultSocketIndexInterval,
 		ProcFS:                     defaultProcFS,
 		ShadowsocksJournalFallback: &enableShadowsocksJournalFallback,
-		LogLevel:                   "info",
 		Retention: Retention{
 			Months: 3,
 		},
@@ -112,13 +102,9 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
-// Derive applies runtime defaults and compatibility merges to a Config value.
+// Derive applies runtime defaults to a Config value.
 // Use this when a Config is constructed in-memory (without Load) before wiring services.
 func Derive(cfg Config) Config {
-	return withDerivedDefaults(cfg)
-}
-
-func withDerivedDefaults(cfg Config) Config {
 	if cfg.Listen == "" {
 		cfg.Listen = defaultListen
 	}
@@ -137,7 +123,7 @@ func withDerivedDefaults(cfg Config) Config {
 	if cfg.ConntrackPath == "" {
 		cfg.ConntrackPath = filepath.Join(cfg.ProcFS, "net", "nf_conntrack")
 	}
-	cfg.ProcessLogDirs = withConfiguredProcessLogDirs(cfg.ProcessLogDirs, cfg.NginxLogDir, cfg.SSLogDir)
+	cfg.ProcessLogDirs = normalizeProcessLogDirs(cfg.ProcessLogDirs)
 	if cfg.ShadowsocksJournalFallback == nil {
 		enableShadowsocksJournalFallback := true
 		cfg.ShadowsocksJournalFallback = &enableShadowsocksJournalFallback
@@ -185,29 +171,6 @@ func normalizeProcessLogDirs(values map[string]string) map[string]string {
 		return nil
 	}
 	return result
-}
-
-func withConfiguredProcessLogDirs(values map[string]string, nginxLogDir string, ssLogDir string) map[string]string {
-	result := normalizeProcessLogDirs(values)
-
-	if normalizedNginxLogDir := strings.TrimSpace(nginxLogDir); normalizedNginxLogDir != "" {
-		if result == nil {
-			result = make(map[string]string, 2)
-		}
-		if _, ok := result["nginx"]; !ok {
-			result["nginx"] = normalizedNginxLogDir
-		}
-	}
-	if normalizedSSLogDir := strings.TrimSpace(ssLogDir); normalizedSSLogDir != "" {
-		if result == nil {
-			result = make(map[string]string, 2)
-		}
-		if _, ok := result["ss-server"]; !ok {
-			result["ss-server"] = normalizedSSLogDir
-		}
-	}
-
-	return normalizeProcessLogDirs(result)
 }
 
 func (c Config) Validate() error {

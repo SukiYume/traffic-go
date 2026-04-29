@@ -3,7 +3,7 @@ export type BucketKey = '1m' | '5m' | '1h' | '6h' | '1d';
 export type GroupBy = 'direction' | 'comm' | 'remote_ip';
 export type Direction = 'in' | 'out' | 'forward';
 export type Attribution = 'exact' | 'heuristic' | 'guess' | 'unknown';
-export type DataSource = 'usage_1m' | 'usage_1h' | 'usage_1m_forward' | 'usage_1h_forward';
+export type DataSource = 'usage_1m' | 'usage_1h' | 'usage_1d' | 'usage_1m_forward' | 'usage_1h_forward' | 'usage_1d_forward';
 export type SortOrder = 'asc' | 'desc';
 export type UsageSortKey = 'minuteTs' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount' | 'remoteIp' | 'direction' | 'localPort' | 'comm' | 'pid';
 export type ForwardSortKey = 'minuteTs' | 'bytesOrig' | 'bytesReply' | 'bytesTotal' | 'flowCount' | 'origSrc' | 'origDst';
@@ -135,6 +135,7 @@ export interface UsageQuery {
   pageSize?: number;
   sortBy?: UsageSortKey;
   sortOrder?: SortOrder;
+  includeTotal?: boolean;
 }
 
 export interface ForwardUsageQuery {
@@ -148,12 +149,15 @@ export interface ForwardUsageQuery {
   pageSize?: number;
   sortBy?: ForwardSortKey;
   sortOrder?: SortOrder;
+  includeTotal?: boolean;
 }
 
 export interface PaginationMeta {
   page: number;
   pageSize: number;
   totalRows: number;
+  hasMore?: boolean;
+  totalRowsExact?: boolean;
 }
 
 export interface UsageResponse {
@@ -163,6 +167,8 @@ export interface UsageResponse {
   page: number;
   pageSize: number;
   totalRows: number;
+  hasMore?: boolean;
+  totalRowsExact?: boolean;
 }
 
 export type ExplainConfidence = 'low' | 'medium' | 'high';
@@ -228,6 +234,8 @@ export interface ForwardUsageResponse {
   page: number;
   pageSize: number;
   totalRows: number;
+  hasMore?: boolean;
+  totalRowsExact?: boolean;
 }
 
 export interface ProcessSummaryRow {
@@ -278,8 +286,8 @@ export interface TrafficApiClient {
   getTimeSeries(range: RangeKey, groupBy?: GroupBy, filters?: TimeSeriesFilters, requestOptions?: ApiRequestOptions): Promise<TimeSeriesResponse>;
   getUsage(query: UsageQuery, requestOptions?: ApiRequestOptions): Promise<UsageResponse>;
   getUsageExplain(row: UsageRow, options?: { dataSource?: DataSource; allowScan?: boolean }, requestOptions?: ApiRequestOptions): Promise<UsageExplain>;
-  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy }, requestOptions?: ApiRequestOptions): Promise<ProcessSummaryResponse>;
-  getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean }, requestOptions?: ApiRequestOptions): Promise<RemoteSummaryResponse>;
+  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean }, requestOptions?: ApiRequestOptions): Promise<ProcessSummaryResponse>;
+  getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean; includeTotal?: boolean }, requestOptions?: ApiRequestOptions): Promise<RemoteSummaryResponse>;
   getTopPorts(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<TopResponse>;
   getProcesses(requestOptions?: ApiRequestOptions): Promise<ProcessesResponse>;
   getForwardUsage(query: ForwardUsageQuery, requestOptions?: ApiRequestOptions): Promise<ForwardUsageResponse>;

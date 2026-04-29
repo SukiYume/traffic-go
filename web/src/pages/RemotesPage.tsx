@@ -167,6 +167,8 @@ export function RemotesPage() {
             page: query.data.page,
             pageSize: query.data.pageSize,
             totalRows: query.data.totalRows,
+            hasMore: query.data.hasMore,
+            totalRowsExact: query.data.totalRowsExact,
             onPageChange: setPage,
           }}
         />

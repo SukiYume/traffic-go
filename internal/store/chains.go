@@ -118,7 +118,11 @@ ON CONFLICT(chain_id) DO UPDATE SET
 		return err
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateCaches()
+	return nil
 }
 
 func upsertDirtyHours(ctx context.Context, tx interface {

@@ -43,6 +43,7 @@ type Service struct {
 	lastSockRefresh time.Time
 	socketReady     bool
 	warnedNoAcct    bool
+	lastTickMetrics tickMetrics
 }
 
 type bucketState struct {
@@ -53,6 +54,16 @@ type bucketState struct {
 	flowCount int64
 	flows     map[string]struct{}
 	perFlow   map[string]flowContribution
+}
+
+type tickMetrics struct {
+	tickDuration       time.Duration
+	conntrackRead      time.Duration
+	socketIndexLookup  time.Duration
+	processResolve     time.Duration
+	rawFlowCount       int
+	observedFlowCount  int
+	socketIndexEntries int
 }
 
 const defaultProcessHintTTL = 90 * time.Second
@@ -147,6 +158,13 @@ func (s *Service) Start(ctx context.Context) error {
 }
 
 func (s *Service) runTick(ctx context.Context, now time.Time) error {
+	tickStarted := time.Now()
+	metrics := tickMetrics{}
+	defer func() {
+		metrics.tickDuration = time.Since(tickStarted)
+		s.recordTickMetrics(metrics)
+	}()
+
 	minute := now.Truncate(time.Minute)
 	if !minute.Equal(s.currentMinute) {
 		if err := s.flushCurrentBuckets(ctx); err != nil {
@@ -161,30 +179,39 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 		}
 	}
 
+	conntrackStarted := time.Now()
 	flows, err := ReadConntrackSnapshot(s.cfg.ConntrackPath)
+	metrics.conntrackRead = time.Since(conntrackStarted)
 	if err != nil {
 		return err
 	}
+	metrics.rawFlowCount = len(flows)
 	if len(flows) > 0 && !s.warnedNoAcct && !hasConntrackAccounting(flows) {
 		s.logger.Printf("conntrack accounting appears disabled; enable `sysctl -w net.netfilter.nf_conntrack_acct=1` to collect byte and packet counters")
 		s.warnedNoAcct = true
 	}
+	socketStarted := time.Now()
 	socketIndex, err := s.socketIndexSnapshot(now)
+	metrics.socketIndexLookup = time.Since(socketStarted)
 	if err != nil {
 		return err
 	}
+	metrics.socketIndexEntries = len(socketIndex.ByTuple) + len(socketIndex.ByLocal)
 	s.pruneProcessHints(now)
 
 	inodesNeeded := make(map[uint64]struct{})
 	localIPs := s.localIPSnapshot()
 	observed := normalizeObservedFlows(flows, localIPs, socketIndex)
+	metrics.observedFlowCount = len(observed)
 	for _, flow := range observed {
 		if flow.Classified.Inode > 0 {
 			inodesNeeded[flow.Classified.Inode] = struct{}{}
 		}
 	}
 
+	resolveStarted := time.Now()
 	processes := s.resolver.Resolve(ctx, inodesNeeded)
+	metrics.processResolve = time.Since(resolveStarted)
 	prevSnapshots := s.snapshotCopy()
 	baselineReady := s.isSnapshotReady()
 	nextSnapshots := s.carryForwardSnapshots(prevSnapshots, now)
@@ -234,6 +261,12 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 	}
 	s.replaceSnapshots(nextSnapshots)
 	return nil
+}
+
+func (s *Service) recordTickMetrics(metrics tickMetrics) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	s.lastTickMetrics = metrics
 }
 
 func (s *Service) socketIndexSnapshot(now time.Time) (socketIndex, error) {
@@ -910,6 +943,13 @@ func (s *Service) Diagnostics() model.CollectorDiagnostics {
 		LocalIPCount:               len(s.localIPs),
 		LocalIPAgeSeconds:          localIPAge,
 		ProcessHintCount:           len(s.processHints),
+		LastTickDurationMS:         s.lastTickMetrics.tickDuration.Milliseconds(),
+		LastConntrackReadMS:        s.lastTickMetrics.conntrackRead.Milliseconds(),
+		LastSocketIndexMS:          s.lastTickMetrics.socketIndexLookup.Milliseconds(),
+		LastResolverMS:             s.lastTickMetrics.processResolve.Milliseconds(),
+		LastRawFlowCount:           s.lastTickMetrics.rawFlowCount,
+		LastObservedFlowCount:      s.lastTickMetrics.observedFlowCount,
+		SocketIndexEntryCount:      s.lastTickMetrics.socketIndexEntries,
 	}
 }
 

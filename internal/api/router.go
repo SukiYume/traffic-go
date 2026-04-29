@@ -83,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/top/ports", s.handleTopPorts)
 	mux.HandleFunc("/api/v1/forward/usage", s.handleForwardUsage)
 	mux.HandleFunc("/api/v1/diagnostics/collector", s.handleCollectorDiagnostics)
+	mux.HandleFunc("/api/v1/diagnostics/store", s.handleStoreDiagnostics)
 	mux.Handle("/", s.spaHandler())
 	var handler http.Handler = mux
 	if s.auth.enabled() {
@@ -145,9 +146,35 @@ func (s *Server) spaHandler() http.Handler {
 
 func loggingMiddleware(logger *log.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(recorder, r)
 		if logger != nil {
-			logger.Printf("%s %s", r.Method, r.URL.RequestURI())
+			logger.Printf(
+				"%s %s status=%d bytes=%d duration_ms=%d",
+				r.Method,
+				r.URL.RequestURI(),
+				recorder.status,
+				recorder.bytes,
+				time.Since(start).Milliseconds(),
+			)
 		}
-		next.ServeHTTP(w, r)
 	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(value []byte) (int, error) {
+	written, err := r.ResponseWriter.Write(value)
+	r.bytes += written
+	return written, err
 }

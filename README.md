@@ -1,331 +1,174 @@
 # traffic-go
 
-`traffic-go` 是一个面向 Linux 服务器的轻量流量监控与归因工具。
-它不依赖 eBPF，不抓包，不需要外置数据库；而是直接读取 `/proc/net/nf_conntrack`、`/proc/net/{tcp,udp}` 和 `/proc/[pid]/fd`，把连接增量、方向、进程归因与查询能力落到同一个 Go 二进制里。
+`traffic-go` 是一个面向 Linux 服务器的单机流量监控与归因工具。它读取 conntrack 和 procfs 中已经存在的内核状态，按分钟记录连接增量、方向、进程、端口和对端地址，并通过同一个 Go 二进制提供 Web 控制台和 JSON API。项目不依赖 eBPF、抓包程序、Prometheus、Kafka 或外置数据库，运行时数据写入本地 SQLite。
 
-它要解决的是一类很具体的问题：
-
-- 某台 VPS 最近是谁在跑流量。
-- 流量是入站、出站，还是 `forward` / NAT 转发。
-- 某个进程在什么时间段访问了哪些对端 IP、端口和协议。
-- 几小时甚至几十天后，能不能继续回查，而不是只能看实时连接。
+这个项目关注服务器运维中的流量台账。它用于查看某台服务器在一段时间内产生了多少入站、出站和转发流量，哪些进程参与了通信，通信对端是什么，某条代理或 Web 流量能关联到哪些日志证据。它适合代理机、落地机、轻量网关和旧内核 VPS，也适合需要在几小时或几个月后回查流量归属的场景。
 
 ![traffic-go dashboard](.github/assets/dashboard-overview.png)
 
-> README 截图使用前端 mock 数据生成，避免暴露真实生产流量、域名或 IP。
+截图使用前端 mock 数据生成，避免泄露真实生产流量、域名和 IP。
 
-## 适用场景
+## 功能范围
 
-- CentOS 7、旧内核 VPS、不能方便上 eBPF 的环境。
-- 代理机、落地机、转发机、轻量网关。
-- 需要一个可落地、可部署、可回查的单机流量台账。
-- 想优先回答“哪个进程在跟谁通信”，而不是做完整 NDR / IDS。
+`traffic-go` 以一个常驻进程完成采集、存储、聚合、查询和前端服务。后端采集 `/proc/net/nf_conntrack` 中的连接累计计数，读取 `/proc/net/tcp`、`/proc/net/udp` 和 `/proc/[pid]/fd` 建立 socket inode 到进程的映射，然后把每个采集周期的增量写入 SQLite。前端通过内置静态资源访问 API，外部系统也可以直接调用 JSON 接口。
 
-## 核心特性
+主要能力包括按时间范围查询总流量和时序流量，按进程、PID、EXE、方向、协议、端口和远端 IP 过滤明细，分别统计普通入站出站流量和 NAT 转发流量，按自然月保留明细并生成月度摘要，通过 `usage/explain` 回放日志证据并生成来源、目标和链路候选。后台预热任务会定期扫描配置过的日志目录，并把可复用的证据写入 `log_evidence` 和 `usage_chain_1m`。
 
-- Linux-only，单个 Go 二进制运行。
-- 不依赖 eBPF、Kafka、Prometheus、外置数据库。
-- 以 SQLite 持久化分钟级和小时级流量。
-- WebUI 与 JSON API 由同一进程提供。
-- 支持按进程、PID、EXE、端口、远端 IP、方向、协议过滤。
-- 单独统计 `forward` / NAT 流量，避免和普通入站、出站重复计算。
-- `usage/explain` 支持日志证据关联，适合反查代理、Web 请求和链路线索。
-- 前端支持纯 mock 运行，便于演示和截图，不依赖生产库。
+项目只读取连接元数据和配置的应用日志。它不解析 payload，不提供 DPI 能力，也不试图还原每一个应用层请求。`usage/explain` 的结果是可解释线索，适合辅助判断流量来源和目标。
 
-## 原理
-
-`traffic-go` 的设计目标不是“看到每一个包”，而是“在老机器上稳定回答流量归属问题”。
-因此它采用的是 conntrack + procfs 的组合方案：
+## 工作方式
 
 ```mermaid
 flowchart LR
     A["/proc/net/nf_conntrack"] --> B["collector"]
-    C["/proc/net/tcp + /proc/net/udp"] --> D["socket inode 映射"]
+    C["/proc/net/tcp and /proc/net/udp"] --> D["socket index"]
     E["/proc/<pid>/fd"] --> D
-    B --> F["方向判断: in / out / forward"]
-    D --> G["进程归因"]
-    F --> H["分钟增量累积"]
+    B --> F["direction classify"]
+    D --> G["process attribution"]
+    F --> H["minute accumulator"]
     G --> H
-    H --> I["SQLite: usage_1m / usage_1m_forward"]
-    I --> J["小时聚合: usage_1h / usage_1h_forward"]
-    K["日志证据预热 / 按需补扫"] --> L["log_evidence / usage_chain_1m"]
+    H --> I["SQLite usage tables"]
+    I --> J["hour and day aggregation"]
+    K["process logs"] --> L["log evidence cache"]
     I --> M["HTTP API"]
     J --> M
     L --> M
-    M --> N["WebUI / 外部调用方"]
+    M --> N["WebUI"]
 ```
 
-### 1. 连接采集
+采集器从 conntrack 读取的是连接的累计字节数和包数。服务第一次看到一条连接时只建立基线，后续采集周期才计算增量。这个规则避免服务重启后把内核中已经累计很久的连接重新计入当前分钟。分钟数据到达下一个分钟边界后更稳定，长时间范围查询会使用小时表和日表降低查询成本。
 
-collector 按 `tick_interval` 周期读取 `/proc/net/nf_conntrack`，解析出每条连接的协议、源/目的 IP、端口、字节数和包数。用于 PID 归因的 `/proc` socket index 按 `socket_index_interval` 单独刷新，避免在每次 conntrack 采样时重扫所有 PID/net namespace。
+方向判断基于本机地址集合。远端访问本机的连接记为 `in`，本机访问远端的连接记为 `out`，经过本机转发的连接记为 `forward`。转发流量写入独立表，避免和本机进程流量混合。
 
-这里读到的是内核维护的连接跟踪状态，而不是镜像流量或 socket hook，所以它的优点是：
+进程归因基于 socket inode。TCP 连接通常更容易归属到进程。UDP、极短连接、未 connect 的 socket、代理复用和 relay 流量会降低归因稳定性。归因失败时，系统仍会保留连接统计，并用 `unknown` 或空进程字段表达边界。
 
-- 老内核可用。
-- 成本低。
-- 不需要在部署机上额外挂 eBPF 程序。
+## 数据表和保留策略
 
-代价是：
+SQLite 中的主要运行表按粒度划分。`usage_1m` 保存普通入站和出站分钟明细，`usage_1m_forward` 保存转发分钟明细。`usage_1h` 和 `usage_1h_forward` 保存小时聚合。`usage_1d` 和 `usage_1d_forward` 保存日聚合。`usage_monthly` 保存已结束自然月的摘要。`log_evidence` 保存日志证据缓存，`usage_chain_1m` 和 `usage_chain_1h` 保存已经物化的归因链路。
 
-- 只能看到 conntrack 能看到的连接。
-- 看不到完整 payload，也不直接知道 HTTP URI、TLS SNI 或应用协议字段。
-
-### 2. 方向判断
-
-拿到连接后，`traffic-go` 会结合本机地址判断它是：
-
-- `in`：远端访问本机。
-- `out`：本机访问远端。
-- `forward`：流量经过本机转发，但不归属到本机进程。
-
-`forward` 会写入独立表：
-
-- `usage_1m_forward`
-- `usage_1h_forward`
-
-这样它不会和普通入站/出站统计混在一起，也不会误算成“某个本机进程的连接”。
-
-### 3. 进程归因
-
-对于非 `forward` 流量，系统会尝试把连接归到进程：
-
-1. 从 `/proc/net/tcp`、`/proc/net/udp` 拿到 socket inode。
-2. 反查 `/proc/<pid>/fd`，找出哪个进程还持有这个 inode。
-3. 结合 PID、进程名和 EXE 做 best-effort 归因。
-
-这一步不是内核级强绑定，所以要明确边界：
-
-- TCP 归因通常更稳。
-- UDP 只能 best-effort，尤其是未 connect 的 UDP、DNS、QUIC、中继 relay 类流量。
-- 极短连接如果在两个采集周期之间出现并消失，可能完全看不到。
-
-### 4. 增量与基线
-
-conntrack 暴露的是连接累计字节数，不是每分钟增量。
-因此 `traffic-go` 会对每个首次观测到的连接先建立 baseline，只在之后的 tick 中计算增量。
-
-这意味着：
-
-- 监控启动之前已经跑了很久的连接，不会把历史累计值直接算进来。
-- “启动后第一次看到它”只建基线，不记作新增流量。
-- 真正持久化的是“本监控周期内的增量”。
-
-这是为了保证分钟表语义稳定，否则服务重启一次，历史连接会把整段累积字节重新灌进数据库。
-
-### 5. 落盘与聚合
-
-增量先累积到当前分钟，然后写入 SQLite：
-
-- `usage_1m`：普通入站/出站分钟明细。
-- `usage_1m_forward`：转发分钟明细。
-- `usage_1h`：从分钟表回放得到的小时聚合。
-- `usage_1h_forward`：转发小时聚合。
-- `usage_monthly`：已结束自然月的月总量摘要，供历史页面和 `/api/v1/stats/monthly` 查询。
-
-后台任务会继续做三件事：
-
-- 每分钟补跑小时聚合。
-- 每小时检查是否有超过自然月留存窗口的数据；如果有，会先写月摘要，再清理明细。
-- 每 7 天做一次 `VACUUM`。
-
-所以查询语义是这样的：
-
-- `active_connections` / `active_processes` 更接近运行时快照。
-- `overview` / `usage` / `timeseries` 依赖分钟落盘，通常要等到下一个分钟边界后更稳定。
-
-### 6. 日志证据与 `usage/explain`
-
-conntrack 只能告诉你“谁连了谁”，不能直接告诉你“这是不是某条代理链、某个 URI、某个目标域名”。
-
-所以 `traffic-go` 为 `usage/explain` 额外做了一层证据关联：
-
-- 后台按 `process_log_dirs` 周期性预热日志，写入 `log_evidence`。
-- 对近期分钟级 usage 预物化链路，写入 `usage_chain_1m`。
-- 前端展开详情时优先查 SQLite。
-- 如果缓存里还没有，再做一次按需文件补扫，并把结果回写缓存。
-
-这一层不是为了把系统变成 DPI，而是为了在不抓包的前提下，尽可能把：
-
-- Shadowsocks / FRPS / 代理日志
-- Nginx access log
-- 同进程同时间窗内的关联证据
-
-拼成一条更可解释的“为什么这条流量被这样归因”的线索。
-
-## 数据语义
-
-### 分钟表和小时表
-
-- 分钟数据源：`usage_1m`
-- 小时数据源：`usage_1h`
-- 转发分钟数据源：`usage_1m_forward`
-- 转发小时数据源：`usage_1h_forward`
-
-完整明细按 UTC 自然月保留，默认保留当前月和前两个月。前端长窗口筛选使用：
-
-- `this_month`：本月
-- `last_month`：上月
-- `two_months_ago`：上上月
-
-每次清理会先把已经结束的自然月写入 `usage_monthly`，再按留存窗口删除过期月份的分钟、小时、链路和日志证据明细。也就是说，每个月月初会先生成上个月的月结；如果此时某个月已经超出“当前月 + 前两个月”的完整明细窗口，系统会确认该月已有月结，缺失时会补写月结后再清理明细。前端 `History` 页面会把保留期内月份和已归档月份放在同一张月度表里：保留期内月份可继续跳转明细，已归档月份只展示月总量、转发总量、证据数和链路数。
-
-如果显式查询已经不在完整明细窗口内的数据，系统可能降级到小时表。一旦降级，分钟级维度就不可用了，例如：
-
-- `pid`
-- `exe`
-- `attribution`
-- 某些只存在于分钟明细的端口级细节
-
-这不是 bug，而是因为小时聚合本来就不保留这类高基数维度。
-
-### `processes` 接口的含义
-
-`/api/v1/processes` 返回的是：
-
-- 当前活跃进程。
-- 最近历史窗口里出现过的进程建议项。
-
-它的用途是给前端筛选框补全，不等同于“完整进程审计清单”。
-
-### `usage/explain` 的定位
-
-`usage/explain` 适合回答：
-
-- 这条代理流量大概率从哪来、往哪去。
-- 这条 Web 入站流量能不能关联到 host/path/bot。
-- 这条分钟 usage 记录有没有缓存证据支撑。
-
-它不保证：
-
-- 每条代理连接都能精确恢复来源 IP 与目标 IP 的一一映射。
-- 所有 UDP / relay / 混淆流量都能反推完整链路。
+默认保留当前 UTC 自然月和前两个月的完整明细。过期月份清理前会先写入月度摘要，然后删除分钟、小时、链路和日志证据明细。历史页面可以继续展示月总量、转发总量、证据数和链路数。超出完整明细窗口的查询会使用聚合表，聚合表保留的维度少于分钟表，PID、EXE 和部分端口级过滤在这些数据源上不可用。
 
 ## 运行前提
 
-至少需要满足这些内核条件：
+服务需要运行在 Linux 上，并且需要读取 conntrack 和 procfs。主机需要加载 `nf_conntrack` 模块。要获得字节数和包数，内核参数 `net.netfilter.nf_conntrack_acct` 需要设置为 `1`。systemd 模板会在启动前尝试加载模块并打开这个参数。
 
-- `/proc/net/nf_conntrack` 可读。
-- `nf_conntrack` 模块已加载。
-- `net.netfilter.nf_conntrack_acct=1` 已启用。
-
-如果没有打开 `nf_conntrack_acct`，连接还能被看到，但 `bytes_*` / `pkts_*` 会一直是 `0`。
+服务默认监听 loopback 地址。绑定到非 loopback 地址时必须配置 HTTP Basic Auth。生产环境建议通过 SSH 端口转发、内网访问或带认证的反向代理暴露控制台。
 
 ## 快速开始
 
-### 本地开发
-
-后端：
+后端可以直接使用示例配置运行。
 
 ```bash
 go test ./...
 go run ./cmd/traffic-go -config deploy/config.example.yaml
 ```
 
-前端：
+前端开发服务器会把 `/api` 代理到后端。
 
 ```bash
 npm --prefix web install
 npm --prefix web run dev -- --host 127.0.0.1
 ```
 
-Vite 开发服务器默认会把 `/api` 代理到 `deploy/config.example.yaml` 里的 `listen` 地址。
-如果你想临时覆盖它：
+需要覆盖开发代理地址时，可以设置 `TRAFFIC_GO_DEV_PROXY`。
 
 ```bash
-TRAFFIC_GO_DEV_PROXY=http://127.0.0.1:<your-port> npm --prefix web run dev -- --host 127.0.0.1
+TRAFFIC_GO_DEV_PROXY=http://127.0.0.1:18080 npm --prefix web run dev -- --host 127.0.0.1
 ```
 
-如果你只想单独预览 UI，不接真实后端：
+只预览前端界面时可以启用 mock 数据。
 
 ```bash
 VITE_TRAFFICGO_USE_MOCK=1 npm --prefix web run dev -- --host 127.0.0.1
 ```
 
-如果你在非 Linux 环境启动后端，collector 默认只读不采集，避免把假数据写进拷贝下来的生产库。
-只有显式设置下面这个开关，后端才会写 mock 流量：
+在非 Linux 环境启动后端时，collector 默认不写 mock 流量。显式配置 `mock_data` 后才会写入演示数据。
 
 ```yaml
 mock_data: true
 ```
 
-### Makefile
+## 构建和发布
+
+常用 Make 目标覆盖后端测试、前端测试、构建、发布和本地运行。
 
 ```bash
 make test-backend
 make test-frontend
 make build-frontend
-make sync-frontend
 make build
 make release-linux
 make run
 make dev-web
 ```
 
-说明：
+`make build` 会先构建前端并同步到 `internal/embed/dist/`，然后编译当前平台二进制。`make release-linux` 会运行前端测试、前端构建和 Go 测试，然后生成 `linux/amd64` 发布目录和压缩包。
 
-- `make build` 会先同步前端到 `internal/embed/dist/`，再编译当前平台二进制。
-- `make release-linux` 会先跑前后端测试，再打 `linux/amd64` 发布物。
-- `make release-linux` 与 `deploy/build-linux-gitbash.sh` 共用同一份 `deploy/package-release.sh`。
-
-## 从 Windows 打 Linux 发布包
-
-仓库内提供了面向 Windows Git Bash 的打包脚本：
+Windows Git Bash 可以直接调用发布脚本。
 
 ```bash
 bash deploy/build-linux-gitbash.sh
 ```
 
-产物位置：
+发布产物写入 `release/linux-amd64/`。压缩包写入 `release/traffic-go-linux-amd64.tar.gz`。
 
-- `release/linux-amd64/traffic-go`
-- `release/linux-amd64/config.yaml`
-- `release/linux-amd64/traffic-go.service`
-- `release/linux-amd64/install-centos7.sh`
-- `release/traffic-go-linux-amd64.tar.gz`
+## 安装到 CentOS 7
 
-当前发布逻辑只考虑 Linux 编译，不再保留额外的 Windows 可执行产物。
-
-## 在 CentOS 7 上安装
-
-最省事的路径是直接使用发布包里的安装脚本。默认安装位置：
-
-- 二进制：`/usr/local/bin/traffic-go`
-- 配置：`/etc/traffic-go/config.yaml`
-- 数据库：`/var/lib/traffic-go/traffic.db`
-- unit：`/etc/systemd/system/traffic-go.service`
+发布包内包含二进制、配置示例、systemd 模板和安装脚本。安装脚本使用当前解压目录作为安装根目录。假设发布包解压到 `/opt/traffic-go`，最终二进制、配置和数据库会位于这个目录，systemd unit 会写入 `/etc/systemd/system/traffic-go.service`。
 
 ```bash
-mkdir -p /tmp/traffic-go-release
-tar -xzf traffic-go-linux-amd64.tar.gz -C /tmp/traffic-go-release
-cd /tmp/traffic-go-release
+mkdir -p /opt/traffic-go
+tar -xzf traffic-go-linux-amd64.tar.gz -C /opt/traffic-go
+cd /opt/traffic-go
 bash install-centos7.sh
 ```
 
-安装脚本会自动：
+安装脚本会创建运行账号，安装或更新二进制和配置，改写 `db_path` 到安装目录内的 `traffic.db`，补充常见日志目录，加载 `nf_conntrack`，打开 `nf_conntrack_acct`，并启用 `traffic-go.service`。如果安装目录位于私有父目录下，脚本会让服务以 root 身份运行，避免 systemd 无法进入工作目录。
 
-- 创建 `traffic-go` 系统用户和用户组。
-- 安装二进制、配置和 systemd unit。
-- 把 `db_path` 改写为 `/var/lib/traffic-go/traffic.db`。
-- `modprobe nf_conntrack`。
-- 打开 `net.netfilter.nf_conntrack_acct=1`。
-- `systemctl enable --now traffic-go`。
-
-如果你已经把文件单独传到服务器，也可以手动指定输入文件：
+已有文件可以通过参数传入。
 
 ```bash
-cd /tmp/traffic-go-release
 bash install-centos7.sh ./traffic-go ./config.yaml ./traffic-go.service
 ```
 
-## Nginx 反代到子路径
+服务状态可以用 systemd 查看。
 
-同一个前端构建可以挂到任意子路径，例如：
+```bash
+systemctl status traffic-go.service --no-pager
+journalctl -u traffic-go.service -n 100 --no-pager
+```
 
-- `/traffic/`
-- `/ops/traffic/`
-- `/whatever/`
+## 配置
 
-如果你想挂到 `https://example.com/traffic/`，推荐配置：
+示例配置位于 [deploy/config.example.yaml](deploy/config.example.yaml)。配置文件使用 YAML。时间字段使用 Go duration 格式，例如 `2s`、`1m` 和 `20m`。
+
+| 字段 | 含义 |
+| --- | --- |
+| `listen` | HTTP WebUI 和 API 的监听地址 |
+| `db_path` | SQLite 数据库路径 |
+| `tick_interval` | conntrack 采集周期 |
+| `socket_index_interval` | procfs socket index 刷新周期 |
+| `proc_fs` | procfs 根目录 |
+| `conntrack_path` | conntrack 文件路径 |
+| `mock_data` | 启用 mock collector |
+| `auth.username` | Basic Auth 用户名 |
+| `auth.password` | Basic Auth 密码 |
+| `process_log_dirs` | 进程日志目录或 glob 文件模式 |
+| `shadowsocks_journal_fallback` | Shadowsocks 文件日志未命中时读取 systemd journal |
+| `retention.months` | 完整明细保留的 UTC 自然月数量 |
+| `prefetch.enabled` | 启用后台日志预热和链路预物化 |
+| `prefetch.interval` | 后台预热周期 |
+| `prefetch.evidence_lookback` | 每轮日志预热的回看窗口 |
+| `prefetch.chain_lookback` | 每轮链路预物化的 usage 回看窗口 |
+| `prefetch.scan_budget` | 单个日志源每轮扫描预算 |
+| `prefetch.max_scan_files` | 单个日志源每轮最多扫描文件数 |
+| `prefetch.max_scan_lines_per_file` | 单个文件每轮最多读取行数 |
+
+`process_log_dirs` 的 key 使用进程名或可执行文件 basename，大小写不敏感。value 可以是目录，也可以是 glob 文件模式。多个进程可以指向同一个目录。Shadowsocks 常见组合可以把 `ss-server`、`ss-manager` 和 `obfs-server` 都指向 `/var/log/shadowsocks`。FRPS 可以指向 `/var/log/frps` 或具体的 `*.log` 模式。
+
+## Nginx 反向代理
+
+前端使用相对资源路径，可以挂载在任意子路径。下面的配置把控制台挂载到 `/traffic/`。
 
 ```nginx
 location = /traffic {
@@ -343,189 +186,98 @@ location /traffic/ {
 }
 ```
 
-关键点只有两个：
+`/traffic` 需要跳转到 `/traffic/`，这样静态资源相对路径可以正确解析。`proxy_pass` 末尾保留 `/`，这样后端收到的是剥离子路径后的请求。
 
-- `/traffic` 要先 301 到 `/traffic/`，否则相对静态资源路径会错。
-- `proxy_pass` 末尾必须带 `/`，这样才会把 `/traffic/...` 正确剥成后端根路径。
+## Nginx 日志归因
 
-## 配置
+`usage/explain` 可以从 nginx access log 中提取客户端、host、path、状态码、Referer 和 User-Agent。反代场景下 access log 可能只记录 `127.0.0.1`。建议在日志格式中写入 `xff` 和 `realip` 字段。
 
-示例文件见 [deploy/config.example.yaml](deploy/config.example.yaml)。
+```nginx
+log_format traffic_go '$remote_addr - - [$time_local] "$request" $status $body_bytes_sent '
+                      '"$http_referer" "$http_user_agent" '
+                      'xff="$http_x_forwarded_for" realip="$realip_remote_addr"';
 
-主要配置项：
-
-- `listen`：HTTP 监听地址，默认 `127.0.0.1:8080`
-- `db_path`：SQLite 文件路径
-- `tick_interval`：采集周期，默认 `2s`
-- `socket_index_interval`：PID 归因 socket index 刷新周期，默认 `10s`；调低会提高短连接归因实时性，但会增加 `/proc` 扫描 CPU/syscall 成本
-- `proc_fs`：procfs 根目录，默认 `/proc`
-- `conntrack_path`：conntrack 文件路径，默认 `/proc/net/nf_conntrack`
-- `mock_data`：显式启用 mock collector
-- `auth.username` / `auth.password`：HTTP Basic Auth；当 `listen` 不是 loopback 地址时必须配置
-- `process_log_dirs`：进程日志路径映射，key 为进程名，大小写不敏感
-- `shadowsocks_journal_fallback`：Shadowsocks 文件日志未命中时，是否回退到 systemd journal
-- `retention.months`：完整明细保留的 UTC 自然月数量，默认 `3`，即当前月和前两个月
-- `prefetch.enabled`：是否启用后台日志预热与链路预物化
-- `prefetch.interval`：后台预热周期
-- `prefetch.evidence_lookback`：每轮预热回看多久的日志时间窗
-- `prefetch.chain_lookback`：每轮预物化回看多久的分钟级 usage
-- `prefetch.scan_budget`：单个日志源每轮允许消耗的扫描时间
-- `prefetch.max_scan_files`：单个日志源每轮最多扫描多少个候选文件
-- `prefetch.max_scan_lines_per_file`：单个候选文件每轮最多读取多少行
-
-补充说明：
-
-- `process_log_dirs` 的 value 既可以是目录，也可以是 glob 文件模式，例如 `/var/log/frps/*.log`。
-- `nginx_log_dir` 与 `ss_log_dir` 仍保留兼容支持；如果 `process_log_dirs` 已经显式写了对应进程键，则以 `process_log_dirs` 为准。
-- 多个进程如果共用同一批日志文件，需要分别配置各自键指向同一个目录或 glob。
-- 对 `shadowsocks-libev + shadowsocks-manager + simple-obfs`，推荐把 `ss-server`、`ss-manager`、`obfs-server` 都指向 `/var/log/shadowsocks`。
-- 如果 rsyslog 已经把 `ss-server/ss-manager` 的 journal 镜像到 `/var/log/shadowsocks/*.log`，建议把 `shadowsocks_journal_fallback` 设为 `false`，避免重复兜底扫描。
-- `flows_days` 和 `hourly_days` 仍可被旧配置文件解析，但已经不再作为留存策略生效。
-- `log_level` 当前只做解析，不提供真正的 logger 级别裁剪。
-
-## API 概览
-
-主要接口：
-
-- `GET /api/v1/healthz`
-- `GET /api/v1/diagnostics/collector`
-- `GET /api/v1/processes`
-- `GET /api/v1/stats/overview`
-- `GET /api/v1/stats/monthly`
-- `GET /api/v1/stats/timeseries`
-- `GET /api/v1/usage`
-- `GET /api/v1/usage/explain`
-- `GET /api/v1/top/processes`
-- `GET /api/v1/top/remotes`
-- `GET /api/v1/top/ports`
-- `GET /api/v1/forward/usage`
-
-常见查询方式：
-
-- `?range=1h`
-- `?range=24h`
-- `?range=7d`
-- `?range=this_month`
-- `?range=last_month`
-- `?range=two_months_ago`
-- `?start=2026-04-15T00:00:00Z&end=2026-04-15T12:00:00Z`
-
-示例：
-
-```bash
-LISTEN_ADDR=<listen-address>
+access_log /var/log/nginx/access.log traffic_go;
 ```
 
-健康检查：
+前面存在 CDN、负载均衡或本机反代时，需要配置可信代理。
+
+```nginx
+set_real_ip_from 127.0.0.1;
+set_real_ip_from ::1;
+# set_real_ip_from 10.0.0.0/8;
+# set_real_ip_from 172.16.0.0/12;
+# set_real_ip_from 192.168.0.0/16;
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+```
+
+配置更新后执行 nginx 检查和 reload。
 
 ```bash
+nginx -t && systemctl reload nginx
+```
+
+`process_log_dirs.nginx` 需要指向 access log 所在目录，常见路径是 `/var/log/nginx`。
+
+## API
+
+所有接口挂在 `/api/v1` 下。响应使用 JSON。分页接口默认返回快速估算的 `total_rows` 和 `has_more`，并把 `total_rows_exact` 置为 `false`。需要精确总数时追加 `include_total=1`。
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/v1/healthz` | 健康检查 |
+| `GET /api/v1/diagnostics/collector` | 采集器状态 |
+| `GET /api/v1/diagnostics/store` | SQLite 连接池和表大小 |
+| `GET /api/v1/processes` | 当前和近期进程建议项 |
+| `GET /api/v1/stats/overview` | 总览统计 |
+| `GET /api/v1/stats/monthly` | 自然月摘要 |
+| `GET /api/v1/stats/timeseries` | 时序统计 |
+| `GET /api/v1/usage` | 普通入站和出站明细 |
+| `GET /api/v1/usage/explain` | 单条 usage 的归因解释 |
+| `GET /api/v1/top/processes` | 进程排行 |
+| `GET /api/v1/top/remotes` | 对端排行 |
+| `GET /api/v1/top/ports` | 端口排行 |
+| `GET /api/v1/forward/usage` | NAT 转发明细 |
+
+时间范围可以使用 `range`，也可以使用 `start` 和 `end`。常用范围包括 `1h`、`24h`、`7d`、`this_month`、`last_month` 和 `two_months_ago`。显式时间使用 RFC3339。
+
+```bash
+LISTEN_ADDR=127.0.0.1:18080
+
 curl "http://${LISTEN_ADDR}/api/v1/healthz"
-```
-
-采集器诊断：
-
-```bash
 curl "http://${LISTEN_ADDR}/api/v1/diagnostics/collector"
-```
-
-过去 1 小时总览：
-
-```bash
+curl "http://${LISTEN_ADDR}/api/v1/diagnostics/store"
 curl "http://${LISTEN_ADDR}/api/v1/stats/overview?range=1h"
-```
-
-上月自然月总览：
-
-```bash
-curl "http://${LISTEN_ADDR}/api/v1/stats/overview?range=last_month"
-```
-
-所有历史自然月汇总：
-
-```bash
 curl "http://${LISTEN_ADDR}/api/v1/stats/monthly"
-```
-
-查询某个进程的分钟级历史：
-
-```bash
 curl "http://${LISTEN_ADDR}/api/v1/usage?range=6h&comm=ss-server&limit=50"
-```
-
-分析某一条 usage 记录的关联证据：
-
-```bash
-curl "http://${LISTEN_ADDR}/api/v1/usage/explain?ts=1710000000&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443"
-```
-
-查询 forward / NAT 流量：
-
-```bash
 curl "http://${LISTEN_ADDR}/api/v1/forward/usage?range=1h&limit=50"
 ```
 
-## 已知限制
+`usage/explain` 需要传入前端明细行中的时间、方向、协议、进程和端口信息。
 
-- 仅支持 Linux，目标是老内核和老发行版，不走 eBPF。
-- UDP 归因是 best-effort；未 connect 的 UDP、DNS、QUIC、某些 relay 流量可能只能统计，不能准确归属到进程。
-- 短连接如果在两个 tick 之间出现并消失，可能完全看不到。
-- 服务启动后第一次观测到已有连接时只建立 baseline，不回补监控启动前的累计流量。
-- 小时聚合不是分钟表的全字段复制；时间跨度足够大时，查询会自动失去 PID / EXE 等细粒度维度。
-- `usage/explain` 更偏“可解释线索”，不是严格意义上的协议级取证。
+```bash
+curl "http://${LISTEN_ADDR}/api/v1/usage/explain?ts=1710000000&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443"
+```
 
-## 安全与隐私
-
-不要把 `traffic-go` 直接监听到公网地址。
-
-它暴露的是本机网络元数据，包括：
-
-- 哪个进程在通信。
-- 通向哪个远端 IP。
-- 使用了哪个本地端口和远端端口。
-- 流量字节数、包数和方向。
-
-建议的访问方式：
-
-- SSH 端口转发
-- 带认证的反向代理
-- 仅允许内网访问
-
-另外需要注意：
-
-- `traffic.db` 是运行时数据库，通常包含真实生产流量元数据，不应公开分发。
-- 仓库默认通过 `.gitignore` 忽略 `*.db`、`release/`、`.tools/`、`.codex/`、`.claude/` 等本地内容。
-- README 和前端截图示例都应使用 mock 或保留样例，不要直接贴生产数据。
+默认情况下，`usage/explain` 优先读取缓存证据。追加 `scan=1` 可以触发一次按需文件扫描，扫描结果会写回缓存。小时和日聚合数据只回放已经持久化的链路和缓存证据。
 
 ## 排障
 
-### 1. `bytes_up` / `bytes_down` 一直为 0
-
-先检查：
+字节数一直为 0 时，先检查 conntrack accounting。
 
 ```bash
 sysctl net.netfilter.nf_conntrack_acct
 head -n 5 /proc/net/nf_conntrack
 ```
 
-应该看到：
-
-- `net.netfilter.nf_conntrack_acct = 1`
-- 新连接行里带 `bytes=` / `packets=`
-
-如果没有：
+新的 conntrack 行需要包含 `bytes=` 和 `packets=`。缺失时可以临时打开参数。
 
 ```bash
 sysctl -w net.netfilter.nf_conntrack_acct=1
 ```
 
-### 2. API 正常，但刚打完流量还是 0
-
-这通常不是故障，而是因为：
-
-- 首次观测先建 baseline。
-- 分钟增量要跨分钟后才完整落盘。
-
-可以这样验证：
+刚产生流量后总览仍为 0，通常和基线规则和分钟落盘有关。可以产生一段持续流量，等待一个完整分钟后再查总览。
 
 ```bash
 curl -L "https://speed.cloudflare.com/__down?bytes=50000000" -o /dev/null
@@ -533,46 +285,53 @@ sleep 70
 curl "http://${LISTEN_ADDR}/api/v1/stats/overview?range=1h"
 ```
 
-### 3. 看不到进程，只看到连接数
-
-先看：
+进程归因为空时，先查看当前连接和进程建议项。
 
 ```bash
 curl "http://${LISTEN_ADDR}/api/v1/processes"
 ```
 
-如果 `active_connections` 有值但进程列表为空，通常是：
+常见原因包括流量属于 NAT 转发，UDP socket 缺少稳定进程绑定，短连接在采集周期之间结束，运行用户没有足够权限读取 `/proc/[pid]/fd`。
 
-- 这些流量是 `forward`
-- UDP 无法稳定归因
-- `/proc/[pid]/fd` 没有足够权限
-
-### 4. 启动时报 `conntrack path ... unavailable`
-
-说明 `/proc/net/nf_conntrack` 不存在或不可读。检查：
+启动时报 conntrack 文件不可用时，检查文件和模块。
 
 ```bash
 ls -l /proc/net/nf_conntrack
 modprobe nf_conntrack
 ```
 
+日志归因没有命中时，先确认配置中的进程名和实际 `comm` 或可执行文件 basename 一致，再确认日志目录可读。后台预热默认每分钟执行一次，刚修改日志配置后可以等待下一轮预热，或在详情接口上追加 `scan=1`。
+
+## 限制
+
+项目只支持 Linux。它依赖 conntrack 和 procfs 提供的信息。未进入 conntrack 的流量不会被采集。payload、TLS SNI、HTTP body 和完整应用协议字段不会被读取。UDP 归因是 best effort。代理复用、混淆、relay、未 connect UDP 和极短连接会降低来源和目标的对应精度。
+
+小时表和日表是聚合结果。长时间范围查询会减少高基数字段。`usage/explain` 的日志链路是候选证据，结果需要结合业务日志和部署拓扑判断。
+
+## 安全和隐私
+
+数据库包含真实流量元数据，包括进程名、可执行文件路径、远端 IP、端口、方向、字节数、包数和部分日志证据。不要公开分发生产环境的 `traffic.db`。控制台和 API 不应直接暴露到公网。仓库通过 `.gitignore` 忽略本地数据库、发布产物、工具目录和代理运行目录。
+
+README、测试和截图应使用 mock 或保留样例。提交问题和日志时需要清理真实 IP、域名、路径和用户标识。
+
 ## 开发验证
 
-后端：
+后端验证使用 Go 工具链。
 
 ```bash
 go test ./...
+go vet ./...
 go build ./cmd/traffic-go
 ```
 
-前端：
+前端验证使用 npm。
 
 ```bash
 npm --prefix web run test
 npm --prefix web run build
 ```
 
-重新生成内嵌前端：
+重新生成内嵌前端资源使用 Make。
 
 ```bash
 make sync-frontend
@@ -582,44 +341,20 @@ make sync-frontend
 
 ```text
 traffic-go/
-├── cmd/
-│   └── traffic-go/
-│       └── main.go
+├── cmd/traffic-go/
 ├── deploy/
-│   ├── build-linux-gitbash.sh
-│   ├── package-release.sh
-│   ├── config.example.yaml
-│   ├── install-centos7.sh
-│   └── traffic-go.service
-├── internal/
-│   ├── api/
-│   ├── app/
-│   ├── collector/
-│   ├── config/
-│   ├── embed/
-│   ├── evidence/
-│   ├── model/
-│   └── store/
+├── internal/api/
+├── internal/app/
+├── internal/collector/
+├── internal/config/
+├── internal/embed/
+├── internal/evidence/
+├── internal/model/
+├── internal/store/
 ├── web/
-│   ├── src/
-│   ├── index.html
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── vite.config.ts
-├── .github/
-│   └── assets/
-├── .gitignore
 ├── Makefile
 ├── go.mod
-├── go.sum
 └── README.md
 ```
 
-职责划分可以简单理解为：
-
-- `internal/collector/`：从内核和 procfs 看见流量并做方向/进程归因。
-- `internal/store/`：把分钟增量、小时聚合和证据缓存写进 SQLite，并提供查询。
-- `internal/api/`：把查询能力暴露成 HTTP API。
-- `internal/app/`：把 collector、store、API 和后台维护任务装起来。
-- `web/`：前端控制台，最终打包到 `internal/embed/dist/`。
-- `deploy/`：发布、安装和 systemd 模板。
+`internal/collector` 负责内核和 procfs 采集。`internal/store` 负责 SQLite schema、写入、聚合、清理和查询。`internal/api` 负责 HTTP API、静态资源服务、日志证据扫描和归因解释。`internal/app` 负责组装 collector、store、API 和后台维护任务。`web` 是 React 控制台。`deploy` 保存发布、安装和 systemd 模板。

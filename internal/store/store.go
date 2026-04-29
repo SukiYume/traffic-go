@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -21,9 +22,11 @@ import (
 const (
 	DataSourceMinute = "usage_1m"
 	DataSourceHour   = "usage_1h"
+	DataSourceDay    = "usage_1d"
 
 	DataSourceMinuteForward = "usage_1m_forward"
 	DataSourceHourForward   = "usage_1h_forward"
+	DataSourceDayForward    = "usage_1d_forward"
 	DataSourceMinuteChain   = "usage_chain_1m"
 	DataSourceHourChain     = "usage_chain_1h"
 )
@@ -32,12 +35,25 @@ var ErrDimensionUnavailable = errors.New("dimension_unavailable")
 var ErrCursorSortUnsupported = errors.New("cursor pagination only supports time-desc sort")
 
 const hourlyQueryMinWindow = 24 * time.Hour
+const dailyQueryMinWindow = 14 * 24 * time.Hour
+const storeShortCacheTTL = 30 * time.Second
 
 type Store struct {
 	db        *sql.DB
 	readDB    *sql.DB
+	dbPath    string
 	retention config.Retention
 	now       func() time.Time
+
+	cacheMu           sync.RWMutex
+	monthlyCache      []model.MonthlyUsageSummary
+	monthlyCacheUntil time.Time
+	processCache      map[int]cachedProcessList
+}
+
+type cachedProcessList struct {
+	items     []model.ProcessListItem
+	expiresAt time.Time
 }
 
 func effectiveRetentionMonths(retention config.Retention) int {
@@ -68,6 +84,7 @@ func Open(cfg config.Config) (*Store, error) {
 
 	store := &Store{
 		db:        db,
+		dbPath:    cfg.DBPath,
 		retention: cfg.Retention,
 		now:       time.Now,
 	}
@@ -138,121 +155,113 @@ func (s *Store) queryDB() *sql.DB {
 	return s.db
 }
 
+func (s *Store) invalidateCaches() {
+	if s == nil {
+		return
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.monthlyCache = nil
+	s.monthlyCacheUntil = time.Time{}
+	s.processCache = nil
+}
+
+func cloneMonthlySummaries(values []model.MonthlyUsageSummary) []model.MonthlyUsageSummary {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]model.MonthlyUsageSummary, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneProcessItems(values []model.ProcessListItem) []model.ProcessListItem {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]model.ProcessListItem, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func (s *Store) Diagnostics(ctx context.Context) (model.StoreDiagnostics, error) {
+	diag := model.StoreDiagnostics{
+		DBBytes:  fileSizeOrZero(s.dbPath),
+		WALBytes: fileSizeOrZero(s.dbPath + "-wal"),
+		SHMBytes: fileSizeOrZero(s.dbPath + "-shm"),
+	}
+	if s.db != nil {
+		diag.WritePool = poolDiagnostics(s.db.Stats())
+	}
+	if s.readDB != nil {
+		diag.ReadPool = poolDiagnostics(s.readDB.Stats())
+	}
+
+	tableNames := []string{
+		DataSourceMinute,
+		DataSourceHour,
+		DataSourceDay,
+		DataSourceMinuteForward,
+		DataSourceHourForward,
+		DataSourceDayForward,
+		DataSourceMinuteChain,
+		DataSourceHourChain,
+		"usage_monthly",
+		"log_evidence",
+		"dirty_chain_hours",
+	}
+	db := s.queryDB()
+	diag.Tables = make([]model.StoreTableDiagnostics, 0, len(tableNames))
+	for _, table := range tableNames {
+		var count int64
+		if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count); err != nil {
+			return diag, fmt.Errorf("diagnostics count %s: %w", table, err)
+		}
+		diag.Tables = append(diag.Tables, model.StoreTableDiagnostics{Name: table, Rows: count})
+	}
+
+	if value, ok, err := s.LastAggregatedHour(ctx); err != nil {
+		return diag, err
+	} else if ok {
+		unix := value.Unix()
+		diag.LastAggregatedHourTS = &unix
+	}
+	if value, ok, err := s.LastVacuum(ctx); err != nil {
+		return diag, err
+	} else if ok {
+		unix := value.Unix()
+		diag.LastVacuumTS = &unix
+	}
+	return diag, nil
+}
+
+func fileSizeOrZero(path string) int64 {
+	if strings.TrimSpace(path) == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func poolDiagnostics(stats sql.DBStats) model.StorePoolDiagnostics {
+	return model.StorePoolDiagnostics{
+		MaxOpenConnections: stats.MaxOpenConnections,
+		OpenConnections:    stats.OpenConnections,
+		InUse:              stats.InUse,
+		Idle:               stats.Idle,
+		WaitCount:          stats.WaitCount,
+		WaitDurationMS:     stats.WaitDuration.Milliseconds(),
+	}
+}
+
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
-	if err := s.ensureLogEvidenceColumns(ctx); err != nil {
-		return err
-	}
-	if err := s.pruneZeroUsageRows(ctx); err != nil {
-		return err
-	}
-	if err := s.seedDirtyChainHours(ctx); err != nil {
-		return err
-	}
 	return nil
-}
-
-func (s *Store) ensureLogEvidenceColumns(ctx context.Context) error {
-	type columnSpec struct {
-		name string
-		sql  string
-	}
-
-	columns := []columnSpec{
-		{name: "host_normalized", sql: `ALTER TABLE log_evidence ADD COLUMN host_normalized TEXT NOT NULL DEFAULT ''`},
-		{name: "entry_port", sql: `ALTER TABLE log_evidence ADD COLUMN entry_port INTEGER NOT NULL DEFAULT 0`},
-		{name: "target_port", sql: `ALTER TABLE log_evidence ADD COLUMN target_port INTEGER NOT NULL DEFAULT 0`},
-	}
-	for _, column := range columns {
-		exists, err := s.tableHasColumn(ctx, "log_evidence", column.name)
-		if err != nil {
-			return fmt.Errorf("inspect log_evidence.%s: %w", column.name, err)
-		}
-		if exists {
-			continue
-		}
-		if _, err := s.db.ExecContext(ctx, column.sql); err != nil {
-			return fmt.Errorf("add log_evidence.%s: %w", column.name, err)
-		}
-	}
-
-	statements := []string{
-		`UPDATE log_evidence SET host_normalized = lower(trim(host)) WHERE host_normalized = '' AND host <> ''`,
-		`UPDATE log_evidence SET entry_port = 0 WHERE entry_port IS NULL`,
-		`UPDATE log_evidence SET target_port = CAST(path AS INTEGER) WHERE target_port = 0 AND path GLOB '[0-9]*'`,
-		`CREATE INDEX IF NOT EXISTS idx_log_evidence_client_lookup ON log_evidence (source, event_ts, client_ip)`,
-		`CREATE INDEX IF NOT EXISTS idx_log_evidence_target_lookup ON log_evidence (source, event_ts, target_ip)`,
-		`CREATE INDEX IF NOT EXISTS idx_log_evidence_entry_port ON log_evidence (source, event_ts, entry_port)`,
-		`CREATE INDEX IF NOT EXISTS idx_log_evidence_host_port ON log_evidence (source, event_ts, host_normalized, target_port)`,
-	}
-	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("migrate log_evidence: %w", err)
-		}
-	}
-	return nil
-}
-
-func (s *Store) pruneZeroUsageRows(ctx context.Context) error {
-	statements := []string{
-		`DELETE FROM usage_1m WHERE bytes_up = 0 AND bytes_down = 0 AND pkts_up = 0 AND pkts_down = 0 AND flow_count = 0`,
-		`DELETE FROM usage_1h WHERE bytes_up = 0 AND bytes_down = 0 AND pkts_up = 0 AND pkts_down = 0 AND flow_count = 0`,
-		`DELETE FROM usage_1m_forward WHERE bytes_orig = 0 AND bytes_reply = 0 AND pkts_orig = 0 AND pkts_reply = 0 AND flow_count = 0`,
-		`DELETE FROM usage_1h_forward WHERE bytes_orig = 0 AND bytes_reply = 0 AND pkts_orig = 0 AND pkts_reply = 0 AND flow_count = 0`,
-	}
-	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("prune zero-usage rows: %w", err)
-		}
-	}
-	return nil
-}
-
-func (s *Store) seedDirtyChainHours(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO dirty_chain_hours (hour_ts)
-SELECT DISTINCT (minute_ts / 3600) * 3600
-FROM usage_chain_1m
-WHERE minute_ts > 0
-  AND ((minute_ts / 3600) * 3600) NOT IN (
-      SELECT hour_ts FROM usage_chain_1h
-  )
-ON CONFLICT(hour_ts) DO NOTHING
-`); err != nil {
-		return fmt.Errorf("seed dirty chain hours: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) tableHasColumn(ctx context.Context, table string, column string) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			cid        int
-			name       string
-			kind       string
-			notNull    int
-			defaultVal sql.NullString
-			pk         int
-		)
-		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultVal, &pk); err != nil {
-			return false, err
-		}
-		if name == column {
-			return true, nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return false, nil
 }
 
 func (s *Store) FlushMinute(
@@ -353,12 +362,18 @@ DO UPDATE SET
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateCaches()
+	return nil
 }
 
 func (s *Store) AggregateHour(ctx context.Context, hour time.Time) error {
 	hourTS := hour.Truncate(time.Hour).Unix()
 	nextHourTS := hour.Truncate(time.Hour).Add(time.Hour).Unix()
+	dayTS := (hourTS / 86400) * 86400
+	nextDayTS := dayTS + 86400
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -468,11 +483,55 @@ ON CONFLICT(hour_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO
 		return fmt.Errorf("aggregate usage_1h_forward: %w", err)
 	}
 
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO usage_1d (
+    day_ts, proto, direction, comm, local_port, remote_ip,
+    bytes_up, bytes_down, pkts_up, pkts_down, flow_count
+)
+SELECT ?, proto, direction, comm, local_port, remote_ip,
+       SUM(bytes_up), SUM(bytes_down), SUM(pkts_up), SUM(pkts_down), SUM(flow_count)
+FROM usage_1h
+WHERE hour_ts >= ? AND hour_ts < ?
+GROUP BY proto, direction, comm, local_port, remote_ip
+ON CONFLICT(day_ts, proto, direction, comm, local_port, remote_ip) DO UPDATE SET
+    bytes_up = excluded.bytes_up,
+    bytes_down = excluded.bytes_down,
+    pkts_up = excluded.pkts_up,
+    pkts_down = excluded.pkts_down,
+    flow_count = excluded.flow_count
+`, dayTS, dayTS, nextDayTS); err != nil {
+		return fmt.Errorf("aggregate usage_1d: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO usage_1d_forward (
+    day_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport,
+    bytes_orig, bytes_reply, pkts_orig, pkts_reply, flow_count
+)
+SELECT ?, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport,
+       SUM(bytes_orig), SUM(bytes_reply), SUM(pkts_orig), SUM(pkts_reply), SUM(flow_count)
+FROM usage_1h_forward
+WHERE hour_ts >= ? AND hour_ts < ?
+GROUP BY proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport
+ON CONFLICT(day_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO UPDATE SET
+    bytes_orig = excluded.bytes_orig,
+    bytes_reply = excluded.bytes_reply,
+    pkts_orig = excluded.pkts_orig,
+    pkts_reply = excluded.pkts_reply,
+    flow_count = excluded.flow_count
+`, dayTS, dayTS, nextDayTS); err != nil {
+		return fmt.Errorf("aggregate usage_1d_forward: %w", err)
+	}
+
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dirty_chain_hours WHERE hour_ts = ?`, hourTS); err != nil {
 		return fmt.Errorf("clear dirty chain hour: %w", err)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateCaches()
+	return nil
 }
 
 func (s *Store) Cleanup(ctx context.Context) error {
@@ -499,8 +558,10 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	}{
 		{`DELETE FROM usage_1m WHERE minute_ts < ?`, cutoff},
 		{`DELETE FROM usage_1h WHERE hour_ts < ?`, cutoff},
+		{`DELETE FROM usage_1d WHERE day_ts < ?`, cutoff},
 		{`DELETE FROM usage_1m_forward WHERE minute_ts < ?`, cutoff},
 		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, cutoff},
+		{`DELETE FROM usage_1d_forward WHERE day_ts < ?`, cutoff},
 		{`DELETE FROM usage_chain_1m WHERE minute_ts < ?`, cutoff},
 		{`DELETE FROM usage_chain_1h WHERE hour_ts < ?`, cutoff},
 		{`DELETE FROM log_evidence WHERE event_ts < ?`, cutoff},
@@ -513,7 +574,11 @@ func (s *Store) Cleanup(ctx context.Context) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateCaches()
+	return nil
 }
 
 func (s *Store) summarizeCleanupMonthsIfMissing(ctx context.Context, tx *sql.Tx, cutoff int64, now time.Time) error {
@@ -688,6 +753,13 @@ func (s *Store) Vacuum(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) Optimize(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA optimize`); err != nil {
+		return fmt.Errorf("optimize: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ResolveUsageSource(start, end time.Time, requiresMinute bool) (string, error) {
 	if end.Before(start) {
 		return "", fmt.Errorf("end before start")
@@ -701,6 +773,9 @@ func (s *Store) ResolveUsageSource(start, end time.Time, requiresMinute bool) (s
 	if requiresMinute {
 		return DataSourceMinute, nil
 	}
+	if end.Sub(start) > dailyQueryMinWindow {
+		return DataSourceDay, nil
+	}
 	if end.Sub(start) > hourlyQueryMinWindow {
 		return DataSourceHour, nil
 	}
@@ -709,6 +784,8 @@ func (s *Store) ResolveUsageSource(start, end time.Time, requiresMinute bool) (s
 
 func ForwardDataSource(source string) string {
 	switch source {
+	case DataSourceDay:
+		return DataSourceDayForward
 	case DataSourceHour:
 		return DataSourceHourForward
 	default:
@@ -718,6 +795,15 @@ func ForwardDataSource(source string) string {
 
 func (s *Store) QueryKnownProcesses(ctx context.Context, limit int) ([]model.ProcessListItem, error) {
 	resolvedLimit := clampPageSize(limit)
+	now := s.now().UTC()
+	s.cacheMu.RLock()
+	if cached, ok := s.processCache[resolvedLimit]; ok && cached.expiresAt.After(now) {
+		items := cloneProcessItems(cached.items)
+		s.cacheMu.RUnlock()
+		return items, nil
+	}
+	s.cacheMu.RUnlock()
+
 	db := s.queryDB()
 	rows, err := db.QueryContext(ctx, `
 WITH minute_processes AS (
@@ -763,5 +849,14 @@ LIMIT ?
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate known processes: %w", err)
 	}
+	s.cacheMu.Lock()
+	if s.processCache == nil {
+		s.processCache = make(map[int]cachedProcessList)
+	}
+	s.processCache[resolvedLimit] = cachedProcessList{
+		items:     cloneProcessItems(processes),
+		expiresAt: now.Add(storeShortCacheTTL),
+	}
+	s.cacheMu.Unlock()
 	return processes, nil
 }

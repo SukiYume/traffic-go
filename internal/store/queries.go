@@ -21,15 +21,19 @@ type sourceInfo struct {
 
 func usageSourceInfo(source string) sourceInfo {
 	switch source {
+	case DataSourceDay:
+		return sourceInfo{Table: DataSourceDay, TimeCol: "day_ts", DataLabel: DataSourceDay}
 	case DataSourceHour:
-		return sourceInfo{Table: "usage_1h", TimeCol: "hour_ts", DataLabel: DataSourceHour}
+		return sourceInfo{Table: DataSourceHour, TimeCol: "hour_ts", DataLabel: DataSourceHour}
 	default:
-		return sourceInfo{Table: "usage_1m", TimeCol: "minute_ts", DataLabel: DataSourceMinute}
+		return sourceInfo{Table: DataSourceMinute, TimeCol: "minute_ts", DataLabel: DataSourceMinute}
 	}
 }
 
 func forwardSourceInfo(source string) sourceInfo {
 	switch source {
+	case DataSourceDay:
+		return sourceInfo{Table: DataSourceDayForward, TimeCol: "day_ts", DataLabel: DataSourceDayForward}
 	case DataSourceHour:
 		return sourceInfo{Table: DataSourceHourForward, TimeCol: "hour_ts", DataLabel: DataSourceHourForward}
 	default:
@@ -95,6 +99,17 @@ func normalizeSortOrder(order string) string {
 	return "DESC"
 }
 
+func isAggregatedUsageSource(source string) bool {
+	return source == DataSourceHour || source == DataSourceDay
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func trimPage[T any](records []T, limit int, timeBucket func(T) int64, rowID func(T) int64) ([]T, string) {
 	if len(records) <= limit {
 		return records, ""
@@ -112,12 +127,26 @@ func countRows(ctx context.Context, db *sql.DB, statement string, args []any, la
 }
 
 func appendOffsetPagination(builder *strings.Builder, args *[]any, orderClause string, page int, pageSize int) {
+	appendOffsetPaginationWithLimitExtra(builder, args, orderClause, page, pageSize, 0)
+}
+
+func appendOffsetPaginationWithLimitExtra(builder *strings.Builder, args *[]any, orderClause string, page int, pageSize int, extra int) {
 	resolvedPage := clampPage(page)
 	resolvedPageSize := clampPageSize(pageSize)
 	offset := (resolvedPage - 1) * resolvedPageSize
 	builder.WriteString(orderClause)
 	builder.WriteString(" LIMIT ? OFFSET ?")
-	*args = append(*args, resolvedPageSize, offset)
+	*args = append(*args, resolvedPageSize+extra, offset)
+}
+
+func trimOffsetPage[T any](records []T, page int, pageSize int) ([]T, int) {
+	resolvedPage := clampPage(page)
+	resolvedPageSize := clampPageSize(pageSize)
+	offset := (resolvedPage - 1) * resolvedPageSize
+	if len(records) <= resolvedPageSize {
+		return records, offset + len(records)
+	}
+	return records[:resolvedPageSize], offset + resolvedPageSize + 1
 }
 
 func appendCursorPagination(builder *strings.Builder, args *[]any, timeCol string, cursorTS int64, cursorRowID int64, limit int) int {
@@ -150,6 +179,14 @@ WHERE %s >= ? AND %s < ?
 
 func (s *Store) QueryMonthlyUsage(ctx context.Context) ([]model.MonthlyUsageSummary, error) {
 	now := s.now().UTC()
+	s.cacheMu.RLock()
+	if s.monthlyCacheUntil.After(now) {
+		summaries := cloneMonthlySummaries(s.monthlyCache)
+		s.cacheMu.RUnlock()
+		return summaries, nil
+	}
+	s.cacheMu.RUnlock()
+
 	liveStart := retentionStartUTC(now, s.retention).Unix()
 	liveUpdatedAt := now.Unix()
 	query := monthlyDetailAggregateCTE(monthlyDetailFromInclusive) + `,
@@ -204,6 +241,10 @@ ORDER BY month_ts DESC
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate monthly usage: %w", err)
 	}
+	s.cacheMu.Lock()
+	s.monthlyCache = cloneMonthlySummaries(summaries)
+	s.monthlyCacheUntil = now.Add(storeShortCacheTTL)
+	s.cacheMu.Unlock()
 	return summaries, nil
 }
 
@@ -255,10 +296,10 @@ WHERE %[1]s >= ? AND %[1]s < ?
 
 	args := []any{bucketSeconds, bucketSeconds, query.Start.Unix(), query.End.Unix()}
 	appendUsageFilters(&builder, &args, query.Comm, query.RemoteIP, query.Direction, query.Proto)
-	if source != DataSourceHour && query.Exe != "" {
+	if !isAggregatedUsageSource(source) && query.Exe != "" {
 		appendExeFilter(&builder, &args, query.Exe)
 	}
-	if source != DataSourceHour && query.PID != nil {
+	if !isAggregatedUsageSource(source) && query.PID != nil {
 		builder.WriteString(" AND pid = ?")
 		args = append(args, *query.PID)
 	}
@@ -303,7 +344,7 @@ func usageOrderClause(source string, sortBy string, sortOrder string, timeCol st
 	case "comm":
 		return fmt.Sprintf(" ORDER BY comm COLLATE NOCASE %s, %s DESC, rowid DESC", order, timeCol)
 	case "pid":
-		if source == DataSourceHour {
+		if isAggregatedUsageSource(source) {
 			return fmt.Sprintf(" ORDER BY %s DESC, rowid DESC", timeCol)
 		}
 		return fmt.Sprintf(" ORDER BY pid %s, %s DESC, rowid DESC", order, timeCol)
@@ -336,7 +377,8 @@ func (s *Store) QueryUsage(ctx context.Context, query model.UsageQuery, source s
 	info := usageSourceInfo(source)
 	builder := strings.Builder{}
 	countBuilder := strings.Builder{}
-	if source == DataSourceHour {
+	aggregatedSource := isAggregatedUsageSource(source)
+	if aggregatedSource {
 		if query.Attribution != "" {
 			return nil, "", 0, ErrDimensionUnavailable
 		}
@@ -369,15 +411,21 @@ WHERE %s >= ? AND %s < ?
 	}
 	args := []any{query.Start.Unix(), query.End.Unix()}
 	countArgs := []any{query.Start.Unix(), query.End.Unix()}
-	appendUsageFiltersDetailed(&builder, &args, query, source == DataSourceHour)
-	appendUsageFiltersDetailed(&countBuilder, &countArgs, query, source == DataSourceHour)
+	appendUsageFiltersDetailed(&builder, &args, query, aggregatedSource)
+	appendUsageFiltersDetailed(&countBuilder, &countArgs, query, aggregatedSource)
 	if query.UsePage {
 		db := s.queryDB()
-		totalRows, err := countRows(ctx, db, countBuilder.String(), countArgs, "usage")
-		if err != nil {
-			return nil, "", 0, err
+		var totalRows int
+		if query.IncludeTotal {
+			var err error
+			totalRows, err = countRows(ctx, db, countBuilder.String(), countArgs, "usage")
+			if err != nil {
+				return nil, "", 0, err
+			}
+			appendOffsetPagination(&builder, &args, usageOrderClause(source, query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize)
+		} else {
+			appendOffsetPaginationWithLimitExtra(&builder, &args, usageOrderClause(source, query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize, 1)
 		}
-		appendOffsetPagination(&builder, &args, usageOrderClause(source, query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize)
 
 		rows, err := db.QueryContext(ctx, builder.String(), args...)
 		if err != nil {
@@ -388,6 +436,9 @@ WHERE %s >= ? AND %s < ?
 		records, err := scanUsageRows(rows, info.DataLabel)
 		if err != nil {
 			return nil, "", 0, err
+		}
+		if !query.IncludeTotal {
+			records, totalRows = trimOffsetPage(records, query.Page, query.PageSize)
 		}
 		return records, "", totalRows, nil
 	}
@@ -456,7 +507,7 @@ func scanUsageRows(rows *sql.Rows, dataSource string) ([]model.UsageRecord, erro
 	return records, nil
 }
 
-func (s *Store) QueryTopProcesses(ctx context.Context, start, end time.Time, source string, groupBy, sortBy, sortOrder string, limit, offset int) ([]model.ProcessSummary, int, error) {
+func (s *Store) QueryTopProcesses(ctx context.Context, start, end time.Time, source string, groupBy, sortBy, sortOrder string, limit, offset int, includeTotal bool) ([]model.ProcessSummary, int, error) {
 	info := usageSourceInfo(source)
 	pageSize := clampPageSize(limit)
 	pageOffset := offset
@@ -465,7 +516,7 @@ func (s *Store) QueryTopProcesses(ctx context.Context, start, end time.Time, sou
 	}
 
 	resolvedGroupBy := "pid"
-	if source == DataSourceHour || strings.EqualFold(groupBy, "comm") {
+	if isAggregatedUsageSource(source) || strings.EqualFold(groupBy, "comm") {
 		resolvedGroupBy = "comm"
 	}
 
@@ -485,8 +536,10 @@ SELECT COUNT(*) FROM (
 )`, info.Table, info.TimeCol, info.TimeCol, groupExpr)
 	var totalRows int
 	db := s.queryDB()
-	if err := db.QueryRowContext(ctx, countSQL, start.Unix(), end.Unix()).Scan(&totalRows); err != nil {
-		return nil, 0, fmt.Errorf("count top processes: %w", err)
+	if includeTotal {
+		if err := db.QueryRowContext(ctx, countSQL, start.Unix(), end.Unix()).Scan(&totalRows); err != nil {
+			return nil, 0, fmt.Errorf("count top processes: %w", err)
+		}
 	}
 
 	sortExpr := "(SUM(bytes_up) + SUM(bytes_down))"
@@ -518,7 +571,7 @@ WHERE %s >= ? AND %s < ?
 GROUP BY %s
 ORDER BY %s %s, comm COLLATE NOCASE ASC
 LIMIT ? OFFSET ?
-`, selectExpr, info.Table, info.TimeCol, info.TimeCol, groupExpr, sortExpr, order), start.Unix(), end.Unix(), pageSize, pageOffset)
+`, selectExpr, info.Table, info.TimeCol, info.TimeCol, groupExpr, sortExpr, order), start.Unix(), end.Unix(), pageSize+boolInt(!includeTotal), pageOffset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query top processes: %w", err)
 	}
@@ -539,10 +592,16 @@ LIMIT ? OFFSET ?
 		entry.Exe = nullableString(exeValue)
 		entries = append(entries, entry)
 	}
-	return entries, totalRows, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if !includeTotal {
+		entries, totalRows = trimOffsetPage(entries, 1+(pageOffset/pageSize), pageSize)
+	}
+	return entries, totalRows, nil
 }
 
-func (s *Store) QueryTopRemotes(ctx context.Context, start, end time.Time, source string, direction model.Direction, includeLoopback bool, sortBy, sortOrder string, limit, offset int) ([]model.RemoteSummary, int, error) {
+func (s *Store) QueryTopRemotes(ctx context.Context, start, end time.Time, source string, direction model.Direction, includeLoopback bool, sortBy, sortOrder string, limit, offset int, includeTotal bool) ([]model.RemoteSummary, int, error) {
 	info := usageSourceInfo(source)
 	pageSize := clampPageSize(limit)
 	pageOffset := offset
@@ -564,8 +623,10 @@ func (s *Store) QueryTopRemotes(ctx context.Context, start, end time.Time, sourc
 	countSQL := "SELECT COUNT(*) FROM (SELECT 1 " + filterBuilder.String() + " GROUP BY direction, remote_ip)"
 	var totalRows int
 	db := s.queryDB()
-	if err := db.QueryRowContext(ctx, countSQL, args...).Scan(&totalRows); err != nil {
-		return nil, 0, fmt.Errorf("count top remotes: %w", err)
+	if includeTotal {
+		if err := db.QueryRowContext(ctx, countSQL, args...).Scan(&totalRows); err != nil {
+			return nil, 0, fmt.Errorf("count top remotes: %w", err)
+		}
 	}
 
 	sortExpr := "(SUM(bytes_up) + SUM(bytes_down))"
@@ -592,7 +653,7 @@ GROUP BY direction, remote_ip
 ORDER BY %s %s, remote_ip ASC
 LIMIT ? OFFSET ?
 `, filterBuilder.String(), sortExpr, order)
-	queryArgs := append(append([]any{}, args...), pageSize, pageOffset)
+	queryArgs := append(append([]any{}, args...), pageSize+boolInt(!includeTotal), pageOffset)
 	rows, err := db.QueryContext(ctx, querySQL, queryArgs...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query top remotes: %w", err)
@@ -608,7 +669,13 @@ LIMIT ? OFFSET ?
 		}
 		entries = append(entries, entry)
 	}
-	return entries, totalRows, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if !includeTotal {
+		entries, totalRows = trimOffsetPage(entries, 1+(pageOffset/pageSize), pageSize)
+	}
+	return entries, totalRows, nil
 }
 
 func (s *Store) QueryTopPorts(ctx context.Context, start, end time.Time, source string, orderBy string) ([]model.TopEntry, error) {
@@ -691,11 +758,17 @@ WHERE %s >= ? AND %s < ?
 	}
 	if query.UsePage {
 		db := s.queryDB()
-		totalRows, err := countRows(ctx, db, countBuilder.String(), countArgs, "forward usage")
-		if err != nil {
-			return nil, "", 0, err
+		var totalRows int
+		if query.IncludeTotal {
+			var err error
+			totalRows, err = countRows(ctx, db, countBuilder.String(), countArgs, "forward usage")
+			if err != nil {
+				return nil, "", 0, err
+			}
+			appendOffsetPagination(&builder, &args, forwardOrderClause(query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize)
+		} else {
+			appendOffsetPaginationWithLimitExtra(&builder, &args, forwardOrderClause(query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize, 1)
 		}
-		appendOffsetPagination(&builder, &args, forwardOrderClause(query.SortBy, query.SortOrder, info.TimeCol), query.Page, query.PageSize)
 
 		rows, err := db.QueryContext(ctx, builder.String(), args...)
 		if err != nil {
@@ -706,6 +779,9 @@ WHERE %s >= ? AND %s < ?
 		records, err := scanForwardRows(rows, info.DataLabel)
 		if err != nil {
 			return nil, "", 0, err
+		}
+		if !query.IncludeTotal {
+			records, totalRows = trimOffsetPage(records, query.Page, query.PageSize)
 		}
 		return records, "", totalRows, nil
 	}

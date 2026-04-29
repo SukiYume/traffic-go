@@ -15,6 +15,8 @@ type PaginationState = {
   page: number;
   pageSize: number;
   totalRows: number;
+  hasMore?: boolean;
+  totalRowsExact?: boolean;
   onPageChange: (page: number) => void;
 };
 
@@ -124,7 +126,20 @@ export function DataTable<TData>({
     getSortedRowModel: manualSorting ? undefined : getSortedRowModel(),
   });
 
-  const totalPages = pagination ? Math.max(1, Math.ceil(pagination.totalRows / pagination.pageSize)) : 1;
+  const totalPages = pagination
+    ? pagination.totalRowsExact === false
+      ? pagination.hasMore
+        ? pagination.page + 1
+        : pagination.page
+      : Math.max(1, Math.ceil(pagination.totalRows / pagination.pageSize))
+    : 1;
+  const totalLabel = pagination
+    ? pagination.totalRowsExact === false
+      ? pagination.hasMore
+        ? `至少 ${formatNumber(pagination.totalRows)} 条`
+        : `已加载 ${formatNumber(pagination.totalRows)} 条`
+      : `共 ${formatNumber(pagination.totalRows)} 条`
+    : '';
 
   return (
     <div className={cardClassName ? `table-card ${cardClassName}` : 'table-card'}>
@@ -236,7 +251,7 @@ export function DataTable<TData>({
       {pagination ? (
         <footer className="table-footer">
           <span>
-            第 {pagination.page} / {formatNumber(totalPages)} 页，共 {formatNumber(pagination.totalRows)} 条
+            第 {pagination.page} / {formatNumber(totalPages)} 页，{totalLabel}
           </span>
           <div className="table-footer-actions">
             <button type="button" className="chip ghost" onClick={() => pagination.onPageChange(1)} disabled={pagination.page <= 1}>
@@ -254,7 +269,7 @@ export function DataTable<TData>({
               type="button"
               className="chip ghost"
               onClick={() => pagination.onPageChange(pagination.page + 1)}
-              disabled={pagination.page >= totalPages}
+              disabled={pagination.totalRowsExact === false ? !pagination.hasMore : pagination.page >= totalPages}
             >
               下一页
             </button>

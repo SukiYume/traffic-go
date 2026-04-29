@@ -1406,6 +1406,84 @@ func TestCollectorDiagnosticsEndpointUsesRuntimeView(t *testing.T) {
 	}
 }
 
+func TestStoreDiagnosticsEndpointReturnsTableStats(t *testing.T) {
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/diagnostics/store", nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected diagnostics status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	for _, expected := range []string{
+		`"write_pool"`,
+		`"read_pool"`,
+		`"tables"`,
+		`"name":"usage_1m"`,
+		`"name":"usage_1d"`,
+		`"db_bytes"`,
+	} {
+		if !strings.Contains(bodyText, expected) {
+			t.Fatalf("expected store diagnostics body to contain %s, got %s", expected, bodyText)
+		}
+	}
+}
+
+func TestPagedTopProcessesUsesEstimatedTotalsByDefault(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC)
+	if err := server.store.FlushMinute(ctx, minute.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   50001,
+			RemoteIP:    "1.1.1.1",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 100, BytesDown: 100, PktsUp: 1, PktsDown: 1, FlowCount: 1},
+		{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         2,
+			Comm:        "wget",
+			Exe:         "/usr/bin/wget",
+			LocalPort:   50002,
+			RemoteIP:    "8.8.8.8",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 200, BytesDown: 200, PktsUp: 1, PktsDown: 1, FlowCount: 1},
+	}, nil); err != nil {
+		t.Fatalf("flush usage: %v", err)
+	}
+
+	url := fmt.Sprintf("/api/v1/top/processes?start=%d&end=%d&page=1&page_size=1&group_by=pid", minute.Add(-time.Minute).Unix(), minute.Add(time.Minute).Unix())
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	bodyText := rec.Body.String()
+	for _, expected := range []string{
+		`"total_rows":2`,
+		`"total_rows_exact":false`,
+		`"has_more":true`,
+	} {
+		if !strings.Contains(bodyText, expected) {
+			t.Fatalf("expected paged top body to contain %s, got %s", expected, bodyText)
+		}
+	}
+}
+
 func TestUsageExplainCorrelatesShadowsocksPeers(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
@@ -1494,7 +1572,7 @@ func TestUsageExplainValidatesInput(t *testing.T) {
 	}
 }
 
-func TestUsageExplainReadsConfiguredNginxLogDir(t *testing.T) {
+func TestUsageExplainReadsConfiguredNginxProcessLogDir(t *testing.T) {
 	server := newTestServer(t)
 	logDir := t.TempDir()
 	setProcessLogDir(server, "nginx", logDir)
@@ -2109,6 +2187,66 @@ func TestUsageExplainUsesConfiguredProcessLogDirForFrps(t *testing.T) {
 	}
 }
 
+func TestUsageExplainBuildsFrpsChainFromUserConnectionLog(t *testing.T) {
+	server := newTestServer(t)
+	frpsLogDir := t.TempDir()
+	server.processLogDirs = map[string]string{"frps": frpsLogDir}
+
+	now := time.Now().In(time.Local).Add(-20 * time.Second).Truncate(time.Second)
+	minute := now.Unix()
+	line := fmt.Sprintf("%s [I] [proxy/proxy.go:204] [5d8d225ac885e00d] [pc_ssh] get a user connection [213.209.159.235:47700]", now.Format("2006-01-02 15:04:05.000"))
+	logPath := filepath.Join(frpsLogDir, fmt.Sprintf("frps.log-%s", now.Format("20060102")))
+	if err := os.WriteFile(logPath, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatalf("write frps log: %v", err)
+	}
+
+	if err := server.store.FlushMinute(context.Background(), minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionIn,
+			PID:         936,
+			Comm:        "frps",
+			Exe:         "/usr/local/bin/frps",
+			LocalPort:   6010,
+			RemoteIP:    "213.209.159.235",
+			RemotePort:  47700,
+			Attribution: model.AttributionHeuristic,
+		}: {
+			BytesUp:   1200,
+			BytesDown: 3525,
+			PktsUp:    5,
+			PktsDown:  8,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed frps usage row: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=936&comm=frps&exe=/usr/local/bin/frps&local_port=6010&remote_ip=213.209.159.235&remote_port=47700&scan=1", minute),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"confidence":"medium"`) {
+		t.Fatalf("expected host-only frps chain to be medium confidence: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"source_ip":"213.209.159.235"`) || !strings.Contains(bodyText, `"target_host":"pc_ssh"`) {
+		t.Fatalf("expected frps source and proxy name chain in body: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"bytes_total":4725`) {
+		t.Fatalf("expected frps chain to use usage metrics: %s", bodyText)
+	}
+}
+
 func TestUsageExplainFallsBackToCachedEvidenceWhenProcessLogDirIsUnconfigured(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
@@ -2368,88 +2506,6 @@ func TestUsageExplainBuildsShadowsocksChainFromSharedServerAndObfsLogs(t *testin
 	}
 	if !strings.Contains(bodyText, `SS/obfs 入口日志命中`) {
 		t.Fatalf("expected entry-port source note: %s", bodyText)
-	}
-}
-
-func TestUsageExplainReadsLegacyShadowsocksEvidenceSourcesFromCacheWithoutConfiguredLogDir(t *testing.T) {
-	server := newTestServer(t)
-
-	now := time.Now().UTC().Truncate(time.Minute)
-	minute := now.Unix()
-	if err := server.store.FlushMinute(context.Background(), minute, map[model.UsageKey]model.UsageDelta{
-		{
-			MinuteTS:    minute,
-			Proto:       "tcp",
-			Direction:   model.DirectionOut,
-			PID:         1088,
-			Comm:        "ss-server",
-			Exe:         "/usr/bin/ss-server",
-			LocalPort:   47920,
-			RemoteIP:    "142.250.72.14",
-			RemotePort:  443,
-			Attribution: model.AttributionExact,
-		}: {
-			BytesUp:   256,
-			BytesDown: 1024,
-			PktsUp:    2,
-			PktsDown:  3,
-			FlowCount: 1,
-		},
-	}, nil); err != nil {
-		t.Fatalf("seed ss usage row: %v", err)
-	}
-
-	status := 200
-	if err := server.store.UpsertLogEvidenceBatch(context.Background(), []model.LogEvidence{
-		{
-			Source:      "proc:obfs-server",
-			EventTS:     minute + 5,
-			Host:        "chatgpt.com",
-			Path:        "443",
-			Method:      "connect",
-			EntryPort:   12096,
-			TargetPort:  443,
-			Status:      &status,
-			Message:     "connect to chatgpt.com:443",
-			Fingerprint: "legacy-ss-connect",
-		},
-		{
-			Source:      "proc:obfs-server",
-			EventTS:     minute + 6,
-			ClientIP:    "203.0.113.24",
-			Method:      "accept",
-			EntryPort:   12096,
-			Message:     "[12096] accepted connection from 203.0.113.24",
-			Fingerprint: "legacy-ss-source",
-		},
-	}); err != nil {
-		t.Fatalf("seed legacy shadowsocks evidence: %v", err)
-	}
-
-	req := httptest.NewRequest(
-		http.MethodGet,
-		fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443", minute),
-		nil,
-	)
-	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("unexpected status: %d", rec.Code)
-	}
-	body, _ := io.ReadAll(rec.Body)
-	bodyText := string(body)
-	if !strings.Contains(bodyText, `chatgpt.com`) {
-		t.Fatalf("expected target host from legacy cache source: %s", bodyText)
-	}
-	if !strings.Contains(bodyText, `203.0.113.24`) {
-		t.Fatalf("expected source ip from legacy cache source: %s", bodyText)
-	}
-	if !strings.Contains(bodyText, `SS 日志命中`) || !strings.Contains(bodyText, `SS/obfs 入口日志命中`) {
-		t.Fatalf("expected shadowsocks cache notes in body: %s", bodyText)
-	}
-	if strings.Contains(bodyText, `已跳过日志检索`) {
-		t.Fatalf("expected cached evidence replay without skip note: %s", bodyText)
 	}
 }
 
@@ -2854,6 +2910,76 @@ func TestUsageExplainFiltersCurrentTupleByRemotePort(t *testing.T) {
 	}
 	if strings.Contains(bodyText, `"remote_port":8443`) {
 		t.Fatalf("did not expect same-IP different-port usage to leak into related peers: %s", bodyText)
+	}
+}
+
+func TestUsageExplainReusesCachedInboundShadowsocksEvidenceWithEphemeralRemotePort(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	setProcessLogDir(server, "obfs-server", t.TempDir())
+
+	minute := time.Date(2026, 4, 29, 13, 37, 0, 0, time.UTC).Unix()
+	if err := server.store.UpsertLogEvidenceBatch(ctx, []model.LogEvidence{
+		{
+			Source:      evidenceSourceSS,
+			EventTS:     minute + 22,
+			ClientIP:    "159.226.171.226",
+			TargetIP:    "216.239.36.223",
+			Path:        "443",
+			Method:      "udp-cache-miss",
+			EntryPort:   12096,
+			TargetPort:  443,
+			Message:     "ss-server[993]: [12096] [udp] cache miss: 216.239.36.223:443 <-> 159.226.171.226:51699",
+			Fingerprint: "fp-cached-inbound-ss-entry",
+		},
+	}); err != nil {
+		t.Fatalf("seed cached ss evidence: %v", err)
+	}
+
+	if err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionIn,
+			PID:         999,
+			Comm:        "obfs-server",
+			Exe:         "/usr/local/bin/obfs-server",
+			LocalPort:   12096,
+			RemoteIP:    "159.226.171.226",
+			RemotePort:  17069,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   120,
+			BytesDown: 184,
+			PktsUp:    3,
+			PktsDown:  4,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed obfs usage row: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1m&proto=tcp&direction=in&pid=999&comm=obfs-server&exe=/usr/local/bin/obfs-server&local_port=12096&remote_ip=159.226.171.226&remote_port=17069", minute),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"target_ip":"216.239.36.223"`) {
+		t.Fatalf("expected cached ss target ip despite ephemeral inbound remote port: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `SS 日志命中 1 条`) {
+		t.Fatalf("expected cached ss evidence hit note: %s", bodyText)
+	}
+	if strings.Contains(bodyText, `日志缓存未命中`) {
+		t.Fatalf("did not expect cache miss when cached inbound ss evidence exists: %s", bodyText)
 	}
 }
 

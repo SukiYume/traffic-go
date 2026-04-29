@@ -22,6 +22,10 @@ type App struct {
 	collector collector.Runner
 	apiServer *api.Server
 	server    *http.Server
+
+	prefetchMu      sync.Mutex
+	prefetchRunning bool
+	prefetchWG      sync.WaitGroup
 }
 
 func New(cfg config.Config, logger *log.Logger) (*App, error) {
@@ -103,6 +107,7 @@ func (a *App) Run(ctx context.Context) error {
 	defer cancel()
 	_ = a.server.Shutdown(shutdownCtx)
 	wg.Wait()
+	a.prefetchWG.Wait()
 	return runErr
 }
 
@@ -133,8 +138,8 @@ func (a *App) runMaintenance(ctx context.Context) error {
 	}
 
 	a.runAggregation(ctx)
-	a.runCleanup(ctx)
-	a.runPrefetch(ctx)
+	a.runCleanup(ctx, false)
+	a.runPrefetchAsync(ctx)
 
 	for {
 		select {
@@ -143,9 +148,9 @@ func (a *App) runMaintenance(ctx context.Context) error {
 		case <-aggregationTicker.C:
 			a.runAggregation(ctx)
 		case <-cleanupTicker.C:
-			a.runCleanup(ctx)
+			a.runCleanup(ctx, true)
 		case <-prefetchTick(prefetchTicker):
-			a.runPrefetch(ctx)
+			a.runPrefetchAsync(ctx)
 		}
 	}
 }
@@ -202,9 +207,15 @@ func (a *App) runAggregation(ctx context.Context) {
 	}
 }
 
-func (a *App) runCleanup(ctx context.Context) {
+func (a *App) runCleanup(ctx context.Context, allowVacuum bool) {
 	if err := a.store.Cleanup(ctx); err != nil {
 		a.logger.Printf("cleanup failed: %v", err)
+		return
+	}
+	if err := a.store.Optimize(ctx); err != nil {
+		a.logger.Printf("optimize failed: %v", err)
+	}
+	if !allowVacuum {
 		return
 	}
 
@@ -251,6 +262,31 @@ func (a *App) runPrefetch(ctx context.Context) {
 		summary.PartialSources,
 		summary.Errors,
 	)
+}
+
+func (a *App) runPrefetchAsync(ctx context.Context) {
+	if a.apiServer == nil || !a.cfg.Prefetch.Enabled || len(a.cfg.ProcessLogDirs) == 0 {
+		return
+	}
+	a.prefetchMu.Lock()
+	if a.prefetchRunning {
+		a.prefetchMu.Unlock()
+		a.logger.Printf("prefetch skipped: previous run still active")
+		return
+	}
+	a.prefetchRunning = true
+	a.prefetchWG.Add(1)
+	a.prefetchMu.Unlock()
+
+	go func() {
+		defer a.prefetchWG.Done()
+		defer func() {
+			a.prefetchMu.Lock()
+			a.prefetchRunning = false
+			a.prefetchMu.Unlock()
+		}()
+		a.runPrefetch(ctx)
+	}()
 }
 
 func prefetchTick(ticker *time.Ticker) <-chan time.Time {

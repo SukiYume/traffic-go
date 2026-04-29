@@ -137,7 +137,7 @@ func (s *Server) RunBackgroundPrefetch(ctx context.Context, options BackgroundPr
 				query.Comm,
 				query.Exe,
 				query.Proto,
-				queryLocalPort(query),
+				nullablePortValue(query.LocalPort),
 				query.RemoteIP,
 				nullablePortValue(query.RemotePort),
 				err,
@@ -290,7 +290,7 @@ func usageExplainQueryKey(query usageExplainQuery) string {
 		nullablePortValue(query.PID),
 		strings.TrimSpace(query.Comm),
 		strings.TrimSpace(query.Exe),
-		queryLocalPort(query),
+		nullablePortValue(query.LocalPort),
 		strings.TrimSpace(query.RemoteIP),
 		nullablePortValue(query.RemotePort),
 	)

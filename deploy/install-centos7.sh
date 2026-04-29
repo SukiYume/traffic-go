@@ -155,7 +155,6 @@ has_any_process_log_settings() {
   awk '
     BEGIN { in_block = 0; found = 0 }
     /^[[:space:]]*#/ { next }
-    /^[[:space:]]*(nginx_log_dir|ss_log_dir):[[:space:]]*[^#[:space:]]/ { found = 1; exit }
     /^[[:space:]]*process_log_dirs:[[:space:]]*$/ { in_block = 1; next }
     in_block {
       if ($0 ~ /^[^[:space:]]/) { in_block = 0; next }
@@ -170,7 +169,6 @@ config_has_process_log_key() {
   awk -v target="${key}" '
     BEGIN { in_block = 0; found = 0 }
     /^[[:space:]]*#/ { next }
-    $0 ~ ("^[[:space:]]*" target ":[[:space:]]*[^#[:space:]]") { found = 1; exit }
     /^[[:space:]]*process_log_dirs:[[:space:]]*$/ { in_block = 1; next }
     in_block {
       if ($0 ~ /^[^[:space:]]/) { in_block = 0; next }
@@ -289,15 +287,15 @@ best_effort_kernel_prereqs
 render_service_unit
 
 if ! has_any_process_log_settings; then
-  echo "No process_log_dirs/legacy log dirs found in ${INSTALL_CONFIG}."
+  echo "No process_log_dirs found in ${INSTALL_CONFIG}."
   echo "Appending default nginx + shadowsocks log paths so usage/explain can scan logs."
   append_default_process_log_dirs
 fi
 
-if ! config_has_process_log_key "nginx" && ! config_has_process_log_key "nginx_log_dir"; then
+if ! config_has_process_log_key "nginx"; then
   echo "Warning: nginx log path is not configured in ${INSTALL_CONFIG}."
 fi
-if ! config_has_process_log_key "ss-server" && ! config_has_process_log_key "ss_log_dir"; then
+if ! config_has_process_log_key "ss-server"; then
   echo "Warning: ss-server log path is not configured in ${INSTALL_CONFIG}."
 fi
 

@@ -39,11 +39,14 @@ const (
 
 var (
 	nginxAccessPattern = regexp.MustCompile(`^(.*?)\s+\[([^\]]+)\]\s+"([^"]*)"\s+(\d{3})\s+(\S+)(?:\s+"([^"]*)"\s+"([^"]*)")?`)
+	nginxQuotedIPHint  = regexp.MustCompile(`(?i)\b(?:xff|x[_-]forwarded[_-]for|forwarded_for|realip|real_ip)="([^"]*)"`)
+	nginxTokenIPHint   = regexp.MustCompile(`(?i)\b(?:xff|x[_-]forwarded[_-]for|forwarded_for|realip|real_ip)=([^\s"]+)`)
 	ssClientPattern    = regexp.MustCompile(`(?i)(?:client|src|source|from)\s*[=:]\s*([^\s,;]+)`)
 	ssFromPattern      = regexp.MustCompile(`(?i)\bfrom\s+([^\s,;]+)`)
 	ssTargetPattern    = regexp.MustCompile(`(?i)(?:target|dst|destination|to)\s*[=:]\s*([^\s,;]+)`)
 	ssConnectPattern   = regexp.MustCompile(`(?i)\bconnect to\s+([^\s,;]+)`)
-	ssUDPCachePattern  = regexp.MustCompile(`(?i)\[udp\]\s+cache miss:\s*([^\s,;]+)\s*<->\s*([^\s,;]+)`)
+	ssUDPCachePattern  = regexp.MustCompile(`(?i)\[udp\]\s+cache\s+(hit|miss):\s*([^\s,;]+)\s*<->\s*([^\s,;]+)`)
+	frpsConnPattern    = regexp.MustCompile(`(?i)\]\s+\[([^\]]+)\]\s+get a user connection\s+\[([^\]]+)\]`)
 	bracketPortPattern = regexp.MustCompile(`\[(\d{1,5})\]`)
 	rfc3339Pattern     = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})`)
 	syslogTimePattern  = regexp.MustCompile(`^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}`)
@@ -257,14 +260,19 @@ func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usage
 		Notes:         make([]string, 0),
 	}
 	allowFileScan := options.allowFileScan
-	if query.DataSource == store.DataSourceHour {
+	aggregatedSource := query.DataSource == store.DataSourceHour || query.DataSource == store.DataSourceDay
+	if aggregatedSource {
 		allowFileScan = false
-		appendNoteUnique(&response.Notes, "当前展示的是小时聚合数据，仅回放已持久化链路和已缓存日志线索。")
+		if query.DataSource == store.DataSourceDay {
+			appendNoteUnique(&response.Notes, "当前展示的是日聚合数据，仅回放已持久化链路和已缓存日志线索。")
+		} else {
+			appendNoteUnique(&response.Notes, "当前展示的是小时聚合数据，仅回放已持久化链路和已缓存日志线索。")
+		}
 	}
 	allowCachedEvidence := allowFileScan || strings.TrimSpace(query.DataSource) != ""
 
 	related := make([]model.UsageRecord, 0)
-	if query.DataSource != store.DataSourceHour {
+	if !aggregatedSource {
 		var err error
 		related, err = s.collectRelatedUsage(ctx, query, bucketTS)
 		if err != nil {
@@ -548,10 +556,10 @@ func (s *Server) enrichNginxFromLogs(ctx context.Context, response *usageExplain
 	}
 	if len(rows) == 0 {
 		if !allowFileScan {
-			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", resolvedLogDir(logDir, "缓存证据库")))
+			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", evidence.ResolvedLogDir(logDir, "缓存证据库")))
 			return nil
 		}
-		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志中未匹配到该来源 IP。", resolvedLogDir(logDir, "缓存证据库")))
+		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志中未匹配到该来源 IP。", evidence.ResolvedLogDir(logDir, "缓存证据库")))
 		return nil
 	}
 
@@ -593,7 +601,7 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 		// libev ss-server logs often record domain:port without target IP,
 		// so fall back to strict same-port matching for outbound explain rows.
 		if query.Direction == model.DirectionOut && remotePort > 0 && ev.Host != "" {
-			if port, ok := parseEvidencePort(ev.Path); ok && port == remotePort {
+			if port, ok := evidence.ParsePort(ev.Path); ok && port == remotePort {
 				// Keep fallback conservative to reduce false matches on common ports like 443.
 				if evidence.AbsInt64(ev.EventTS-bucketTS) > logWindowStrict {
 					return false
@@ -601,7 +609,7 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 				if remoteIP != "" && ev.TargetIP != "" && !sameIP(ev.TargetIP, remoteIP) {
 					return false
 				}
-				if ev.Method != "connect" && ev.Method != "udp-cache-miss" && ev.Method != "udp" {
+				if ev.Method != "connect" && !strings.HasPrefix(ev.Method, "udp-cache-") && ev.Method != "udp" {
 					return false
 				}
 				return true
@@ -610,15 +618,15 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 		return false
 	}
 
-	rows, notes, err := s.lookupOrScanEvidenceAcrossSourcesAndDirs(
+	rows, notes, err := s.lookupOrScanEvidenceAcrossDirs(
 		ctx,
-		shadowsocksEvidenceSources(),
+		evidenceSourceSS,
 		logDirs,
 		bucketTS,
 		maxEvidenceRows,
 		allowFileScan,
 		matcher,
-		evidenceQueryHints{AnyIP: remoteIP, TargetPort: remotePort},
+		evidenceHintsForUsageExplain(query, remoteIP, remotePort),
 		isShadowsocksLogFileName,
 		parseSSEvidenceLine,
 	)
@@ -671,12 +679,12 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 		if query.Direction == model.DirectionOut && remoteIP != "" && row.ClientIP != "" && sameIP(row.TargetIP, remoteIP) {
 			sourceConfirmed[row.ClientIP]++
 		}
-		if row.Method == "udp-cache-miss" && row.ClientIP != "" {
+		if strings.HasPrefix(row.Method, "udp-cache-") && row.ClientIP != "" {
 			sourceConfirmed[row.ClientIP] += 2
 		}
 		if row.Host != "" {
 			host := row.Host
-			if port, ok := parseEvidencePort(row.Path); ok {
+			if port, ok := evidence.ParsePort(row.Path); ok {
 				host = fmt.Sprintf("%s:%d", host, port)
 			}
 			hostCounts[host]++
@@ -710,8 +718,8 @@ func (s *Server) enrichShadowsocksFromLogs(ctx context.Context, response *usageE
 	hydrateChainsFromEntryPortCandidates(chainMap, entrySources)
 	mergeChainUsageMetrics(chainMap, query, related)
 
-	response.SourceIPs = mergeTopIPs(response.SourceIPs, topIPsByCount(sourceWeights, 4), 6)
-	response.TargetIPs = mergeTopIPs(response.TargetIPs, topIPsByCount(targetWeights, 4), 6)
+	response.SourceIPs = mergeTopIPs(response.SourceIPs, topIPsByWeight(sourceWeights, 4), 6)
+	response.TargetIPs = mergeTopIPs(response.TargetIPs, topIPsByWeight(targetWeights, 4), 6)
 	response.Chains = mergeExplainChains(response.Chains, summarizeChains(chainMap, 0), 0)
 	if len(hostCounts) > 0 {
 		appendNoteUnique(&response.Notes, fmt.Sprintf("SS 目标主机候选：%s", formatTopLabeledCounts(hostCounts, 5)))
@@ -768,7 +776,7 @@ func (s *Server) enrichGenericProcessFromLogs(
 			if ev.TargetPort == remotePort {
 				return true
 			}
-			if port, ok := parseEvidencePort(ev.Path); ok && port == remotePort {
+			if port, ok := evidence.ParsePort(ev.Path); ok && port == remotePort {
 				return true
 			}
 		}
@@ -784,7 +792,7 @@ func (s *Server) enrichGenericProcessFromLogs(
 		maxEvidenceRows,
 		allowFileScan,
 		matcher,
-		evidenceQueryHints{AnyIP: remoteIP, TargetPort: remotePort},
+		evidenceHintsForUsageExplain(query, remoteIP, remotePort),
 		isGenericLogFileName,
 		parseGenericEvidenceLine,
 	)
@@ -796,10 +804,10 @@ func (s *Server) enrichGenericProcessFromLogs(
 	}
 	if len(rows) == 0 {
 		if !allowFileScan {
-			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", resolvedLogDir(logDir, "缓存证据库")))
+			appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 的日志缓存未命中，已跳过同步文件扫描，等待后台预热后重试。", evidence.ResolvedLogDir(logDir, "缓存证据库")))
 			return nil
 		}
-		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 中未命中 %s 相关日志。", resolvedLogDir(logDir, "缓存证据库"), processName))
+		appendNoteUnique(&response.Notes, fmt.Sprintf("路径 %s 中未命中 %s 相关日志。", evidence.ResolvedLogDir(logDir, "缓存证据库"), processName))
 		return nil
 	}
 
@@ -817,8 +825,8 @@ func (s *Server) enrichGenericProcessFromLogs(
 	}
 	mergeChainUsageMetrics(chainMap, query, related)
 
-	response.SourceIPs = mergeTopIPs(response.SourceIPs, topIPsByCount(sourceWeights, 4), 6)
-	response.TargetIPs = mergeTopIPs(response.TargetIPs, topIPsByCount(targetWeights, 4), 6)
+	response.SourceIPs = mergeTopIPs(response.SourceIPs, topIPsByWeight(sourceWeights, 4), 6)
+	response.TargetIPs = mergeTopIPs(response.TargetIPs, topIPsByWeight(targetWeights, 4), 6)
 	response.Chains = mergeExplainChains(response.Chains, summarizeChains(chainMap, 0), 0)
 
 	appendNoteUnique(&response.Notes, fmt.Sprintf("%s 日志命中 %d 条。", processName, len(rows)))
@@ -836,10 +844,6 @@ func customEvidenceSource(processName string) string {
 		return "proc"
 	}
 	return fmt.Sprintf("proc:%s", name)
-}
-
-func parseEvidencePort(value string) (int, bool) {
-	return evidence.ParsePort(value)
 }
 
 func (s *Server) lookupOrScanEvidence(
@@ -871,6 +875,14 @@ func (s *Server) lookupOrScanEvidence(
 		MaxScanLinesPerFile:  maxScanLinesPerFile,
 		CacheOnly:            !allowFileScan,
 	})
+}
+
+func evidenceHintsForUsageExplain(query usageExplainQuery, remoteIP string, remotePort int) evidenceQueryHints {
+	hints := evidenceQueryHints{AnyIP: strings.TrimSpace(remoteIP)}
+	if query.Direction == model.DirectionOut && remotePort > 0 {
+		hints.TargetPort = remotePort
+	}
+	return hints
 }
 
 func (s *Server) lookupOrScanEvidenceAcrossDirs(
@@ -1109,60 +1121,6 @@ func (s *Server) scanEvidenceDirWindow(
 	return evidence.SortAndTrim(rows, bucketTS, limit), hitNote, nil
 }
 
-func shadowsocksEvidenceSources() []string {
-	sources := make([]string, 0, 1+len(shadowsocksFamilyLookupKeys()))
-	sources = append(sources, evidenceSourceSS)
-	for _, key := range shadowsocksFamilyLookupKeys() {
-		sources = append(sources, customEvidenceSource(key))
-	}
-	return uniqueNonEmptyStrings(sources)
-}
-
-func (s *Server) lookupOrScanEvidenceAcrossSourcesAndDirs(
-	ctx context.Context,
-	sources []string,
-	logDirs []string,
-	bucketTS int64,
-	limit int,
-	allowFileScan bool,
-	matcher evidenceMatcher,
-	queryHints evidenceQueryHints,
-	fileNameMatcher func(string) bool,
-	parser evidenceParser,
-) ([]model.LogEvidence, []string, error) {
-	orderedSources := uniqueNonEmptyStrings(sources)
-	if len(orderedSources) == 0 {
-		return nil, nil, nil
-	}
-
-	rows := make([]model.LogEvidence, 0, limit)
-	notes := make([]string, 0, len(orderedSources))
-	for index, source := range orderedSources {
-		// Only the canonical source should perform live file scans. Older source
-		// keys are read back from cache for compatibility with pre-upgrade DBs.
-		sourceRows, sourceNotes, err := s.lookupOrScanEvidenceAcrossDirs(
-			ctx,
-			source,
-			logDirs,
-			bucketTS,
-			limit,
-			allowFileScan && index == 0,
-			matcher,
-			queryHints,
-			fileNameMatcher,
-			parser,
-		)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, note := range sourceNotes {
-			appendUniqueString(&notes, note)
-		}
-		rows = appendDedupEvidenceRows(rows, sourceRows)
-	}
-	return evidence.SortAndTrim(rows, bucketTS, limit), notes, nil
-}
-
 func (s *Server) lookupShadowsocksSourceEvidenceByEntryPort(
 	ctx context.Context,
 	bucketTS int64,
@@ -1180,9 +1138,9 @@ func (s *Server) lookupShadowsocksSourceEvidenceByEntryPort(
 	missingJournalPorts := make([]int, 0, len(ports))
 	for _, entryPort := range ports {
 		portValue := entryPort
-		entryRows, entryNotes, err := s.lookupOrScanEvidenceAcrossSourcesAndDirs(
+		entryRows, entryNotes, err := s.lookupOrScanEvidenceAcrossDirs(
 			ctx,
-			shadowsocksEvidenceSources(),
+			evidenceSourceSS,
 			logDirs,
 			bucketTS,
 			maxRelatedPeers*4,
@@ -1556,6 +1514,7 @@ func parseNginxEvidenceLine(source string, line string, _ time.Time) (model.LogE
 	if len(clientIPs) == 0 {
 		return model.LogEvidence{}, false
 	}
+	clientIP := selectNginxClientIP(clientIPs[0], line)
 	eventTS, ok := parseNginxTimestamp(match[2])
 	if !ok {
 		return model.LogEvidence{}, false
@@ -1580,7 +1539,7 @@ func parseNginxEvidenceLine(source string, line string, _ time.Time) (model.LogE
 	ev := model.LogEvidence{
 		Source:   source,
 		EventTS:  eventTS,
-		ClientIP: clientIPs[0],
+		ClientIP: clientIP,
 		TargetIP: "",
 		Host:     host,
 		Path:     path,
@@ -1591,6 +1550,31 @@ func parseNginxEvidenceLine(source string, line string, _ time.Time) (model.LogE
 	ev = evidence.Normalize(ev)
 	ev.Fingerprint = evidenceFingerprint(ev)
 	return ev, true
+}
+
+func selectNginxClientIP(primary string, line string) string {
+	primary = normalizeIP(primary)
+	if primary == "" || !isLoopbackIP(primary) {
+		return primary
+	}
+	for _, candidate := range extractNginxForwardedIPs(line) {
+		if candidate == "" || isLoopbackIP(candidate) {
+			continue
+		}
+		return candidate
+	}
+	return primary
+}
+
+func extractNginxForwardedIPs(line string) []string {
+	for _, pattern := range []*regexp.Regexp{nginxQuotedIPHint, nginxTokenIPHint} {
+		match := pattern.FindStringSubmatch(line)
+		if len(match) < 2 {
+			continue
+		}
+		return extractIPs(match[1])
+	}
+	return nil
 }
 
 func parseSSEvidenceLine(source string, line string, reference time.Time) (model.LogEvidence, bool) {
@@ -1606,14 +1590,14 @@ func parseSSEvidenceLine(source string, line string, reference time.Time) (model
 	targetToken := extractEndpointToken(ssTargetPattern, line)
 	method := ""
 
-	if match := ssUDPCachePattern.FindStringSubmatch(line); len(match) >= 3 {
+	if match := ssUDPCachePattern.FindStringSubmatch(line); len(match) >= 4 {
 		if targetToken == "" {
-			targetToken = match[1]
+			targetToken = match[2]
 		}
 		if clientIP == "" {
-			clientIP = normalizeIP(match[2])
+			clientIP = normalizeIP(match[3])
 		}
-		method = "udp-cache-miss"
+		method = "udp-cache-" + strings.ToLower(match[1])
 	}
 
 	if targetToken == "" {
@@ -1665,6 +1649,9 @@ func parseGenericEvidenceLine(source string, line string, reference time.Time) (
 	if !ok {
 		return model.LogEvidence{}, false
 	}
+	if ev, ok := parseFRPSUserConnectionEvidence(source, line, eventTS); ok {
+		return ev, true
+	}
 
 	clientIP := extractEndpointIP(ssClientPattern, line)
 	if clientIP == "" {
@@ -1706,6 +1693,36 @@ func parseGenericEvidenceLine(source string, line string, reference time.Time) (
 		Method:    method,
 		EntryPort: extractLogEntryPort(line),
 		Message:   truncateMessage(line, 512),
+	}
+	ev = evidence.Normalize(ev)
+	ev.Fingerprint = evidenceFingerprint(ev)
+	return ev, true
+}
+
+func parseFRPSUserConnectionEvidence(source string, line string, eventTS int64) (model.LogEvidence, bool) {
+	match := frpsConnPattern.FindStringSubmatch(line)
+	if len(match) < 3 {
+		return model.LogEvidence{}, false
+	}
+	proxyName := trimDisplayValue(strings.TrimSpace(match[1]), 128)
+	if proxyName == "" {
+		return model.LogEvidence{}, false
+	}
+	_, _, clientIP := parseSSTargetToken(match[2])
+	if clientIP == "" {
+		clientIP = normalizeIP(match[2])
+	}
+	if clientIP == "" {
+		return model.LogEvidence{}, false
+	}
+
+	ev := model.LogEvidence{
+		Source:   source,
+		EventTS:  eventTS,
+		ClientIP: clientIP,
+		Host:     proxyName,
+		Method:   "frps-user-connection",
+		Message:  truncateMessage(line, 512),
 	}
 	ev = evidence.Normalize(ev)
 	ev.Fingerprint = evidenceFingerprint(ev)
@@ -1940,10 +1957,7 @@ func isNginxLogFileName(lowerName string) bool {
 }
 
 func isGenericLogFileName(lowerName string) bool {
-	if !strings.Contains(lowerName, ".log") {
-		return false
-	}
-	return true
+	return strings.Contains(lowerName, ".log")
 }
 
 func isShadowsocksLogFileName(lowerName string) bool {
@@ -1961,13 +1975,6 @@ func isShadowsocksLogFileName(lowerName string) bool {
 
 func evidenceFingerprint(row model.LogEvidence) string {
 	return evidence.Fingerprint(row)
-}
-
-func statusValue(status *int) int {
-	if status == nil {
-		return -1
-	}
-	return *status
 }
 
 func processLabel(comm, exe string) string {
@@ -2032,10 +2039,6 @@ func topIPsByWeight(weights map[string]int64, maxCount int) []string {
 		result = append(result, item.IP)
 	}
 	return result
-}
-
-func topIPsByCount(weights map[string]int64, maxCount int) []string {
-	return topIPsByWeight(weights, maxCount)
 }
 
 func oppositeDirection(direction model.Direction) model.Direction {
@@ -2213,11 +2216,11 @@ func addExplainChain(chains map[string]chainAgg, row model.LogEvidence, query us
 
 	targetPort := row.TargetPort
 	if targetPort <= 0 {
-		targetPort, _ = parseEvidencePort(row.Path)
+		targetPort, _ = evidence.ParsePort(row.Path)
 	}
 	entryPort := row.EntryPort
 	if entryPort <= 0 {
-		entryPort = queryLocalPort(query)
+		entryPort = nullablePortValue(query.LocalPort)
 	}
 	targetIP := strings.TrimSpace(row.TargetIP)
 	key := fmt.Sprintf("%s|%d|%s|%s|%d", row.ClientIP, entryPort, targetIP, evidence.NormalizeHost(row.Host), targetPort)
@@ -2381,7 +2384,7 @@ func buildEntryPortSourceCandidatesFromEvidence(rows []model.LogEvidence) map[in
 		candidate.RemoteIP = row.ClientIP
 		candidate.FlowCount++
 		candidate.BytesTotal++
-		if row.Method == "udp-cache-miss" || row.TargetIP != "" || row.Host != "" {
+		if strings.HasPrefix(row.Method, "udp-cache-") || row.TargetIP != "" || row.Host != "" {
 			candidate.BytesTotal += 2
 		}
 		perPort[row.ClientIP] = candidate
@@ -2525,7 +2528,7 @@ func (s *Server) loadPersistedChains(ctx context.Context, bucketTS int64, query 
 		{bucket: bucketTS, source: store.DataSourceMinuteChain, label: "分钟链路记录"},
 		{bucket: hourBucket, source: store.DataSourceHourChain, label: "小时链路记录"},
 	}
-	if query.DataSource == store.DataSourceHour {
+	if query.DataSource == store.DataSourceHour || query.DataSource == store.DataSourceDay {
 		lookups[0], lookups[1] = lookups[1], lookups[0]
 	}
 
@@ -2889,13 +2892,6 @@ func shouldPersistCanonicalChain(chain usageExplainChain) bool {
 	return strings.TrimSpace(chain.TargetIP) != ""
 }
 
-func queryLocalPort(query usageExplainQuery) int {
-	if query.LocalPort == nil {
-		return 0
-	}
-	return *query.LocalPort
-}
-
 func nullablePort(port int) *int {
 	if port <= 0 {
 		return nil
@@ -2912,7 +2908,20 @@ func inferConfidence(response usageExplainResponse) string {
 		return "high"
 	}
 	if len(response.Chains) > 0 {
-		return "high"
+		bestRank := 1
+		for _, chain := range response.Chains {
+			if rank := explainConfidenceRank(chain.Confidence); rank > bestRank {
+				bestRank = rank
+			}
+		}
+		switch bestRank {
+		case 3:
+			return "high"
+		case 2:
+			return "medium"
+		default:
+			return "low"
+		}
 	}
 	if len(response.SourceIPs) > 0 && len(response.TargetIPs) > 0 {
 		return "medium"
@@ -3063,10 +3072,6 @@ func extractHostAndPath(target string) (string, string) {
 	return "", target
 }
 
-func resolvedLogDir(value string, fallback string) string {
-	return evidence.ResolvedLogDir(value, fallback)
-}
-
 func appendNoteUnique(notes *[]string, text string) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
@@ -3162,7 +3167,7 @@ func formatResolvedLogDirs(logDirs []string) string {
 	}
 	resolved := make([]string, 0, len(uniqueDirs))
 	for _, logDir := range uniqueDirs {
-		resolved = append(resolved, resolvedLogDir(logDir, ""))
+		resolved = append(resolved, evidence.ResolvedLogDir(logDir, ""))
 	}
 	return strings.Join(resolved, "，")
 }

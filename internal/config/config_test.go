@@ -10,7 +10,7 @@ import (
 
 func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	content := []byte("retention:\n  months: 0\n  flows_days: 0\n  hourly_days: 0\n")
+	content := []byte("retention:\n  months: 0\n")
 	if err := os.WriteFile(configPath, content, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -21,12 +21,6 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	}
 	if cfg.Retention.Months != 3 {
 		t.Fatalf("expected default month retention, got %d", cfg.Retention.Months)
-	}
-	if cfg.NginxLogDir != "" {
-		t.Fatalf("expected empty nginx_log_dir by default, got %s", cfg.NginxLogDir)
-	}
-	if cfg.SSLogDir != "" {
-		t.Fatalf("expected empty ss_log_dir by default, got %s", cfg.SSLogDir)
 	}
 	if len(cfg.ProcessLogDirs) != 0 {
 		t.Fatalf("expected no default process_log_dirs entries, got %v", cfg.ProcessLogDirs)
@@ -57,44 +51,6 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	}
 	if cfg.SocketIndexInterval != 10*time.Second {
 		t.Fatalf("expected default socket index interval 10s, got %s", cfg.SocketIndexInterval)
-	}
-}
-
-func TestLoadNginxLogDirOverride(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	content := []byte("nginx_log_dir: /data/nginx-logs\n")
-	if err := os.WriteFile(configPath, content, 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	cfg, err := Load(configPath)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if cfg.NginxLogDir != "/data/nginx-logs" {
-		t.Fatalf("expected nginx_log_dir override, got %s", cfg.NginxLogDir)
-	}
-	if cfg.ProcessLogDirs["nginx"] != "/data/nginx-logs" {
-		t.Fatalf("expected process_log_dirs.nginx merged from legacy override, got %v", cfg.ProcessLogDirs)
-	}
-}
-
-func TestLoadSSLogDirOverride(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	content := []byte("ss_log_dir: /data/ss-logs\n")
-	if err := os.WriteFile(configPath, content, 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	cfg, err := Load(configPath)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if cfg.SSLogDir != "/data/ss-logs" {
-		t.Fatalf("expected ss_log_dir override, got %s", cfg.SSLogDir)
-	}
-	if cfg.ProcessLogDirs["ss-server"] != "/data/ss-logs" {
-		t.Fatalf("expected process_log_dirs.ss-server merged from legacy override, got %v", cfg.ProcessLogDirs)
 	}
 }
 
@@ -155,40 +111,6 @@ func TestLoadProcessLogDirsNormalizesKeysAndDropsEmptyValues(t *testing.T) {
 	}
 	if len(cfg.ProcessLogDirs) != 1 {
 		t.Fatalf("expected only explicit non-empty process_log_dirs entries, got %v", cfg.ProcessLogDirs)
-	}
-}
-
-func TestLoadProcessLogDirsTakesPriorityOverLegacyNginxLogDir(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	content := []byte("nginx_log_dir: /legacy/nginx\nprocess_log_dirs:\n  nginx: /custom/nginx\n")
-	if err := os.WriteFile(configPath, content, 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	cfg, err := Load(configPath)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if cfg.ProcessLogDirs["nginx"] != "/custom/nginx" {
-		t.Fatalf("expected process_log_dirs.nginx to override legacy key, got %v", cfg.ProcessLogDirs)
-	}
-}
-
-func TestDeriveMergesLegacyDirsIntoProcessLogDirs(t *testing.T) {
-	cfg := Default()
-	cfg.NginxLogDir = "/legacy/nginx"
-	cfg.SSLogDir = "/legacy/ss"
-
-	derived := Derive(cfg)
-
-	if derived.ProcessLogDirs["nginx"] != "/legacy/nginx" {
-		t.Fatalf("expected derived nginx path, got %v", derived.ProcessLogDirs)
-	}
-	if derived.ProcessLogDirs["ss-server"] != "/legacy/ss" {
-		t.Fatalf("expected derived ss-server path, got %v", derived.ProcessLogDirs)
-	}
-	if derived.ShadowsocksJournalFallback == nil || !*derived.ShadowsocksJournalFallback {
-		t.Fatalf("expected derived shadowsocks_journal_fallback enabled, got %+v", derived.ShadowsocksJournalFallback)
 	}
 }
 

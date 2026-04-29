@@ -93,7 +93,11 @@ ON CONFLICT(fingerprint) DO UPDATE SET
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateCaches()
+	return nil
 }
 
 func (s *Store) QueryLogEvidence(ctx context.Context, query LogEvidenceQuery) ([]model.LogEvidence, error) {

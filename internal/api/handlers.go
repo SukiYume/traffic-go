@@ -28,6 +28,15 @@ func (s *Server) handleCollectorDiagnostics(w http.ResponseWriter, _ *http.Reque
 	writeJSON(w, http.StatusOK, envelope{"data": s.runtime.Diagnostics()})
 }
 
+func (s *Server) handleStoreDiagnostics(w http.ResponseWriter, r *http.Request) {
+	diagnostics, err := s.store.Diagnostics(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope{"data": diagnostics})
+}
+
 func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	processes, err := s.store.QueryKnownProcesses(r.Context(), processSuggestionLimit)
 	if err != nil {
@@ -47,9 +56,10 @@ type resolvedUsageWindow struct {
 
 type resolvedPagedUsageWindow struct {
 	resolvedUsageWindow
-	Page     int
-	PageSize int
-	Offset   int
+	Page         int
+	PageSize     int
+	Offset       int
+	IncludeTotal bool
 }
 
 func (s *Server) resolveWindowSource(w http.ResponseWriter, r *http.Request, requiresMinute bool) (resolvedUsageWindow, bool) {
@@ -84,7 +94,7 @@ func (s *Server) resolvePagedWindowSource(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return resolvedPagedUsageWindow{}, false
 	}
-	page, pageSize, err := parsePageParams(r)
+	page, pageSize, includeTotal, err := parsePageParams(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_query", err)
 		return resolvedPagedUsageWindow{}, false
@@ -94,6 +104,7 @@ func (s *Server) resolvePagedWindowSource(w http.ResponseWriter, r *http.Request
 		Page:                page,
 		PageSize:            pageSize,
 		Offset:              (page - 1) * pageSize,
+		IncludeTotal:        includeTotal,
 	}, true
 }
 
@@ -147,6 +158,9 @@ func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("bucket") == "" {
 		bucket = defaultBucketForWindow(end.Sub(start), source)
 	}
+	if source == store.DataSourceDay && bucket < 24*time.Hour {
+		bucket = 24 * time.Hour
+	}
 	if source == store.DataSourceHour && bucket < time.Hour {
 		bucket = time.Hour
 	}
@@ -193,12 +207,14 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope{
-		"data_source": source,
-		"data":        records,
-		"next_cursor": nextCursor,
-		"total_rows":  totalRows,
-		"page":        query.Page,
-		"page_size":   query.PageSize,
+		"data_source":      source,
+		"data":             records,
+		"next_cursor":      nextCursor,
+		"total_rows":       totalRows,
+		"total_rows_exact": query.IncludeTotal,
+		"has_more":         pagedHasMore(query.UsePage, totalRows, query.Page, query.PageSize, nextCursor),
+		"page":             query.Page,
+		"page_size":        query.PageSize,
 	})
 }
 
@@ -217,12 +233,13 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("sort_order"),
 		window.PageSize,
 		window.Offset,
+		window.IncludeTotal,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writePagedData(w, window.Source, entries, totalRows, window.Page, window.PageSize)
+	writePagedData(w, window.Source, entries, totalRows, window.Page, window.PageSize, window.IncludeTotal)
 }
 
 func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
@@ -248,12 +265,13 @@ func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("sort_order"),
 		window.PageSize,
 		window.Offset,
+		window.IncludeTotal,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writePagedData(w, window.Source, entries, totalRows, window.Page, window.PageSize)
+	writePagedData(w, window.Source, entries, totalRows, window.Page, window.PageSize, window.IncludeTotal)
 }
 
 func (s *Server) handleTopPorts(w http.ResponseWriter, r *http.Request) {
@@ -297,12 +315,14 @@ func (s *Server) handleForwardUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope{
-		"data_source": store.ForwardDataSource(source),
-		"data":        records,
-		"next_cursor": nextCursor,
-		"total_rows":  totalRows,
-		"page":        query.Page,
-		"page_size":   query.PageSize,
+		"data_source":      store.ForwardDataSource(source),
+		"data":             records,
+		"next_cursor":      nextCursor,
+		"total_rows":       totalRows,
+		"total_rows_exact": query.IncludeTotal,
+		"has_more":         pagedHasMore(query.UsePage, totalRows, query.Page, query.PageSize, nextCursor),
+		"page":             query.Page,
+		"page_size":        query.PageSize,
 	})
 }
 
@@ -312,14 +332,26 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func writePagedData(w http.ResponseWriter, source string, data any, totalRows int, page int, pageSize int) {
+func writePagedData(w http.ResponseWriter, source string, data any, totalRows int, page int, pageSize int, totalRowsExact bool) {
 	writeJSON(w, http.StatusOK, envelope{
-		"data_source": source,
-		"data":        data,
-		"total_rows":  totalRows,
-		"page":        page,
-		"page_size":   pageSize,
+		"data_source":      source,
+		"data":             data,
+		"total_rows":       totalRows,
+		"total_rows_exact": totalRowsExact,
+		"has_more":         pagedHasMore(true, totalRows, page, pageSize, ""),
+		"page":             page,
+		"page_size":        pageSize,
 	})
+}
+
+func pagedHasMore(usePage bool, totalRows int, page int, pageSize int, nextCursor string) bool {
+	if !usePage {
+		return nextCursor != ""
+	}
+	if pageSize <= 0 {
+		return false
+	}
+	return totalRows > page*pageSize
 }
 
 func writeError(w http.ResponseWriter, status int, code string, err error) {
@@ -398,22 +430,23 @@ func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {
 		return model.UsageQuery{}, err
 	}
 	query := model.UsageQuery{
-		Start:       start,
-		End:         end,
-		Comm:        r.URL.Query().Get("comm"),
-		Exe:         r.URL.Query().Get("exe"),
-		RemoteIP:    r.URL.Query().Get("remote_ip"),
-		Direction:   model.Direction(r.URL.Query().Get("direction")),
-		Proto:       r.URL.Query().Get("proto"),
-		Attribution: model.Attribution(r.URL.Query().Get("attribution")),
-		Limit:       listParams.Limit,
-		Page:        listParams.Page,
-		PageSize:    listParams.PageSize,
-		SortBy:      listParams.SortBy,
-		SortOrder:   listParams.SortOrder,
-		CursorTS:    listParams.CursorTS,
-		CursorRowID: listParams.CursorRowID,
-		UsePage:     listParams.UsePage,
+		Start:        start,
+		End:          end,
+		Comm:         r.URL.Query().Get("comm"),
+		Exe:          r.URL.Query().Get("exe"),
+		RemoteIP:     r.URL.Query().Get("remote_ip"),
+		Direction:    model.Direction(r.URL.Query().Get("direction")),
+		Proto:        r.URL.Query().Get("proto"),
+		Attribution:  model.Attribution(r.URL.Query().Get("attribution")),
+		Limit:        listParams.Limit,
+		Page:         listParams.Page,
+		PageSize:     listParams.PageSize,
+		SortBy:       listParams.SortBy,
+		SortOrder:    listParams.SortOrder,
+		CursorTS:     listParams.CursorTS,
+		CursorRowID:  listParams.CursorRowID,
+		UsePage:      listParams.UsePage,
+		IncludeTotal: listParams.IncludeTotal,
 	}
 	if pidValue := r.URL.Query().Get("pid"); pidValue != "" {
 		pid, err := strconv.Atoi(pidValue)
@@ -461,19 +494,20 @@ func parseForwardQuery(r *http.Request) (model.ForwardQuery, error) {
 		return model.ForwardQuery{}, err
 	}
 	query := model.ForwardQuery{
-		Start:       start,
-		End:         end,
-		Proto:       r.URL.Query().Get("proto"),
-		OrigSrcIP:   r.URL.Query().Get("orig_src_ip"),
-		OrigDstIP:   r.URL.Query().Get("orig_dst_ip"),
-		Limit:       listParams.Limit,
-		Page:        listParams.Page,
-		PageSize:    listParams.PageSize,
-		SortBy:      listParams.SortBy,
-		SortOrder:   listParams.SortOrder,
-		CursorTS:    listParams.CursorTS,
-		CursorRowID: listParams.CursorRowID,
-		UsePage:     listParams.UsePage,
+		Start:        start,
+		End:          end,
+		Proto:        r.URL.Query().Get("proto"),
+		OrigSrcIP:    r.URL.Query().Get("orig_src_ip"),
+		OrigDstIP:    r.URL.Query().Get("orig_dst_ip"),
+		Limit:        listParams.Limit,
+		Page:         listParams.Page,
+		PageSize:     listParams.PageSize,
+		SortBy:       listParams.SortBy,
+		SortOrder:    listParams.SortOrder,
+		CursorTS:     listParams.CursorTS,
+		CursorRowID:  listParams.CursorRowID,
+		UsePage:      listParams.UsePage,
+		IncludeTotal: listParams.IncludeTotal,
 	}
 	if !query.UsePage {
 		if err := validateCursorSort(query.SortBy, query.SortOrder); err != nil {
@@ -552,7 +586,7 @@ func defaultBucketForWindow(window time.Duration, source string) time.Duration {
 	case window <= 30*24*time.Hour:
 		return 6 * time.Hour
 	default:
-		if source == store.DataSourceHour {
+		if source == store.DataSourceHour || source == store.DataSourceDay {
 			return 24 * time.Hour
 		}
 		return 6 * time.Hour
@@ -590,14 +624,15 @@ func normalizeWindow(start time.Time, end time.Time, label string) (time.Time, t
 }
 
 type listQueryParams struct {
-	Limit       int
-	Page        int
-	PageSize    int
-	SortBy      string
-	SortOrder   string
-	CursorTS    int64
-	CursorRowID int64
-	UsePage     bool
+	Limit        int
+	Page         int
+	PageSize     int
+	SortBy       string
+	SortOrder    string
+	CursorTS     int64
+	CursorRowID  int64
+	UsePage      bool
+	IncludeTotal bool
 }
 
 func parseListQueryParams(query url.Values) (listQueryParams, error) {
@@ -615,12 +650,13 @@ func parseListQueryParams(query url.Values) (listQueryParams, error) {
 	}
 
 	params := listQueryParams{
-		Limit:     limit,
-		Page:      normalizePositivePage(page),
-		PageSize:  normalizePageSize(pageSize),
-		SortBy:    query.Get("sort_by"),
-		SortOrder: query.Get("sort_order"),
-		UsePage:   query.Has("page") || query.Has("page_size"),
+		Limit:        limit,
+		Page:         normalizePositivePage(page),
+		PageSize:     normalizePageSize(pageSize),
+		SortBy:       query.Get("sort_by"),
+		SortOrder:    query.Get("sort_order"),
+		UsePage:      query.Has("page") || query.Has("page_size"),
+		IncludeTotal: parseBoolFlag(query.Get("include_total")),
 	}
 	if cursor := query.Get("cursor"); cursor != "" {
 		ts, rowID, err := store.DecodeCursor(cursor)
@@ -662,18 +698,18 @@ func parseIntWithDefault(value string, fallback int, field string) (int, error) 
 	return parsed, nil
 }
 
-func parsePageParams(r *http.Request) (int, int, error) {
+func parsePageParams(r *http.Request) (int, int, bool, error) {
 	page, err := parseIntWithDefault(r.URL.Query().Get("page"), 1, "page")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	page = normalizePositivePage(page)
 	pageSize, err := parseIntWithDefault(r.URL.Query().Get("page_size"), 25, "page_size")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	pageSize = normalizePageSize(pageSize)
-	return page, pageSize, nil
+	return page, pageSize, parseBoolFlag(r.URL.Query().Get("include_total")), nil
 }
 
 func parseBoolFlag(value string) bool {

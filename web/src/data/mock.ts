@@ -604,7 +604,7 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
 
 function processSummaries(
   range: RangeKey,
-  query?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy },
+  query?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean },
 ): ProcessSummaryResponse {
   void range;
   const effectiveGroupBy: ProcessGroupBy = query?.groupBy ?? 'pid';
@@ -646,12 +646,14 @@ function processSummaries(
     page: page.page,
     pageSize: page.pageSize,
     totalRows: page.totalRows,
+    hasMore: page.page * page.pageSize < page.totalRows,
+    totalRowsExact: true,
   };
 }
 
 function remoteSummaries(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; direction?: 'in' | 'out'; includeLoopback?: boolean; sortBy?: RemoteSortKey; sortOrder?: SortOrder },
+  options?: { page?: number; pageSize?: number; direction?: 'in' | 'out'; includeLoopback?: boolean; sortBy?: RemoteSortKey; sortOrder?: SortOrder; includeTotal?: boolean },
 ): RemoteSummaryResponse {
   const grouped = new Map<string, { direction: 'in' | 'out'; remoteIp: string; bytesUp: number; bytesDown: number; flowCount: number }>();
   for (const row of createFilteredUsage({ range })) {
@@ -679,6 +681,8 @@ function remoteSummaries(
     page: page.page,
     pageSize: page.pageSize,
     totalRows: page.totalRows,
+    hasMore: page.page * page.pageSize < page.totalRows,
+    totalRowsExact: true,
   };
 }
 
@@ -739,6 +743,8 @@ export function createMockApiClient(): TrafficApiClient {
         page: page.page,
         pageSize: page.pageSize,
         totalRows: page.totalRows,
+        hasMore: page.page * page.pageSize < page.totalRows,
+        totalRowsExact: true,
       };
     },
     async getUsageExplain(row) {
@@ -771,6 +777,8 @@ export function createMockApiClient(): TrafficApiClient {
         page: page.page,
         pageSize: page.pageSize,
         totalRows: page.totalRows,
+        hasMore: page.page * page.pageSize < page.totalRows,
+        totalRowsExact: true,
       };
     },
   };

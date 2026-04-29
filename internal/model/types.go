@@ -208,6 +208,13 @@ type CollectorDiagnostics struct {
 	LocalIPCount               int              `json:"local_ip_count"`
 	LocalIPAgeSeconds          *int64           `json:"local_ip_age_seconds,omitempty"`
 	ProcessHintCount           int              `json:"process_hint_count"`
+	LastTickDurationMS         int64            `json:"last_tick_duration_ms"`
+	LastConntrackReadMS        int64            `json:"last_conntrack_read_ms"`
+	LastSocketIndexMS          int64            `json:"last_socket_index_ms"`
+	LastResolverMS             int64            `json:"last_resolver_ms"`
+	LastRawFlowCount           int              `json:"last_raw_flow_count"`
+	LastObservedFlowCount      int              `json:"last_observed_flow_count"`
+	SocketIndexEntryCount      int              `json:"socket_index_entry_count"`
 }
 
 type MonthlyUsageSummary struct {
@@ -266,41 +273,43 @@ type UsageChainRecord struct {
 }
 
 type UsageQuery struct {
-	Start       time.Time
-	End         time.Time
-	Comm        string
-	Exe         string
-	RemoteIP    string
-	RemotePort  *int
-	Direction   Direction
-	Proto       string
-	Attribution Attribution
-	PID         *int
-	LocalPort   *int
-	Limit       int
-	Page        int
-	PageSize    int
-	SortBy      string
-	SortOrder   string
-	UsePage     bool
-	CursorTS    int64
-	CursorRowID int64
+	Start        time.Time
+	End          time.Time
+	Comm         string
+	Exe          string
+	RemoteIP     string
+	RemotePort   *int
+	Direction    Direction
+	Proto        string
+	Attribution  Attribution
+	PID          *int
+	LocalPort    *int
+	Limit        int
+	Page         int
+	PageSize     int
+	SortBy       string
+	SortOrder    string
+	UsePage      bool
+	IncludeTotal bool
+	CursorTS     int64
+	CursorRowID  int64
 }
 
 type ForwardQuery struct {
-	Start       time.Time
-	End         time.Time
-	Proto       string
-	OrigSrcIP   string
-	OrigDstIP   string
-	Limit       int
-	Page        int
-	PageSize    int
-	SortBy      string
-	SortOrder   string
-	UsePage     bool
-	CursorTS    int64
-	CursorRowID int64
+	Start        time.Time
+	End          time.Time
+	Proto        string
+	OrigSrcIP    string
+	OrigDstIP    string
+	Limit        int
+	Page         int
+	PageSize     int
+	SortBy       string
+	SortOrder    string
+	UsePage      bool
+	IncludeTotal bool
+	CursorTS     int64
+	CursorRowID  int64
 }
 
 type TimeseriesQuery struct {
@@ -314,4 +323,29 @@ type TimeseriesQuery struct {
 	Direction Direction
 	Proto     string
 	PID       *int
+}
+
+type StorePoolDiagnostics struct {
+	MaxOpenConnections int   `json:"max_open_connections"`
+	OpenConnections    int   `json:"open_connections"`
+	InUse              int   `json:"in_use"`
+	Idle               int   `json:"idle"`
+	WaitCount          int64 `json:"wait_count"`
+	WaitDurationMS     int64 `json:"wait_duration_ms"`
+}
+
+type StoreTableDiagnostics struct {
+	Name string `json:"name"`
+	Rows int64  `json:"rows"`
+}
+
+type StoreDiagnostics struct {
+	DBBytes              int64                   `json:"db_bytes"`
+	WALBytes             int64                   `json:"wal_bytes"`
+	SHMBytes             int64                   `json:"shm_bytes"`
+	WritePool            StorePoolDiagnostics    `json:"write_pool"`
+	ReadPool             StorePoolDiagnostics    `json:"read_pool"`
+	Tables               []StoreTableDiagnostics `json:"tables"`
+	LastAggregatedHourTS *int64                  `json:"last_aggregated_hour_ts,omitempty"`
+	LastVacuumTS         *int64                  `json:"last_vacuum_ts,omitempty"`
 }

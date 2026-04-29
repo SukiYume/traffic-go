@@ -290,6 +290,8 @@ export function ProcessesPage() {
                   page: pidQuery.data?.page ?? 1,
                   pageSize: pidQuery.data?.pageSize ?? pageSize,
                   totalRows: pidQuery.data?.totalRows ?? 0,
+                  hasMore: pidQuery.data?.hasMore,
+                  totalRowsExact: pidQuery.data?.totalRowsExact,
                   onPageChange: setPidPage,
                 }}
                 emptyText="当前时间范围没有按 PID 聚合结果。"
@@ -328,6 +330,8 @@ export function ProcessesPage() {
                   page: commQuery.data?.page ?? 1,
                   pageSize: commQuery.data?.pageSize ?? pageSize,
                   totalRows: commQuery.data?.totalRows ?? 0,
+                  hasMore: commQuery.data?.hasMore,
+                  totalRowsExact: commQuery.data?.totalRowsExact,
                   onPageChange: setCommPage,
                 }}
                 emptyText="当前时间范围没有按进程名聚合结果。"

@@ -45,6 +45,7 @@ type ListQueryOptions<SortKey extends string> = {
   pageSize?: number;
   sortBy?: SortKey;
   sortOrder?: SortOrder;
+  includeTotal?: boolean;
 };
 
 type RawErrorResponse = {
@@ -99,6 +100,8 @@ type RawUsageResponse = {
   page?: number;
   page_size?: number;
   total_rows?: number;
+  has_more?: boolean;
+  total_rows_exact?: boolean;
   data: Array<{
     time_bucket: number;
     proto: UsageRow['proto'];
@@ -190,6 +193,8 @@ type RawProcessSummaryResponse = {
   page?: number;
   page_size?: number;
   total_rows?: number;
+  has_more?: boolean;
+  total_rows_exact?: boolean;
   data: Array<{
     pid: number | null;
     comm: string;
@@ -205,6 +210,8 @@ type RawRemoteSummaryResponse = {
   page?: number;
   page_size?: number;
   total_rows?: number;
+  has_more?: boolean;
+  total_rows_exact?: boolean;
   data: Array<{
     direction: 'in' | 'out';
     remote_ip: string;
@@ -220,6 +227,8 @@ type RawForwardResponse = {
   page?: number;
   page_size?: number;
   total_rows?: number;
+  has_more?: boolean;
+  total_rows_exact?: boolean;
   data: Array<{
     time_bucket: number;
     proto: ForwardUsageRow['proto'];
@@ -258,6 +267,7 @@ function appendListQuery<SortKey extends string>(
     ['page_size', options.pageSize ?? undefined],
     ['sort_by', sortParam],
     ['sort_order', options.sortOrder ?? undefined],
+    ['include_total', options.includeTotal ? 1 : undefined],
   ] as Array<[string, QueryValue]>;
 }
 
@@ -314,7 +324,7 @@ function buildUsageExplainQuery(row: UsageRow, options?: { dataSource?: UsageRes
 
 function buildTopProcessesQuery(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy },
+  options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean },
 ) {
   return buildQuery([
     ['range', range],
@@ -323,12 +333,13 @@ function buildTopProcessesQuery(
     ['sort_by', processSortParam(options?.sortBy)],
     ['sort_order', options?.sortOrder ?? undefined],
     ['group_by', options?.groupBy],
+    ['include_total', options?.includeTotal ? 1 : undefined],
   ]);
 }
 
 function buildTopRemotesQuery(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: 'in' | 'out'; includeLoopback?: boolean },
+  options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: 'in' | 'out'; includeLoopback?: boolean; includeTotal?: boolean },
 ) {
   return buildQuery([
     ['range', range],
@@ -339,6 +350,7 @@ function buildTopRemotesQuery(
     ['direction', options?.direction],
     ['include_loopback', options?.includeLoopback === true ? 1 : undefined],
     ['exclude_loopback', options?.includeLoopback === false ? 1 : undefined],
+    ['include_total', options?.includeTotal ? 1 : undefined],
   ]);
 }
 
@@ -494,6 +506,8 @@ function decodeUsage(raw: unknown): UsageResponse {
     page: payload.page ?? 1,
     pageSize: payload.page_size ?? (payload.data?.length ?? 0),
     totalRows: payload.total_rows ?? payload.data?.length ?? 0,
+    hasMore: Boolean(payload.has_more),
+    totalRowsExact: Boolean(payload.total_rows_exact),
     rows: (payload.data ?? []).map((row) => ({
       minuteTs: row.time_bucket,
       proto: row.proto,
@@ -596,6 +610,8 @@ function decodeProcessSummary(raw: unknown): ProcessSummaryResponse {
     page: payload.page ?? 1,
     pageSize: payload.page_size ?? (payload.data?.length ?? 0),
     totalRows: payload.total_rows ?? payload.data?.length ?? 0,
+    hasMore: Boolean(payload.has_more),
+    totalRowsExact: Boolean(payload.total_rows_exact),
     rows: (payload.data ?? []).map((row) => ({
       pid: row.pid ?? null,
       comm: row.comm ?? null,
@@ -615,6 +631,8 @@ function decodeRemoteSummary(raw: unknown): RemoteSummaryResponse {
     page: payload.page ?? 1,
     pageSize: payload.page_size ?? (payload.data?.length ?? 0),
     totalRows: payload.total_rows ?? payload.data?.length ?? 0,
+    hasMore: Boolean(payload.has_more),
+    totalRowsExact: Boolean(payload.total_rows_exact),
     rows: (payload.data ?? []).map((row) => ({
       direction: row.direction,
       remoteIp: row.remote_ip || null,
@@ -634,6 +652,8 @@ function decodeForwardUsage(raw: unknown): ForwardUsageResponse {
     page: payload.page ?? 1,
     pageSize: payload.page_size ?? (payload.data?.length ?? 0),
     totalRows: payload.total_rows ?? payload.data?.length ?? 0,
+    hasMore: Boolean(payload.has_more),
+    totalRowsExact: Boolean(payload.total_rows_exact),
     rows: (payload.data ?? []).map((row) => ({
       minuteTs: row.time_bucket,
       proto: row.proto,

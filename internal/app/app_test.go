@@ -16,24 +16,6 @@ import (
 	"traffic-go/internal/store"
 )
 
-func TestNewDerivesProcessLogDirsFromLegacyFields(t *testing.T) {
-	cfg := config.Default()
-	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
-	cfg.NginxLogDir = "/legacy/nginx"
-
-	application, err := New(cfg, log.New(io.Discard, "", 0))
-	if err != nil {
-		t.Fatalf("new app: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = application.Close()
-	})
-
-	if application.cfg.ProcessLogDirs["nginx"] != "/legacy/nginx" {
-		t.Fatalf("expected derived nginx process log dir, got %v", application.cfg.ProcessLogDirs)
-	}
-}
-
 func TestRunAggregationRefreshesLatestCompletedHour(t *testing.T) {
 	cfg := config.Default()
 	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")

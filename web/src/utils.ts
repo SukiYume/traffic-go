@@ -23,6 +23,12 @@ const DATA_SOURCE_META: Record<DataSource, DataSourceMeta> = {
     autoNote: '当前页面正在读取小时聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
     minuteDimensionsUnavailable: true,
   },
+  usage_1d: {
+    label: '日聚合',
+    description: '按天聚合后的历史数据，月度等长时间范围会自动切换到这里。',
+    autoNote: '当前页面正在读取日聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
+    minuteDimensionsUnavailable: true,
+  },
   usage_1m_forward: {
     label: '分钟转发明细',
     description: '逐分钟累计的 forward / NAT 明细。',
@@ -33,6 +39,12 @@ const DATA_SOURCE_META: Record<DataSource, DataSourceMeta> = {
     label: '小时转发聚合',
     description: '按小时聚合后的 forward / NAT 历史数据。',
     autoNote: '当前页面正在读取小时转发聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
+    minuteDimensionsUnavailable: true,
+  },
+  usage_1d_forward: {
+    label: '日转发聚合',
+    description: '按天聚合后的 forward / NAT 长周期历史数据。',
+    autoNote: '当前页面正在读取日转发聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
     minuteDimensionsUnavailable: true,
   },
 };
