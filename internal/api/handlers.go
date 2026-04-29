@@ -52,13 +52,13 @@ type resolvedPagedUsageWindow struct {
 	Offset   int
 }
 
-func (s *Server) resolveWindowSource(w http.ResponseWriter, r *http.Request, usesPID bool, usesExe bool) (resolvedUsageWindow, bool) {
+func (s *Server) resolveWindowSource(w http.ResponseWriter, r *http.Request, requiresMinute bool) (resolvedUsageWindow, bool) {
 	start, end, rangeLabel, err := parseWindow(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_range", err)
 		return resolvedUsageWindow{}, false
 	}
-	source, ok := s.resolveSourceForWindow(w, start, end, usesPID, usesExe)
+	source, ok := s.resolveSourceForWindow(w, start, end, requiresMinute)
 	if !ok {
 		return resolvedUsageWindow{}, false
 	}
@@ -70,8 +70,8 @@ func (s *Server) resolveWindowSource(w http.ResponseWriter, r *http.Request, use
 	}, true
 }
 
-func (s *Server) resolveSourceForWindow(w http.ResponseWriter, start time.Time, end time.Time, usesPID bool, usesExe bool) (string, bool) {
-	source, err := s.store.ResolveUsageSource(start, end, usesPID, usesExe)
+func (s *Server) resolveSourceForWindow(w http.ResponseWriter, start time.Time, end time.Time, requiresMinute bool) (string, bool) {
+	source, err := s.store.ResolveUsageSource(start, end, requiresMinute)
 	if err != nil {
 		writeDimensionError(w, err)
 		return "", false
@@ -79,8 +79,8 @@ func (s *Server) resolveSourceForWindow(w http.ResponseWriter, start time.Time, 
 	return source, true
 }
 
-func (s *Server) resolvePagedWindowSource(w http.ResponseWriter, r *http.Request, usesPID bool, usesExe bool) (resolvedPagedUsageWindow, bool) {
-	window, ok := s.resolveWindowSource(w, r, usesPID, usesExe)
+func (s *Server) resolvePagedWindowSource(w http.ResponseWriter, r *http.Request, requiresMinute bool) (resolvedPagedUsageWindow, bool) {
+	window, ok := s.resolveWindowSource(w, r, requiresMinute)
 	if !ok {
 		return resolvedPagedUsageWindow{}, false
 	}
@@ -98,7 +98,7 @@ func (s *Server) resolvePagedWindowSource(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
-	window, ok := s.resolveWindowSource(w, r, false, false)
+	window, ok := s.resolveWindowSource(w, r, false)
 	if !ok {
 		return
 	}
@@ -139,7 +139,7 @@ func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 		pidFilter = &pid
 	}
 	exeFilter := r.URL.Query().Get("exe")
-	source, ok := s.resolveSourceForWindow(w, start, end, pidFilter != nil, exeFilter != "")
+	source, ok := s.resolveSourceForWindow(w, start, end, pidFilter != nil || exeFilter != "")
 	if !ok {
 		return
 	}
@@ -175,7 +175,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_usage_query", err)
 		return
 	}
-	source, ok := s.resolveSourceForWindow(w, query.Start, query.End, query.PID != nil, query.Exe != "")
+	source, ok := s.resolveSourceForWindow(w, query.Start, query.End, usageQueryRequiresMinuteSource(query))
 	if !ok {
 		return
 	}
@@ -203,7 +203,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
-	window, ok := s.resolvePagedWindowSource(w, r, false, false)
+	window, ok := s.resolvePagedWindowSource(w, r, false)
 	if !ok {
 		return
 	}
@@ -226,7 +226,7 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
-	window, ok := s.resolvePagedWindowSource(w, r, false, false)
+	window, ok := s.resolvePagedWindowSource(w, r, false)
 	if !ok {
 		return
 	}
@@ -265,7 +265,7 @@ func (s *Server) handleTop(
 	r *http.Request,
 	queryFunc func(context.Context, time.Time, time.Time, string, string) ([]model.TopEntry, error),
 ) {
-	window, ok := s.resolveWindowSource(w, r, false, false)
+	window, ok := s.resolveWindowSource(w, r, false)
 	if !ok {
 		return
 	}
@@ -283,7 +283,7 @@ func (s *Server) handleForwardUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_forward_query", err)
 		return
 	}
-	source, ok := s.resolveSourceForWindow(w, query.Start, query.End, false, false)
+	source, ok := s.resolveSourceForWindow(w, query.Start, query.End, false)
 	if !ok {
 		return
 	}
@@ -442,6 +442,13 @@ func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {
 		}
 	}
 	return query, nil
+}
+
+func usageQueryRequiresMinuteSource(query model.UsageQuery) bool {
+	return query.PID != nil ||
+		strings.TrimSpace(query.Exe) != "" ||
+		query.RemotePort != nil ||
+		query.Attribution != ""
 }
 
 func parseForwardQuery(r *http.Request) (model.ForwardQuery, error) {

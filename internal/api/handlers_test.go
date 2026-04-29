@@ -529,6 +529,107 @@ func TestUsageFiltersByRemotePort(t *testing.T) {
 	}
 }
 
+func TestUsageLongWindowUsesHourlySourceWithoutMinuteOnlyFilters(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Hour)
+	minute := now.Add(-2 * time.Hour).Add(30 * time.Minute)
+
+	if err := server.store.FlushMinute(ctx, minute.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "198.51.100.44",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    3,
+			PktsDown:  5,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed usage row: %v", err)
+	}
+	if err := server.store.AggregateHour(ctx, minute); err != nil {
+		t.Fatalf("aggregate hour: %v", err)
+	}
+
+	start := url.QueryEscape(now.Add(-7 * 24 * time.Hour).Format(time.RFC3339))
+	end := url.QueryEscape(now.Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/usage?start=%s&end=%s&page=1&page_size=10", start, end), nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"data_source":"usage_1h"`) {
+		t.Fatalf("expected long usage window to use hourly source: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"pid":null`) || !strings.Contains(bodyText, `"remote_port":null`) {
+		t.Fatalf("expected hourly usage row to omit minute-only dimensions: %s", bodyText)
+	}
+}
+
+func TestUsageLongWindowKeepsMinuteSourceForAttributionFilter(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Hour)
+	minute := now.Add(-2 * time.Hour).Add(30 * time.Minute).Unix()
+
+	if err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "198.51.100.44",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    3,
+			PktsDown:  5,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed usage row: %v", err)
+	}
+
+	start := url.QueryEscape(now.Add(-7 * 24 * time.Hour).Format(time.RFC3339))
+	end := url.QueryEscape(now.Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/usage?start=%s&end=%s&page=1&page_size=10&attribution=exact", start, end), nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"data_source":"usage_1m"`) {
+		t.Fatalf("expected attribution filter to keep minute source: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `"attribution":"exact"`) {
+		t.Fatalf("expected exact attribution row: %s", bodyText)
+	}
+}
+
 func TestForwardUsageResponseNormalizesPageMetadata(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()

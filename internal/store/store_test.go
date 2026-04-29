@@ -31,7 +31,7 @@ func TestResolveUsageSource(t *testing.T) {
 	start := time.Unix(0, 0)
 	end := start.Add(31 * 24 * time.Hour)
 
-	source, err := store.ResolveUsageSource(start, end, false, false)
+	source, err := store.ResolveUsageSource(start, end, false)
 	if err != nil {
 		t.Fatalf("resolve source: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestResolveUsageSource(t *testing.T) {
 		t.Fatalf("unexpected source: %s", source)
 	}
 
-	if _, err := store.ResolveUsageSource(start, end, true, false); err != ErrDimensionUnavailable {
+	if _, err := store.ResolveUsageSource(start, end, true); err != ErrDimensionUnavailable {
 		t.Fatalf("expected dimension unavailable, got %v", err)
 	}
 }
@@ -708,7 +708,7 @@ func TestQueryTimeseriesUsesTimeColumnForBucketing(t *testing.T) {
 	}
 }
 
-func TestResolveUsageSourceUsesConfiguredMonthRetention(t *testing.T) {
+func TestResolveUsageSourceUsesHourlyForLongWindowWithinRetention(t *testing.T) {
 	cfg := config.Default()
 	cfg.Retention.Months = 3
 	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
@@ -724,12 +724,29 @@ func TestResolveUsageSourceUsesConfiguredMonthRetention(t *testing.T) {
 	start := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
 
-	source, err := store.ResolveUsageSource(start, end, false, false)
+	source, err := store.ResolveUsageSource(start, end, false)
 	if err != nil {
 		t.Fatalf("resolve source: %v", err)
 	}
+	if source != DataSourceHour {
+		t.Fatalf("expected long retained window to use hour source, got %s", source)
+	}
+
+	source, err = store.ResolveUsageSource(start, end, true)
+	if err != nil {
+		t.Fatalf("resolve minute-required source: %v", err)
+	}
 	if source != DataSourceMinute {
-		t.Fatalf("expected minute source, got %s", source)
+		t.Fatalf("expected minute-required long retained window to use minute source, got %s", source)
+	}
+
+	shortStart := now.Add(-24 * time.Hour)
+	source, err = store.ResolveUsageSource(shortStart, now, false)
+	if err != nil {
+		t.Fatalf("resolve short source: %v", err)
+	}
+	if source != DataSourceMinute {
+		t.Fatalf("expected 24h window to keep minute source, got %s", source)
 	}
 }
 
@@ -741,7 +758,7 @@ func TestResolveUsageSourceFallsBackForOldAbsoluteWindow(t *testing.T) {
 	start := time.Date(2026, 1, 31, 23, 30, 0, 0, time.UTC)
 	end := start.Add(30 * time.Minute)
 
-	source, err := store.ResolveUsageSource(start, end, false, false)
+	source, err := store.ResolveUsageSource(start, end, false)
 	if err != nil {
 		t.Fatalf("resolve source: %v", err)
 	}
@@ -749,7 +766,7 @@ func TestResolveUsageSourceFallsBackForOldAbsoluteWindow(t *testing.T) {
 		t.Fatalf("expected old window to use hour source, got %s", source)
 	}
 
-	if _, err := store.ResolveUsageSource(start, end, true, false); err != ErrDimensionUnavailable {
+	if _, err := store.ResolveUsageSource(start, end, true); err != ErrDimensionUnavailable {
 		t.Fatalf("expected minute-only dimensions to be unavailable, got %v", err)
 	}
 }
