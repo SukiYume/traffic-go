@@ -23,7 +23,7 @@ const (
 	usageExplainWindowPadding = int64(60)
 	logWindowStrict           = int64(120)
 	logWindowFallback         = int64(900)
-	explainLogScanBudget      = 1500 * time.Millisecond
+	explainLogScanBudget      = 5 * time.Second
 	maxRelatedPeers           = 8
 	maxNginxRequests          = 0
 	maxEvidenceRows           = 128
