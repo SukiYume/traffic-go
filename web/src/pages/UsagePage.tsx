@@ -22,6 +22,7 @@ import {
   formatBytes,
   formatDateTime,
   formatNumber,
+  formatUrlPath,
   isLoopbackIp,
   minuteDimensionsUnavailable,
   rangeLabel,
@@ -30,6 +31,7 @@ import {
 } from "../utils";
 
 const pageSize = 25;
+const nginxTraceHeaderMaxLength = 120;
 const columnHelper = createColumnHelper<UsageRow>();
 
 function usageRowKey(row: UsageRow) {
@@ -413,24 +415,27 @@ function UsageExpandPanel({
             {explain.nginxRequests.length > 0 ? (
               <div className="row-expand-analysis-list">
                 <span>网页访问线索（聚合）</span>
-                {explain.nginxRequests.slice(0, 5).map((request, index) => (
-                  <div
-                    key={`${request.time}-${request.path}-${index}`}
-                    className="row-expand-analysis-note"
-                  >
-                    {formatDateTime(request.time)} · {request.method}{" "}
-                    {request.host ? `${request.host}` : ""}
-                    {request.path} · {request.status} · {request.count} 次
-                    {request.bot
-                      ? ` · ${request.bot}`
-                      : request.userAgent
-                        ? ` · ${clampText(request.userAgent, 64)}`
+                {explain.nginxRequests.slice(0, 5).map((request, index) => {
+                  const displayPath = formatUrlPath(request.path);
+                  return (
+                    <div
+                      key={`${request.time}-${request.path}-${index}`}
+                      className="row-expand-analysis-note"
+                    >
+                      {formatDateTime(request.time)} · {request.method}{" "}
+                      {request.host ? `${request.host}` : ""}
+                      {displayPath} · {request.status} · {request.count} 次
+                      {request.bot
+                        ? ` · ${request.bot}`
+                        : request.userAgent
+                          ? ` · ${clampText(request.userAgent, nginxTraceHeaderMaxLength)}`
+                          : ""}
+                      {request.referer
+                        ? ` · 来路 ${clampText(request.referer, nginxTraceHeaderMaxLength)}`
                         : ""}
-                    {request.referer
-                      ? ` · 来路 ${clampText(request.referer, 64)}`
-                      : ""}
-                  </div>
-                ))}
+                    </div>
+                  );
+                })}
               </div>
             ) : null}
 

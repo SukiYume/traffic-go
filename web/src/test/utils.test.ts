@@ -5,6 +5,7 @@ import {
   dataSourceLabel,
   displayExecutableName,
   executableName,
+  formatUrlPath,
   isLoopbackIp,
   minuteDimensionsUnavailable,
   serviceNameForPort,
@@ -69,6 +70,19 @@ describe('executableName', () => {
 describe('displayExecutableName', () => {
   it('returns fallback for empty input', () => {
     expect(displayExecutableName(undefined)).toBe('未知');
+  });
+});
+
+describe('formatUrlPath', () => {
+  it('decodes percent-encoded unicode path segments for display', () => {
+    expect(
+      formatUrlPath('/note/%E6%97%A5%E8%AF%AD%E7%AC%94%E8%AE%B0/%E6%97%A5%E8%AF%AD%E5%AD%A6%E4%B9%A0%E7%AC%94%E8%AE%B0-%E4%B8%AD%E7%BA%A7'),
+    ).toBe('/note/日语笔记/日语学习笔记-中级');
+  });
+
+  it('keeps reserved encoded delimiters and falls back on malformed input', () => {
+    expect(formatUrlPath('/api?exe=%2Fusr%2Fbin%2Fnginx')).toBe('/api?exe=%2Fusr%2Fbin%2Fnginx');
+    expect(formatUrlPath('/bad/%E6%A')).toBe('/bad/%E6%A');
   });
 });
 

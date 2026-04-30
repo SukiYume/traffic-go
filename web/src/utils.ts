@@ -175,6 +175,16 @@ export function clampText(value: string, max = 32) {
   return `${value.slice(0, max - 1)}…`;
 }
 
+export function formatUrlPath(value?: string | null) {
+  const trimmed = value?.trim() ?? '';
+  if (!trimmed) return '';
+  try {
+    return decodeURI(trimmed);
+  } catch {
+    return trimmed;
+  }
+}
+
 export function attributionLabel(value: string | null | undefined) {
   if (value === 'exact') return 'exact';
   if (value === 'heuristic') return 'heuristic';
