@@ -59,6 +59,27 @@ func TestParseConntrackLine(t *testing.T) {
 	}
 }
 
+func TestParseConntrackLineNormalizesIPv6ForLocalClassification(t *testing.T) {
+	line := "ipv6 10 tcp 6 431998 ESTABLISHED src=2400:dd01:102d:1001:8469:ee49:ee8f:a2cf dst=2001:19f0:6801:10f4:5400:01ff:fedc:a255 sport=61650 dport=12096 packets=2607 bytes=1475916 src=2001:19f0:6801:10f4:5400:01ff:fedc:a255 dst=2400:dd01:102d:1001:8469:ee49:ee8f:a2cf sport=12096 dport=61650 packets=2677 bytes=4627395 [ASSURED] mark=0 zone=0 use=2 id=77"
+	flow, ok, err := parseConntrackLine(line)
+	if err != nil {
+		t.Fatalf("parse conntrack ipv6: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected flow")
+	}
+
+	localIP := "2001:19f0:6801:10f4:5400:1ff:fedc:a255"
+	if flow.OrigDstIP != localIP || flow.ReplySrcIP != localIP {
+		t.Fatalf("expected normalized local IPv6 %s, got orig_dst=%s reply_src=%s", localIP, flow.OrigDstIP, flow.ReplySrcIP)
+	}
+
+	classified := classifyFlow(flow, map[string]struct{}{localIP: {}}, socketIndex{})
+	if classified.Direction != model.DirectionIn {
+		t.Fatalf("expected normalized IPv6 flow to classify as inbound, got %+v", classified)
+	}
+}
+
 func TestParseConntrackLineWithoutIDOrCounters(t *testing.T) {
 	line := "ipv4 2 tcp 6 100 TIME_WAIT src=159.226.171.226 dst=217.69.7.251 sport=52059 dport=12096 src=217.69.7.251 dst=159.226.171.226 sport=12096 dport=52059 mark=0 zone=0 use=2"
 	flow, ok, err := parseConntrackLine(line)

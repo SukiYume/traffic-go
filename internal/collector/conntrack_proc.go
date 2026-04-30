@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"hash/fnv"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -65,10 +66,10 @@ func parseConntrackLine(line string) (model.ConntrackFlow, bool, error) {
 		tokenValues[parts[0]] = append(tokenValues[parts[0]], parts[1])
 	}
 
-	flow.OrigSrcIP = firstValue(tokenValues["src"], 0)
-	flow.OrigDstIP = firstValue(tokenValues["dst"], 0)
-	flow.ReplySrcIP = firstValue(tokenValues["src"], 1)
-	flow.ReplyDstIP = firstValue(tokenValues["dst"], 1)
+	flow.OrigSrcIP = normalizeConntrackIP(firstValue(tokenValues["src"], 0))
+	flow.OrigDstIP = normalizeConntrackIP(firstValue(tokenValues["dst"], 0))
+	flow.ReplySrcIP = normalizeConntrackIP(firstValue(tokenValues["src"], 1))
+	flow.ReplyDstIP = normalizeConntrackIP(firstValue(tokenValues["dst"], 1))
 	flow.OrigSrcPort = mustAtoi(firstValue(tokenValues["sport"], 0))
 	flow.OrigDstPort = mustAtoi(firstValue(tokenValues["dport"], 0))
 	flow.ReplySrcPort = mustAtoi(firstValue(tokenValues["sport"], 1))
@@ -117,6 +118,14 @@ func firstValue(values []string, idx int) string {
 		return ""
 	}
 	return values[idx]
+}
+
+func normalizeConntrackIP(value string) string {
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return value
+	}
+	return ip.String()
 }
 
 func mustAtoi(value string) int {
