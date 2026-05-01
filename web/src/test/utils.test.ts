@@ -5,6 +5,9 @@ import {
   dataSourceLabel,
   displayExecutableName,
   executableName,
+  chartTickLabel,
+  formatBucketTimeLabel,
+  formatDateTime,
   formatUrlPath,
   isLoopbackIp,
   minuteDimensionsUnavailable,
@@ -83,6 +86,19 @@ describe('formatUrlPath', () => {
   it('keeps reserved encoded delimiters and falls back on malformed input', () => {
     expect(formatUrlPath('/api?exe=%2Fusr%2Fbin%2Fnginx')).toBe('/api?exe=%2Fusr%2Fbin%2Fnginx');
     expect(formatUrlPath('/bad/%E6%A')).toBe('/bad/%E6%A');
+  });
+});
+
+describe('UTC time formatting', () => {
+  it('keeps traffic timestamps in UTC for detailed labels', () => {
+    const mayFirstUTC = 1777593600;
+
+    expect(formatDateTime(mayFirstUTC)).toBe('05/01 00:00');
+    expect(formatBucketTimeLabel(mayFirstUTC, '5m')).toBe('05/01 00:00');
+  });
+
+  it('keeps chart ticks in UTC for hourly ranges', () => {
+    expect(chartTickLabel(1777593600, '24h')).toBe('05/01 00时');
   });
 });
 

@@ -222,7 +222,7 @@ describe('http api client', () => {
     expect(series).toMatchObject({
       dataSource: 'interface_1m',
       bucket: '5m',
-      points: [expect.objectContaining({ ts: 1710000000, down: 125, up: 60, flowCount: 0 })],
+      points: [expect.objectContaining({ ts: 1710000000, down: 125, up: 60, flowCount: 0, label: '03/09 16:00' })],
     });
   });
 

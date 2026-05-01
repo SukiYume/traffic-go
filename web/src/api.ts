@@ -37,6 +37,7 @@ import {
   remoteSortParam,
   usageSortParam,
 } from './sort-keys';
+import { formatBucketTimeLabel } from './utils';
 
 type QueryValue = string | number | boolean | undefined | null;
 type ListQueryOptions<SortKey extends string> = {
@@ -413,13 +414,7 @@ async function requestJson<T>(path: string, decode: (raw: unknown) => T, options
 }
 
 function formatPointLabel(ts: number, bucket: BucketKey) {
-  const options: Intl.DateTimeFormatOptions =
-    bucket === '1d'
-      ? { month: '2-digit', day: '2-digit' }
-      : bucket === '1h' || bucket === '6h'
-        ? { month: '2-digit', day: '2-digit', hour: '2-digit' }
-        : { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' };
-  return new Intl.DateTimeFormat('zh-CN', options).format(ts * 1000);
+  return formatBucketTimeLabel(ts, bucket);
 }
 
 function decodeOverview(raw: unknown): OverviewStats {

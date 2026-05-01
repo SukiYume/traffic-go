@@ -1,6 +1,8 @@
 import type { BucketKey, DataSource, Direction, RangeKey } from './types';
 
 const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+const DATE_LOCALE = 'zh-CN';
+const DISPLAY_TIME_ZONE = 'UTC';
 type DataSourceMeta = {
   label: string;
   description: string;
@@ -67,16 +69,24 @@ export function formatBytes(value: number) {
 }
 
 export function formatNumber(value: number) {
-  return new Intl.NumberFormat('zh-CN').format(value);
+  return new Intl.NumberFormat(DATE_LOCALE).format(value);
+}
+
+function formatUtcTime(ts: number, options: Intl.DateTimeFormatOptions) {
+  return new Intl.DateTimeFormat(DATE_LOCALE, {
+    ...options,
+    timeZone: DISPLAY_TIME_ZONE,
+    hourCycle: options.hour ? 'h23' : undefined,
+  }).format(ts * 1000);
 }
 
 export function formatDateTime(ts: number) {
-  return new Intl.DateTimeFormat('zh-CN', {
+  return formatUtcTime(ts, {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
-  }).format(ts * 1000);
+  });
 }
 
 export function formatLongDateTime(ts: number) {
@@ -84,11 +94,20 @@ export function formatLongDateTime(ts: number) {
 }
 
 export function formatMonth(ts: number) {
-  return new Intl.DateTimeFormat('zh-CN', {
+  return formatUtcTime(ts, {
     year: 'numeric',
     month: '2-digit',
-    timeZone: 'UTC',
-  }).format(ts * 1000);
+  });
+}
+
+export function formatBucketTimeLabel(ts: number, bucket: BucketKey) {
+  const options: Intl.DateTimeFormatOptions =
+    bucket === '1d'
+      ? { month: '2-digit', day: '2-digit' }
+      : bucket === '1h' || bucket === '6h'
+        ? { month: '2-digit', day: '2-digit', hour: '2-digit' }
+        : { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' };
+  return formatUtcTime(ts, options);
 }
 
 export function rangeLabel(range: RangeKey) {
@@ -148,9 +167,9 @@ export function chartTickLabel(ts: number, range: RangeKey) {
       : range === '24h'
         ? { month: '2-digit', day: '2-digit', hour: '2-digit' }
         : range === '7d'
-          ? { month: '2-digit', day: '2-digit', hour: '2-digit' }
-          : { month: '2-digit', day: '2-digit' };
-  return new Intl.DateTimeFormat('zh-CN', options).format(ts * 1000);
+        ? { month: '2-digit', day: '2-digit', hour: '2-digit' }
+        : { month: '2-digit', day: '2-digit' };
+  return formatUtcTime(ts, options);
 }
 
 export function safeText(value?: string | null) {

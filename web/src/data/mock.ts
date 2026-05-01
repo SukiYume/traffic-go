@@ -1,4 +1,5 @@
 import type {
+  BucketKey,
   ForwardSortKey,
   ForwardUsageQuery,
   ForwardUsageResponse,
@@ -25,7 +26,7 @@ import type {
   UsageExplain,
 } from '../types';
 import { RANGE_TO_BUCKET } from '../ranges';
-import { executableName, isLoopbackIp } from '../utils';
+import { executableName, formatBucketTimeLabel, isLoopbackIp } from '../utils';
 
 const BASE_TS = 1_735_689_600;
 const MINUTE = 60;
@@ -156,7 +157,7 @@ function aggregateSeries(range: RangeKey, bucket: string): TimeSeriesPoint[] {
       up: (wave + 1) * 2_500_000 + index * 180_000,
       down: (wave + 2) * 4_000_000 + index * 210_000,
       flowCount: wave + 2,
-      label: new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(ts * 1000),
+      label: formatBucketTimeLabel(ts, bucket as BucketKey),
     };
   });
 }
