@@ -6,6 +6,7 @@ import type {
   ForwardSortKey,
   GroupBy,
   MonthlyUsageResponse,
+  NetworkTimeSeriesResponse,
   OverviewStats,
   ProcessGroupBy,
   ProcessSortKey,
@@ -91,6 +92,16 @@ type RawTimeseriesResponse = {
     bytes_up: number;
     bytes_down: number;
     flow_count: number;
+  }>;
+};
+
+type RawNetworkTimeseriesResponse = {
+  data_source: NetworkTimeSeriesResponse['dataSource'];
+  data: Array<{
+    bucket_ts: number;
+    interface: string;
+    rx_bytes: number;
+    tx_bytes: number;
   }>;
 };
 
@@ -498,6 +509,30 @@ function decodeTimeSeries(raw: unknown, bucket: BucketKey, groupBy: GroupBy): Ti
   };
 }
 
+function decodeNetworkTimeSeries(raw: unknown, bucket: BucketKey): NetworkTimeSeriesResponse {
+  const payload = raw as RawNetworkTimeseriesResponse;
+  const byBucket = new Map<number, { rx: number; tx: number }>();
+  for (const point of payload.data ?? []) {
+    const current = byBucket.get(point.bucket_ts) ?? { rx: 0, tx: 0 };
+    current.rx += point.rx_bytes;
+    current.tx += point.tx_bytes;
+    byBucket.set(point.bucket_ts, current);
+  }
+  return {
+    dataSource: payload.data_source,
+    bucket,
+    points: [...byBucket.entries()]
+      .sort((left, right) => left[0] - right[0])
+      .map(([ts, value]) => ({
+        ts,
+        up: value.tx,
+        down: value.rx,
+        flowCount: 0,
+        label: formatPointLabel(ts, bucket),
+      })),
+  };
+}
+
 function decodeUsage(raw: unknown): UsageResponse {
   const payload = raw as RawUsageResponse;
   return {
@@ -683,6 +718,14 @@ export function createHttpClient(): TrafficApiClient {
       return requestJson(
         withAppBase(`/api/v1/stats/timeseries${buildTimeSeriesQuery(range, bucket, groupBy, filters)}`),
         (raw) => decodeTimeSeries(raw, bucket, groupBy),
+        requestOptions,
+      );
+    },
+    getNetworkTimeSeries(range, requestOptions) {
+      const bucket = RANGE_TO_BUCKET[range];
+      return requestJson(
+        withAppBase(`/api/v1/stats/interfaces/timeseries${buildQuery([['range', range], ['bucket', bucket]])}`),
+        (raw) => decodeNetworkTimeSeries(raw, bucket),
         requestOptions,
       );
     },

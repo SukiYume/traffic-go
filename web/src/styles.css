@@ -506,6 +506,8 @@ button {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
   margin-bottom: 24px;
 }
 
@@ -524,6 +526,10 @@ button {
 
 .chart-panel {
   padding: 24px;
+}
+
+.chart-panel .segmented-control {
+  margin-left: auto;
 }
 
 .chart-panel h2 {

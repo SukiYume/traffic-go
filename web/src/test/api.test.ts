@@ -198,6 +198,34 @@ describe('http api client', () => {
     ]);
   });
 
+  it('fetches network interface timeseries as RX and TX points', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          data_source: 'interface_1m',
+          data: [
+            { bucket_ts: 1710000000, interface: 'eth0', rx_bytes: 100, tx_bytes: 50 },
+            { bucket_ts: 1710000000, interface: 'ens3', rx_bytes: 25, tx_bytes: 10 },
+          ],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    const series = await client.getNetworkTimeSeries('24h');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/stats/interfaces/timeseries?range=24h&bucket=5m',
+      expect.any(Object),
+    );
+    expect(series).toMatchObject({
+      dataSource: 'interface_1m',
+      bucket: '5m',
+      points: [expect.objectContaining({ ts: 1710000000, down: 125, up: 60, flowCount: 0 })],
+    });
+  });
+
   it('preserves null-only hourly dimensions in usage responses', async () => {
     vi.stubGlobal('fetch', fetchMock);
     fetchMock.mockResolvedValue(

@@ -29,6 +29,12 @@ const DATA_SOURCE_META: Record<DataSource, DataSourceMeta> = {
     autoNote: '当前页面正在读取日聚合历史。它不是一个手动筛选项，时间范围或维度变化后会自动切换。',
     minuteDimensionsUnavailable: true,
   },
+  interface_1m: {
+    label: '网卡分钟',
+    description: '按分钟累计的非 loopback 网卡 RX/TX 数据，用于和服务商网卡流量口径对齐。',
+    autoNote: '当前页面正在读取网卡分钟数据。它不是一个手动筛选项，Dashboard 会按趋势口径自动使用。',
+    minuteDimensionsUnavailable: false,
+  },
   usage_1m_forward: {
     label: '分钟转发明细',
     description: '逐分钟累计的 forward / NAT 明细。',

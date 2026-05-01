@@ -25,8 +25,8 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if len(cfg.ProcessLogDirs) != 0 {
 		t.Fatalf("expected no default process_log_dirs entries, got %v", cfg.ProcessLogDirs)
 	}
-	if cfg.ShadowsocksJournalFallback == nil || !*cfg.ShadowsocksJournalFallback {
-		t.Fatalf("expected shadowsocks_journal_fallback enabled by default, got %+v", cfg.ShadowsocksJournalFallback)
+	if cfg.ShadowsocksJournalFallback == nil || *cfg.ShadowsocksJournalFallback {
+		t.Fatalf("expected shadowsocks_journal_fallback disabled by default, got %+v", cfg.ShadowsocksJournalFallback)
 	}
 	if !cfg.Prefetch.Enabled {
 		t.Fatalf("expected prefetch enabled by default")
@@ -75,7 +75,7 @@ func TestLoadProcessLogDirsOverride(t *testing.T) {
 
 func TestLoadShadowsocksJournalFallbackOverride(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	content := []byte("shadowsocks_journal_fallback: false\n")
+	content := []byte("shadowsocks_journal_fallback: true\n")
 	if err := os.WriteFile(configPath, content, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -87,8 +87,8 @@ func TestLoadShadowsocksJournalFallbackOverride(t *testing.T) {
 	if cfg.ShadowsocksJournalFallback == nil {
 		t.Fatalf("expected shadowsocks_journal_fallback to be set")
 	}
-	if *cfg.ShadowsocksJournalFallback {
-		t.Fatalf("expected shadowsocks_journal_fallback override false, got true")
+	if !*cfg.ShadowsocksJournalFallback {
+		t.Fatalf("expected shadowsocks_journal_fallback override true, got false")
 	}
 }
 
@@ -111,6 +111,28 @@ func TestLoadProcessLogDirsNormalizesKeysAndDropsEmptyValues(t *testing.T) {
 	}
 	if len(cfg.ProcessLogDirs) != 1 {
 		t.Fatalf("expected only explicit non-empty process_log_dirs entries, got %v", cfg.ProcessLogDirs)
+	}
+}
+
+func TestLoadNetworkInterfacesNormalizesValues(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := []byte("network_interfaces:\n  - ' eth0 '\n  - ens3\n  - eth0\n  - '   '\n")
+	if err := os.WriteFile(configPath, content, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	expected := []string{"eth0", "ens3"}
+	if len(cfg.NetworkInterfaces) != len(expected) {
+		t.Fatalf("expected network interfaces %v, got %v", expected, cfg.NetworkInterfaces)
+	}
+	for index, value := range expected {
+		if cfg.NetworkInterfaces[index] != value {
+			t.Fatalf("expected network interface %q at %d, got %q", value, index, cfg.NetworkInterfaces[index])
+		}
 	}
 }
 

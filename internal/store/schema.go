@@ -74,6 +74,16 @@ CREATE INDEX IF NOT EXISTS idx_usage_1d_comm_day ON usage_1d (comm, day_ts);
 CREATE INDEX IF NOT EXISTS idx_usage_1d_remote_day ON usage_1d (remote_ip, day_ts);
 CREATE INDEX IF NOT EXISTS idx_usage_1d_direction_day ON usage_1d (direction, day_ts);
 
+CREATE TABLE IF NOT EXISTS interface_1m (
+    minute_ts INTEGER NOT NULL,
+    interface TEXT NOT NULL,
+    rx_bytes INTEGER NOT NULL,
+    tx_bytes INTEGER NOT NULL,
+    PRIMARY KEY (minute_ts, interface)
+);
+
+CREATE INDEX IF NOT EXISTS idx_interface_1m_minute ON interface_1m (minute_ts);
+
 CREATE TABLE IF NOT EXISTS usage_1m_forward (
     minute_ts INTEGER NOT NULL,
     proto TEXT NOT NULL,

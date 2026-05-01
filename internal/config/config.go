@@ -46,10 +46,11 @@ type Config struct {
 	SocketIndexInterval time.Duration     `yaml:"socket_index_interval"`
 	ProcFS              string            `yaml:"proc_fs"`
 	ConntrackPath       string            `yaml:"conntrack_path"`
+	NetworkInterfaces   []string          `yaml:"network_interfaces"`
 	ProcessLogDirs      map[string]string `yaml:"process_log_dirs"`
-	// Keep systemd journal fallback enabled by default for hosts where
-	// shadowsocks still logs only to journald. Set false once rsyslog or the
-	// service itself writes usable files under process_log_dirs.
+	// Keep systemd journal fallback disabled by default to avoid making
+	// persistent journald retention a hidden requirement. Set true only on
+	// hosts where shadowsocks still logs exclusively to journald.
 	ShadowsocksJournalFallback *bool     `yaml:"shadowsocks_journal_fallback"`
 	MockData                   bool      `yaml:"mock_data"`
 	Auth                       Auth      `yaml:"auth"`
@@ -58,7 +59,7 @@ type Config struct {
 }
 
 func Default() Config {
-	enableShadowsocksJournalFallback := true
+	enableShadowsocksJournalFallback := false
 	return Config{
 		Listen:                     defaultListen,
 		DBPath:                     defaultDBPath,
@@ -123,9 +124,10 @@ func Derive(cfg Config) Config {
 	if cfg.ConntrackPath == "" {
 		cfg.ConntrackPath = filepath.Join(cfg.ProcFS, "net", "nf_conntrack")
 	}
+	cfg.NetworkInterfaces = normalizeStringList(cfg.NetworkInterfaces)
 	cfg.ProcessLogDirs = normalizeProcessLogDirs(cfg.ProcessLogDirs)
 	if cfg.ShadowsocksJournalFallback == nil {
-		enableShadowsocksJournalFallback := true
+		enableShadowsocksJournalFallback := false
 		cfg.ShadowsocksJournalFallback = &enableShadowsocksJournalFallback
 	}
 	if cfg.Retention.Months <= 0 {
@@ -166,6 +168,29 @@ func normalizeProcessLogDirs(values map[string]string) map[string]string {
 			continue
 		}
 		result[normalizedKey] = normalizedValue
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func normalizeStringList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		normalized := strings.TrimSpace(value)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
 	}
 	if len(result) == 0 {
 		return nil

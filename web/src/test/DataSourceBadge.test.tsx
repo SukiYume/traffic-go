@@ -9,5 +9,11 @@ describe('DataSourceBadge', () => {
     expect(screen.getByText('小时聚合')).toBeInTheDocument();
     expect(screen.getByText('usage_1h_forward')).toBeInTheDocument();
   });
-});
 
+  it('labels interface minute data as network interface data', () => {
+    render(<DataSourceBadge dataSource="interface_1m" />);
+
+    expect(screen.getByText('网卡分钟')).toBeInTheDocument();
+    expect(screen.getByText('interface_1m')).toBeInTheDocument();
+  });
+});

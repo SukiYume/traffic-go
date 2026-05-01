@@ -9,18 +9,41 @@ import { StatCard } from '../components/StatCard';
 import { useApiClient } from '../api-context';
 import { buildRangedPath, useRangeSearchParam } from '../useRangeSearchParam';
 import { displayExecutableName, formatBytes, peerRoleLabel, rangeLabel, safeText } from '../utils';
+import type { TimeSeriesPoint } from '../types';
+
+type DashboardTrafficView = 'interface' | 'direction';
+
+function normalizeTrafficView(value: string | null): DashboardTrafficView {
+  return value === 'direction' ? 'direction' : 'interface';
+}
 
 export function DashboardPage() {
   const api = useApiClient();
-  const { range, setRange } = useRangeSearchParam();
+  const { params, setParams, range, setRange } = useRangeSearchParam();
+  const trafficView = normalizeTrafficView(params.get('traffic_view'));
+  const setTrafficView = (next: DashboardTrafficView) => {
+    const nextParams = new URLSearchParams(params);
+    if (next === 'interface') {
+      nextParams.delete('traffic_view');
+    } else {
+      nextParams.set('traffic_view', next);
+    }
+    setParams(nextParams, { replace: true });
+  };
 
   const overview = useQuery({
     queryKey: ['overview', range],
     queryFn: ({ signal }) => api.getOverview(range, { signal }),
   });
+  const networkSeries = useQuery({
+    queryKey: ['network-series', range],
+    queryFn: ({ signal }) => api.getNetworkTimeSeries(range, { signal }),
+    enabled: trafficView === 'interface',
+  });
   const series = useQuery({
     queryKey: ['series', range, 'direction'],
     queryFn: ({ signal }) => api.getTimeSeries(range, 'direction', undefined, { signal }),
+    enabled: trafficView === 'direction',
   });
   const topProcesses = useQuery({
     queryKey: ['top-processes', range, 'dashboard'],
@@ -39,14 +62,22 @@ export function DashboardPage() {
     queryFn: ({ signal }) => api.getTopPorts(range, { signal }),
   });
 
-  const cards = overview.data
-    ? [
-        { label: '总上行', value: overview.data.bytesUp, suffix: 'bytes' as const },
-        { label: '总下行', value: overview.data.bytesDown, suffix: 'bytes' as const },
-        { label: '活跃连接', value: overview.data.activeConnections, suffix: 'count' as const },
-        { label: '活跃进程', value: overview.data.activeProcesses, suffix: 'count' as const },
-      ]
-    : [];
+  const selectedTrafficTotals =
+    trafficView === 'interface' && networkSeries.data
+      ? summarizeTrafficPoints(networkSeries.data.points)
+      : trafficView === 'direction' && overview.data
+        ? { bytesUp: overview.data.bytesUp, bytesDown: overview.data.bytesDown }
+        : null;
+  const selectedTrafficDataSource = trafficView === 'interface' ? networkSeries.data?.dataSource : overview.data?.dataSource;
+  const cards =
+    overview.data && selectedTrafficTotals
+      ? [
+          { label: '总上行', value: selectedTrafficTotals.bytesUp, suffix: 'bytes' as const },
+          { label: '总下行', value: selectedTrafficTotals.bytesDown, suffix: 'bytes' as const },
+          { label: '活跃连接', value: overview.data.activeConnections, suffix: 'count' as const },
+          { label: '活跃进程', value: overview.data.activeProcesses, suffix: 'count' as const },
+        ]
+      : [];
 
   return (
     <div className="page">
@@ -62,7 +93,7 @@ export function DashboardPage() {
               <strong>时间范围</strong>
               <span>{rangeLabel(range)}</span>
             </div>
-            {overview.data ? <DataSourceBadge dataSource={overview.data.dataSource} /> : null}
+            {selectedTrafficDataSource ? <DataSourceBadge dataSource={selectedTrafficDataSource} /> : null}
           </section>
         </div>
         <RangeSelect value={range} onChange={setRange} />
@@ -70,6 +101,8 @@ export function DashboardPage() {
 
       {overview.isError ? (
         <QueryErrorState error={overview.error} title="总览加载失败" />
+      ) : trafficView === 'interface' && networkSeries.isError ? (
+        <QueryErrorState error={networkSeries.error} title="网卡口径加载失败" />
       ) : cards.length ? (
         <section className="stat-grid">
           {cards.map((card) => (
@@ -77,18 +110,31 @@ export function DashboardPage() {
           ))}
         </section>
       ) : (
-        <EmptyState title="总览加载中" description="正在获取总览统计。" />
+        <EmptyState title="总览加载中" description="正在获取当前口径的总览统计。" />
       )}
 
-      {series.isError ? (
-        <QueryErrorState error={series.error} title="趋势加载失败" />
-      ) : series.data ? (
+      {trafficView === 'interface' && networkSeries.isError ? null : trafficView === 'direction' && series.isError ? (
+        <QueryErrorState error={series.error} title="连接方向趋势加载失败" />
+      ) : trafficView === 'interface' && networkSeries.data ? (
+        <ChartPanel
+          points={networkSeries.data.points}
+          groupBy={undefined}
+          range={range}
+          title="网卡流量趋势"
+          subtitle="按公网网卡聚合：接收 RX / 发送 TX"
+          upLabel="发送 TX"
+          downLabel="接收 RX"
+          actions={<TrafficViewSelect value={trafficView} onChange={setTrafficView} />}
+        />
+      ) : trafficView === 'direction' && series.data ? (
         <ChartPanel
           points={series.data.points}
           groups={series.data.groups}
           groupBy={series.data.groupBy}
           range={range}
+          title="连接方向趋势"
           subtitle="按方向聚合：入站 / 出站总量"
+          actions={<TrafficViewSelect value={trafficView} onChange={setTrafficView} />}
         />
       ) : (
         <EmptyState title="趋势加载中" description="正在获取时间序列。" />
@@ -194,6 +240,45 @@ export function DashboardPage() {
           )}
         </section>
       </section>
+    </div>
+  );
+}
+
+function summarizeTrafficPoints(points: TimeSeriesPoint[]) {
+  return points.reduce(
+    (totals, point) => ({
+      bytesUp: totals.bytesUp + point.up,
+      bytesDown: totals.bytesDown + point.down,
+    }),
+    { bytesUp: 0, bytesDown: 0 },
+  );
+}
+
+function TrafficViewSelect({
+  value,
+  onChange,
+}: {
+  value: DashboardTrafficView;
+  onChange: (value: DashboardTrafficView) => void;
+}) {
+  const options: Array<{ value: DashboardTrafficView; label: string }> = [
+    { value: 'interface', label: '网卡口径' },
+    { value: 'direction', label: '连接方向' },
+  ];
+  return (
+    <div className="segmented-control" role="tablist" aria-label="流量趋势口径">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          role="tab"
+          aria-selected={value === option.value}
+          className={value === option.value ? 'chip active' : 'chip'}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
     </div>
   );
 }

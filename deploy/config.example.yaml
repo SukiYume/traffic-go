@@ -15,6 +15,13 @@ tick_interval: 2s
 # every PID/net namespace on each conntrack sample.
 socket_index_interval: 10s
 
+# Network interfaces included in Dashboard NIC RX/TX totals. To align with a
+# provider bandwidth graph, list only the public interface names shown by
+# `ip link` or `ifconfig`. Leave unset only when you intentionally want the
+# legacy behavior of collecting every up, non-loopback interface.
+network_interfaces:
+  - eth0
+
 # Optional HTTP Basic Auth for the bundled WebUI and API. Required if listen
 # is changed to a non-loopback address such as 0.0.0.0:18080.
 # auth:
@@ -37,10 +44,10 @@ process_log_dirs:
   frps: /root/frp_0630/*.log
   # rustdesk: /var/log/rustdesk
 
-# Keep this true on hosts where Shadowsocks only logs to systemd journal.
-# Set false once rsyslog or the service itself already writes usable files
-# under /var/log/shadowsocks, to avoid duplicate fallback scans.
-shadowsocks_journal_fallback: true
+# Disabled by default because most installs should read Shadowsocks evidence
+# from files under /var/log/shadowsocks. Set true only on hosts where
+# Shadowsocks still logs exclusively to systemd journal.
+shadowsocks_journal_fallback: false
 
 retention:
   months: 3

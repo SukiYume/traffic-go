@@ -263,6 +263,38 @@ func TestTimeseriesDimensionUnavailable(t *testing.T) {
 	}
 }
 
+func TestInterfaceTimeseriesEndpoint(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 5, 1, 10, 3, 0, 0, time.UTC)
+	if err := server.store.FlushInterfaceMinute(ctx, minute.Unix(), map[string]model.InterfaceUsageDelta{
+		"eth0": {RxBytes: 1024, TxBytes: 2048},
+	}); err != nil {
+		t.Fatalf("seed interface usage: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/stats/interfaces/timeseries?start=%d&end=%d&bucket=5m", minute.Unix(), minute.Add(time.Hour).Unix()), nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		DataSource string                           `json:"data_source"`
+		Data       []model.InterfaceTimeseriesPoint `json:"data"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode interface timeseries response: %v", err)
+	}
+	if body.DataSource != store.DataSourceInterfaceMinute {
+		t.Fatalf("unexpected data source: %s", body.DataSource)
+	}
+	if len(body.Data) != 1 || body.Data[0].Interface != "eth0" || body.Data[0].RxBytes != 1024 || body.Data[0].TxBytes != 2048 {
+		t.Fatalf("unexpected interface timeseries body: %+v", body)
+	}
+}
+
 func TestUsageRejectsInvalidPageParam(t *testing.T) {
 	server := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?range=24h&page=abc", nil)

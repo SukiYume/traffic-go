@@ -37,6 +37,15 @@ function pendingPromise<T>() {
   return new Promise<T>(() => {});
 }
 
+function expectStatValue(label: string, value: string) {
+  const labelElement = screen.getByText(label);
+  const card = labelElement.closest("section");
+  if (!card) {
+    throw new Error(`expected stat card for ${label}`);
+  }
+  expect(within(card).getByText(value)).toBeInTheDocument();
+}
+
 function createHourlyClient(): TrafficApiClient {
   const base = createMockApiClient();
   return {
@@ -70,8 +79,96 @@ describe("traffic-go web ui", () => {
   it("renders dashboard overview", async () => {
     renderWithProviders("/", <DashboardPage />);
     expect(await screen.findByText("流量总览")).toBeInTheDocument();
+    expect(await screen.findByText("网卡流量趋势")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "网卡口径" })).toHaveAttribute("aria-selected", "true");
     expect(await screen.findByText("总上行")).toBeInTheDocument();
     expect(await screen.findByText("Top 进程")).toBeInTheDocument();
+  });
+
+  it("defaults dashboard trend to network mode and switches to direction mode", async () => {
+    const base = createMockApiClient();
+    let networkCalls = 0;
+    let directionCalls = 0;
+    const client: TrafficApiClient = {
+      ...base,
+      async getNetworkTimeSeries(range, requestOptions) {
+        networkCalls += 1;
+        return base.getNetworkTimeSeries(range, requestOptions);
+      },
+      async getTimeSeries(range, groupBy, filters, requestOptions) {
+        directionCalls += 1;
+        return base.getTimeSeries(range, groupBy, filters, requestOptions);
+      },
+    };
+    const user = userEvent.setup();
+
+    renderWithProviders("/", <DashboardPage />, client);
+
+    expect(await screen.findByText("网卡流量趋势")).toBeInTheDocument();
+    await waitFor(() => expect(networkCalls).toBeGreaterThan(0));
+    expect(directionCalls).toBe(0);
+
+    await user.click(screen.getByRole("tab", { name: "连接方向" }));
+
+    expect(await screen.findByText("连接方向趋势")).toBeInTheDocument();
+    await waitFor(() => expect(directionCalls).toBeGreaterThan(0));
+  });
+
+  it("switches dashboard summary traffic totals with the selected traffic view", async () => {
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getOverview(range, requestOptions) {
+        const response = await base.getOverview(range, requestOptions);
+        return {
+          ...response,
+          bytesUp: 4096,
+          bytesDown: 6144,
+          activeConnections: 7,
+          activeProcesses: 3,
+        };
+      },
+      async getNetworkTimeSeries() {
+        return {
+          dataSource: "interface_1m",
+          bucket: "1m",
+          points: [
+            { ts: 1710000000, up: 8192, down: 16384, flowCount: 0, label: "12:00" },
+          ],
+        };
+      },
+    };
+    const user = userEvent.setup();
+
+    renderWithProviders("/", <DashboardPage />, client);
+
+    expect(await screen.findByText("网卡流量趋势")).toBeInTheDocument();
+    await waitFor(() => expectStatValue("总上行", "8.00 KB"));
+    expectStatValue("总下行", "16.0 KB");
+    expect(screen.getByText("interface_1m")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "连接方向" }));
+
+    expect(await screen.findByText("连接方向趋势")).toBeInTheDocument();
+    await waitFor(() => expectStatValue("总上行", "4.00 KB"));
+    expectStatValue("总下行", "6.00 KB");
+    expect(screen.getByText("usage_1m")).toBeInTheDocument();
+  });
+
+  it("shows a single dashboard error when network interface totals fail", async () => {
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getNetworkTimeSeries() {
+        throw new Error("interface stats unavailable");
+      },
+    };
+
+    renderWithProviders("/", <DashboardPage />, client);
+
+    expect(await screen.findByText("网卡口径加载失败")).toBeInTheDocument();
+    expect(screen.getByText("interface stats unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("网卡趋势加载失败")).not.toBeInTheDocument();
   });
 
   it("queries dashboard top processes by pid and shows pid/exe in minute windows", async () => {

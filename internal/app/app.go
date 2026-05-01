@@ -40,7 +40,7 @@ func New(cfg config.Config, logger *log.Logger) (*App, error) {
 	}
 
 	trafficCollector := collector.New(cfg, trafficStore, logger)
-	enableSSJournalFallback := true
+	enableSSJournalFallback := false
 	if cfg.ShadowsocksJournalFallback != nil {
 		enableSSJournalFallback = *cfg.ShadowsocksJournalFallback
 	}

@@ -159,6 +159,19 @@ type TimeseriesPoint struct {
 	DataSource string `json:"data_source"`
 }
 
+type InterfaceUsageDelta struct {
+	RxBytes int64
+	TxBytes int64
+}
+
+type InterfaceTimeseriesPoint struct {
+	BucketTS   int64  `json:"bucket_ts"`
+	Interface  string `json:"interface"`
+	RxBytes    int64  `json:"rx_bytes"`
+	TxBytes    int64  `json:"tx_bytes"`
+	DataSource string `json:"data_source"`
+}
+
 type TopEntry struct {
 	Key        string `json:"key"`
 	BytesUp    int64  `json:"bytes_up"`

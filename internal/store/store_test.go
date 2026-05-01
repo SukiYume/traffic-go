@@ -40,6 +40,38 @@ func TestSchemaCreatesLogEvidenceHostPortIndexes(t *testing.T) {
 	}
 }
 
+func TestFlushAndQueryInterfaceTimeseries(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	minute := time.Date(2026, 5, 1, 10, 3, 0, 0, time.UTC)
+	if err := store.FlushInterfaceMinute(ctx, minute.Unix(), map[string]model.InterfaceUsageDelta{
+		"eth0": {RxBytes: 1024, TxBytes: 2048},
+	}); err != nil {
+		t.Fatalf("flush interface minute: %v", err)
+	}
+	if err := store.FlushInterfaceMinute(ctx, minute.Add(time.Minute).Unix(), map[string]model.InterfaceUsageDelta{
+		"eth0": {RxBytes: 4096, TxBytes: 8192},
+		"ens3": {RxBytes: 512, TxBytes: 256},
+	}); err != nil {
+		t.Fatalf("flush second interface minute: %v", err)
+	}
+
+	points, err := store.QueryInterfaceTimeseries(ctx, minute, minute.Add(10*time.Minute), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("query interface timeseries: %v", err)
+	}
+	if len(points) != 2 {
+		t.Fatalf("expected two interface points, got %+v", points)
+	}
+	if points[0].Interface != "ens3" || points[0].RxBytes != 512 || points[0].TxBytes != 256 {
+		t.Fatalf("unexpected ens3 point: %+v", points[0])
+	}
+	if points[1].Interface != "eth0" || points[1].RxBytes != 5120 || points[1].TxBytes != 10240 {
+		t.Fatalf("unexpected eth0 point: %+v", points[1])
+	}
+}
+
 func TestResolveUsageSource(t *testing.T) {
 	store := newTestStore(t)
 	start := time.Unix(0, 0)

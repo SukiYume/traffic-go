@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { type ReactNode, useMemo } from 'react';
 import {
   CartesianGrid,
   Legend,
@@ -34,6 +34,9 @@ export function ChartPanel({
   range,
   title = '流量趋势',
   subtitle = '上行 / 下行',
+  upLabel = '上行',
+  downLabel = '下行',
+  actions,
 }: {
   points: TimeSeriesPoint[];
   groups?: TimeSeriesGroup[];
@@ -41,6 +44,9 @@ export function ChartPanel({
   range: RangeKey;
   title?: string;
   subtitle?: string;
+  upLabel?: string;
+  downLabel?: string;
+  actions?: ReactNode;
 }) {
   const showDirectionGroups = groupBy === 'direction' && groups.length > 0;
   const groupedData = useMemo(() => {
@@ -65,6 +71,7 @@ export function ChartPanel({
           <h2>{title}</h2>
           <span>{subtitle}</span>
         </div>
+        {actions}
       </div>
       <div className="chart-frame">
         <ResponsiveContainer width="100%" height={360}>
@@ -105,8 +112,8 @@ export function ChartPanel({
               ))
             ) : (
               <>
-                <Line type="monotone" dataKey="up" stroke="#6ee7b7" strokeWidth={2.5} dot={false} name="上行" />
-                <Line type="monotone" dataKey="down" stroke="#60a5fa" strokeWidth={2.5} dot={false} name="下行" />
+                <Line type="monotone" dataKey="down" stroke="#60a5fa" strokeWidth={2.5} dot={false} name={downLabel} />
+                <Line type="monotone" dataKey="up" stroke="#6ee7b7" strokeWidth={2.5} dot={false} name={upLabel} />
               </>
             )}
           </LineChart>

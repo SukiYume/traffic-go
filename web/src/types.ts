@@ -3,7 +3,14 @@ export type BucketKey = '1m' | '5m' | '1h' | '6h' | '1d';
 export type GroupBy = 'direction' | 'comm' | 'remote_ip';
 export type Direction = 'in' | 'out' | 'forward';
 export type Attribution = 'exact' | 'heuristic' | 'guess' | 'unknown';
-export type DataSource = 'usage_1m' | 'usage_1h' | 'usage_1d' | 'usage_1m_forward' | 'usage_1h_forward' | 'usage_1d_forward';
+export type DataSource =
+  | 'usage_1m'
+  | 'usage_1h'
+  | 'usage_1d'
+  | 'interface_1m'
+  | 'usage_1m_forward'
+  | 'usage_1h_forward'
+  | 'usage_1d_forward';
 export type SortOrder = 'asc' | 'desc';
 export type UsageSortKey = 'minuteTs' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount' | 'remoteIp' | 'direction' | 'localPort' | 'comm' | 'pid';
 export type ForwardSortKey = 'minuteTs' | 'bytesOrig' | 'bytesReply' | 'bytesTotal' | 'flowCount' | 'origSrc' | 'origDst';
@@ -62,6 +69,12 @@ export interface TimeSeriesResponse {
   groupBy: GroupBy;
   points: TimeSeriesPoint[];
   groups: TimeSeriesGroup[];
+}
+
+export interface NetworkTimeSeriesResponse {
+  dataSource: DataSource;
+  bucket: BucketKey;
+  points: TimeSeriesPoint[];
 }
 
 export interface TimeSeriesFilters {
@@ -284,6 +297,7 @@ export interface TrafficApiClient {
   getOverview(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<OverviewStats>;
   getMonthlyUsage(requestOptions?: ApiRequestOptions): Promise<MonthlyUsageResponse>;
   getTimeSeries(range: RangeKey, groupBy?: GroupBy, filters?: TimeSeriesFilters, requestOptions?: ApiRequestOptions): Promise<TimeSeriesResponse>;
+  getNetworkTimeSeries(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<NetworkTimeSeriesResponse>;
   getUsage(query: UsageQuery, requestOptions?: ApiRequestOptions): Promise<UsageResponse>;
   getUsageExplain(row: UsageRow, options?: { dataSource?: DataSource; allowScan?: boolean }, requestOptions?: ApiRequestOptions): Promise<UsageExplain>;
   getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean }, requestOptions?: ApiRequestOptions): Promise<ProcessSummaryResponse>;

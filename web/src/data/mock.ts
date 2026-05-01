@@ -733,6 +733,19 @@ export function createMockApiClient(): TrafficApiClient {
         groups,
       };
     },
+    async getNetworkTimeSeries(range) {
+      const points = aggregateSeries(range, RANGE_TO_BUCKET[range]).map((point, index) => ({
+        ...point,
+        up: Math.round(point.up * 0.86 + (index % 3) * 70_000),
+        down: Math.round(point.down * 0.92 + (index % 4) * 95_000),
+        flowCount: 0,
+      }));
+      return {
+        dataSource: 'interface_1m',
+        bucket: RANGE_TO_BUCKET[range],
+        points,
+      };
+    },
     async getUsage(query) {
       const rows = normalizeUsageRows(query.range, createFilteredUsage(query));
       const page = paginate(rows, query.page ?? 1, query.pageSize ?? 25);

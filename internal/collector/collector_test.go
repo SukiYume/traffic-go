@@ -42,6 +42,89 @@ func TestNewUsesNoopCollectorOutsideLinuxUnlessMockDataEnabled(t *testing.T) {
 	}
 }
 
+func TestReadInterfaceCountersParsesProcNetDev(t *testing.T) {
+	procFS := t.TempDir()
+	netDir := filepath.Join(procFS, "net")
+	if err := os.MkdirAll(netDir, 0o755); err != nil {
+		t.Fatalf("create proc net dir: %v", err)
+	}
+	content := `Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0
+  eth0: 12345 10 0 0 0 0 0 0 67890 20 0 0 0 0 0 0
+`
+	if err := os.WriteFile(filepath.Join(netDir, "dev"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write proc net dev: %v", err)
+	}
+
+	counters, err := ReadInterfaceCounters(procFS)
+	if err != nil {
+		t.Fatalf("read interface counters: %v", err)
+	}
+	if len(counters) != 2 {
+		t.Fatalf("expected two counters, got %+v", counters)
+	}
+	if counters[1].Name != "eth0" || counters[1].RxBytes != 12345 || counters[1].TxBytes != 67890 {
+		t.Fatalf("unexpected eth0 counter: %+v", counters[1])
+	}
+}
+
+func TestCollectInterfaceDeltasUsesConfiguredInterfaces(t *testing.T) {
+	procFS := t.TempDir()
+	writeProcNetDev(t, procFS, map[string][2]uint64{
+		"lo":   {100, 100},
+		"eth0": {1000, 2000},
+		"ens3": {3000, 4000},
+	})
+	cfg := config.Default()
+	cfg.ProcFS = procFS
+	cfg.NetworkInterfaces = []string{"eth0"}
+	service := &Service{cfg: cfg}
+
+	if err := service.collectInterfaceDeltas(); err != nil {
+		t.Fatalf("collect baseline interface deltas: %v", err)
+	}
+	writeProcNetDev(t, procFS, map[string][2]uint64{
+		"lo":   {900, 900},
+		"eth0": {1100, 2300},
+		"ens3": {9000, 9000},
+	})
+	if err := service.collectInterfaceDeltas(); err != nil {
+		t.Fatalf("collect interface deltas: %v", err)
+	}
+
+	if len(service.interfaceBuckets) != 1 {
+		t.Fatalf("expected only configured interface bucket, got %+v", service.interfaceBuckets)
+	}
+	delta := service.interfaceBuckets["eth0"]
+	if delta.RxBytes != 100 || delta.TxBytes != 300 {
+		t.Fatalf("unexpected eth0 delta: %+v", delta)
+	}
+	if _, exists := service.interfaceBuckets["ens3"]; exists {
+		t.Fatalf("unexpected ens3 bucket: %+v", service.interfaceBuckets)
+	}
+	if _, exists := service.interfaceBuckets["lo"]; exists {
+		t.Fatalf("unexpected loopback bucket: %+v", service.interfaceBuckets)
+	}
+}
+
+func writeProcNetDev(t *testing.T, procFS string, counters map[string][2]uint64) {
+	t.Helper()
+	netDir := filepath.Join(procFS, "net")
+	if err := os.MkdirAll(netDir, 0o755); err != nil {
+		t.Fatalf("create proc net dir: %v", err)
+	}
+	var builder strings.Builder
+	builder.WriteString("Inter-|   Receive                                                |  Transmit\n")
+	builder.WriteString(" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n")
+	for name, values := range counters {
+		builder.WriteString(fmt.Sprintf(" %s: %d 1 0 0 0 0 0 0 %d 1 0 0 0 0 0 0\n", name, values[0], values[1]))
+	}
+	if err := os.WriteFile(filepath.Join(netDir, "dev"), []byte(builder.String()), 0o644); err != nil {
+		t.Fatalf("write proc net dev: %v", err)
+	}
+}
+
 func TestParseConntrackLine(t *testing.T) {
 	line := "ipv4 2 tcp 6 431999 ESTABLISHED src=10.0.0.2 dst=1.1.1.1 sport=51544 dport=443 packets=10 bytes=1024 src=1.1.1.1 dst=10.0.0.2 sport=443 dport=51544 packets=8 bytes=4096 [ASSURED] mark=0 use=1 id=12345"
 	flow, ok, err := parseConntrackLine(line)

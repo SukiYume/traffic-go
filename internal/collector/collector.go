@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,26 +25,28 @@ type Runner interface {
 }
 
 type Service struct {
-	cfg             config.Config
-	store           *store.Store
-	logger          *log.Logger
-	resolver        *processResolver
-	currentMinute   time.Time
-	buckets         map[model.UsageKey]*bucketState
-	forwardBuckets  map[model.ForwardUsageKey]*bucketState
-	usageFlowOwner  map[string]model.UsageKey
-	fwdFlowOwner    map[string]model.ForwardUsageKey
-	runtimeMu       sync.RWMutex
-	snapshots       map[string]model.FlowSnapshot
-	snapshotReady   bool
-	processHints    map[string]processHint
-	localIPs        map[string]struct{}
-	lastIPRefresh   time.Time
-	socketIndex     socketIndex
-	lastSockRefresh time.Time
-	socketReady     bool
-	warnedNoAcct    bool
-	lastTickMetrics tickMetrics
+	cfg               config.Config
+	store             *store.Store
+	logger            *log.Logger
+	resolver          *processResolver
+	currentMinute     time.Time
+	buckets           map[model.UsageKey]*bucketState
+	forwardBuckets    map[model.ForwardUsageKey]*bucketState
+	interfaceBuckets  map[string]model.InterfaceUsageDelta
+	usageFlowOwner    map[string]model.UsageKey
+	fwdFlowOwner      map[string]model.ForwardUsageKey
+	runtimeMu         sync.RWMutex
+	snapshots         map[string]model.FlowSnapshot
+	snapshotReady     bool
+	processHints      map[string]processHint
+	localIPs          map[string]struct{}
+	lastIPRefresh     time.Time
+	interfaceCounters map[string]interfaceCounter
+	socketIndex       socketIndex
+	lastSockRefresh   time.Time
+	socketReady       bool
+	warnedNoAcct      bool
+	lastTickMetrics   tickMetrics
 }
 
 type bucketState struct {
@@ -96,16 +99,17 @@ func New(cfg config.Config, trafficStore *store.Store, logger *log.Logger) Runne
 	}
 
 	return &Service{
-		cfg:            cfg,
-		store:          trafficStore,
-		logger:         logger,
-		resolver:       newProcessResolver(cfg.ProcFS),
-		buckets:        make(map[model.UsageKey]*bucketState),
-		forwardBuckets: make(map[model.ForwardUsageKey]*bucketState),
-		usageFlowOwner: make(map[string]model.UsageKey),
-		fwdFlowOwner:   make(map[string]model.ForwardUsageKey),
-		snapshots:      make(map[string]model.FlowSnapshot),
-		processHints:   make(map[string]processHint),
+		cfg:              cfg,
+		store:            trafficStore,
+		logger:           logger,
+		resolver:         newProcessResolver(cfg.ProcFS),
+		buckets:          make(map[model.UsageKey]*bucketState),
+		forwardBuckets:   make(map[model.ForwardUsageKey]*bucketState),
+		interfaceBuckets: make(map[string]model.InterfaceUsageDelta),
+		usageFlowOwner:   make(map[string]model.UsageKey),
+		fwdFlowOwner:     make(map[string]model.ForwardUsageKey),
+		snapshots:        make(map[string]model.FlowSnapshot),
+		processHints:     make(map[string]processHint),
 	}
 }
 
@@ -171,6 +175,9 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 			return err
 		}
 		s.currentMinute = minute
+	}
+	if err := s.collectInterfaceDeltas(); err != nil {
+		s.logger.Printf("collect interface counters: %v", err)
 	}
 
 	if now.Sub(s.lastIPRefreshTime()) >= 30*time.Second || s.localIPCount() == 0 {
@@ -267,6 +274,80 @@ func (s *Service) recordTickMetrics(metrics tickMetrics) {
 	s.runtimeMu.Lock()
 	defer s.runtimeMu.Unlock()
 	s.lastTickMetrics = metrics
+}
+
+func (s *Service) collectInterfaceDeltas() error {
+	counters, err := ReadInterfaceCounters(s.cfg.ProcFS)
+	if err != nil {
+		return err
+	}
+	eligible := s.eligibleInterfaces()
+	if s.interfaceCounters == nil {
+		s.interfaceCounters = make(map[string]interfaceCounter, len(counters))
+	}
+	if s.interfaceBuckets == nil {
+		s.interfaceBuckets = make(map[string]model.InterfaceUsageDelta)
+	}
+	for _, counter := range counters {
+		if !isEligibleInterface(counter.Name, eligible) {
+			continue
+		}
+		if previous, ok := s.interfaceCounters[counter.Name]; ok {
+			delta := model.InterfaceUsageDelta{
+				RxBytes: int64(clampDelta(counter.RxBytes, previous.RxBytes)),
+				TxBytes: int64(clampDelta(counter.TxBytes, previous.TxBytes)),
+			}
+			if delta.RxBytes != 0 || delta.TxBytes != 0 {
+				current := s.interfaceBuckets[counter.Name]
+				current.RxBytes += delta.RxBytes
+				current.TxBytes += delta.TxBytes
+				s.interfaceBuckets[counter.Name] = current
+			}
+		}
+		s.interfaceCounters[counter.Name] = counter
+	}
+	return nil
+}
+
+func eligibleInterfaces() map[string]struct{} {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	result := make(map[string]struct{}, len(interfaces))
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		result[iface.Name] = struct{}{}
+	}
+	return result
+}
+
+func (s *Service) eligibleInterfaces() map[string]struct{} {
+	if len(s.cfg.NetworkInterfaces) == 0 {
+		return eligibleInterfaces()
+	}
+	result := make(map[string]struct{}, len(s.cfg.NetworkInterfaces))
+	for _, name := range s.cfg.NetworkInterfaces {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		result[name] = struct{}{}
+	}
+	return result
+}
+
+func isEligibleInterface(name string, eligible map[string]struct{}) bool {
+	if name == "" || name == "lo" {
+		return false
+	}
+	if eligible == nil {
+		return true
+	}
+	_, ok := eligible[name]
+	return ok
 }
 
 func (s *Service) socketIndexSnapshot(now time.Time) (socketIndex, error) {
@@ -681,7 +762,7 @@ func (s *Service) addForwardUsage(flowID string, classified classifiedFlow, delt
 func (s *Service) flushCurrentBuckets(ctx context.Context) error {
 	s.ensureFlowOwners()
 
-	if len(s.buckets) == 0 && len(s.forwardBuckets) == 0 {
+	if len(s.buckets) == 0 && len(s.forwardBuckets) == 0 && len(s.interfaceBuckets) == 0 {
 		s.usageFlowOwner = make(map[string]model.UsageKey)
 		s.fwdFlowOwner = make(map[string]model.ForwardUsageKey)
 		return nil
@@ -718,8 +799,12 @@ func (s *Service) flushCurrentBuckets(ctx context.Context) error {
 	if err := s.store.FlushMinute(ctx, s.currentMinute.Unix(), usage, forward); err != nil {
 		return err
 	}
+	if err := s.store.FlushInterfaceMinute(ctx, s.currentMinute.Unix(), s.interfaceBuckets); err != nil {
+		return err
+	}
 	s.buckets = make(map[model.UsageKey]*bucketState)
 	s.forwardBuckets = make(map[model.ForwardUsageKey]*bucketState)
+	s.interfaceBuckets = make(map[string]model.InterfaceUsageDelta)
 	s.usageFlowOwner = make(map[string]model.UsageKey)
 	s.fwdFlowOwner = make(map[string]model.ForwardUsageKey)
 	return nil

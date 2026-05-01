@@ -324,6 +324,39 @@ WHERE %[1]s >= ? AND %[1]s < ?
 	return points, rows.Err()
 }
 
+func (s *Store) QueryInterfaceTimeseries(ctx context.Context, start, end time.Time, bucket time.Duration) ([]model.InterfaceTimeseriesPoint, error) {
+	bucketSeconds := int64(bucket / time.Second)
+	if bucketSeconds <= 0 {
+		bucketSeconds = 60
+	}
+	db := s.queryDB()
+	rows, err := db.QueryContext(ctx, `
+SELECT ((minute_ts / ?) * ?) AS bucket_ts,
+       interface,
+       COALESCE(SUM(rx_bytes), 0),
+       COALESCE(SUM(tx_bytes), 0)
+FROM interface_1m
+WHERE minute_ts >= ? AND minute_ts < ?
+GROUP BY bucket_ts, interface
+ORDER BY bucket_ts ASC, interface ASC
+`, bucketSeconds, bucketSeconds, start.Unix(), end.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("query interface timeseries: %w", err)
+	}
+	defer rows.Close()
+
+	points := make([]model.InterfaceTimeseriesPoint, 0)
+	for rows.Next() {
+		var point model.InterfaceTimeseriesPoint
+		point.DataSource = DataSourceInterfaceMinute
+		if err := rows.Scan(&point.BucketTS, &point.Interface, &point.RxBytes, &point.TxBytes); err != nil {
+			return nil, fmt.Errorf("scan interface timeseries: %w", err)
+		}
+		points = append(points, point)
+	}
+	return points, rows.Err()
+}
+
 func usageOrderClause(source string, sortBy string, sortOrder string, timeCol string) string {
 	order := normalizeSortOrder(sortOrder)
 	switch sortBy {

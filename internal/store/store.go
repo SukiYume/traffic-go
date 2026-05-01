@@ -24,6 +24,8 @@ const (
 	DataSourceHour   = "usage_1h"
 	DataSourceDay    = "usage_1d"
 
+	DataSourceInterfaceMinute = "interface_1m"
+
 	DataSourceMinuteForward = "usage_1m_forward"
 	DataSourceHourForward   = "usage_1h_forward"
 	DataSourceDayForward    = "usage_1d_forward"
@@ -206,6 +208,7 @@ func (s *Store) Diagnostics(ctx context.Context) (model.StoreDiagnostics, error)
 		DataSourceDayForward,
 		DataSourceMinuteChain,
 		DataSourceHourChain,
+		DataSourceInterfaceMinute,
 		"usage_monthly",
 		"log_evidence",
 		"dirty_chain_hours",
@@ -366,6 +369,44 @@ DO UPDATE SET
 		return err
 	}
 	s.invalidateCaches()
+	return nil
+}
+
+func (s *Store) FlushInterfaceMinute(ctx context.Context, minuteTS int64, interfaces map[string]model.InterfaceUsageDelta) error {
+	if len(interfaces) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin flush interface minute: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO interface_1m (
+    minute_ts, interface, rx_bytes, tx_bytes
+) VALUES (?, ?, ?, ?)
+ON CONFLICT(minute_ts, interface)
+DO UPDATE SET
+    rx_bytes = interface_1m.rx_bytes + excluded.rx_bytes,
+    tx_bytes = interface_1m.tx_bytes + excluded.tx_bytes`)
+	if err != nil {
+		return fmt.Errorf("prepare interface minute flush: %w", err)
+	}
+	defer stmt.Close()
+
+	for name, delta := range interfaces {
+		name = strings.TrimSpace(name)
+		if name == "" || (delta.RxBytes == 0 && delta.TxBytes == 0) {
+			continue
+		}
+		if _, err := stmt.ExecContext(ctx, minuteTS, name, delta.RxBytes, delta.TxBytes); err != nil {
+			return fmt.Errorf("flush interface minute usage: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -559,6 +600,7 @@ func (s *Store) Cleanup(ctx context.Context) error {
 		{`DELETE FROM usage_1m WHERE minute_ts < ?`, cutoff},
 		{`DELETE FROM usage_1h WHERE hour_ts < ?`, cutoff},
 		{`DELETE FROM usage_1d WHERE day_ts < ?`, cutoff},
+		{`DELETE FROM interface_1m WHERE minute_ts < ?`, cutoff},
 		{`DELETE FROM usage_1m_forward WHERE minute_ts < ?`, cutoff},
 		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, cutoff},
 		{`DELETE FROM usage_1d_forward WHERE day_ts < ?`, cutoff},

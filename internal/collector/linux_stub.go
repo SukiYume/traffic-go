@@ -66,6 +66,14 @@ func (m *mockCollector) Start(ctx context.Context) error {
 		if err := m.store.FlushMinute(ctx, now.Unix(), usage, nil); err != nil {
 			m.logger.Printf("mock flush failed: %v", err)
 		}
+		if err := m.store.FlushInterfaceMinute(ctx, now.Unix(), map[string]model.InterfaceUsageDelta{
+			"eth0": {
+				RxBytes: 640 * 1024,
+				TxBytes: 192 * 1024,
+			},
+		}); err != nil {
+			m.logger.Printf("mock interface flush failed: %v", err)
+		}
 
 		select {
 		case <-ctx.Done():
