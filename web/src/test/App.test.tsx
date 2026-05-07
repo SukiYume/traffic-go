@@ -477,6 +477,7 @@ describe("traffic-go web ui", () => {
 
     renderWithProviders("/usage", <UsagePage />, client);
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
+    expect(usageCalls.some((call) => call.includeTotal === true)).toBe(true);
 
     await user.click(await screen.findByRole("button", { name: "下一页" }));
     await waitFor(() => {

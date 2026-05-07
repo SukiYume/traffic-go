@@ -38,8 +38,6 @@ const (
 var ErrDimensionUnavailable = errors.New("dimension_unavailable")
 var ErrCursorSortUnsupported = errors.New("cursor pagination only supports time-desc sort")
 
-const hourlyQueryMinWindow = 24 * time.Hour
-const dailyQueryMinWindow = 14 * 24 * time.Hour
 const storeShortCacheTTL = 30 * time.Second
 
 type Store struct {
@@ -1186,18 +1184,9 @@ func (s *Store) ResolveUsageSource(start, end time.Time, requiresMinute bool) (s
 		if requiresMinute {
 			return "", ErrDimensionUnavailable
 		}
-		if start.UTC().Before(hourRetentionStartUTC(now, s.retention)) || end.Sub(start) > dailyQueryMinWindow {
+		if start.UTC().Before(hourRetentionStartUTC(now, s.retention)) {
 			return DataSourceDay, nil
 		}
-		return DataSourceHour, nil
-	}
-	if requiresMinute {
-		return DataSourceMinute, nil
-	}
-	if end.Sub(start) > dailyQueryMinWindow {
-		return DataSourceDay, nil
-	}
-	if end.Sub(start) > hourlyQueryMinWindow {
 		return DataSourceHour, nil
 	}
 	return DataSourceMinute, nil

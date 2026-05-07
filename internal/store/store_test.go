@@ -1037,7 +1037,7 @@ func TestQueryTimeseriesUsesTimeColumnForBucketing(t *testing.T) {
 	}
 }
 
-func TestResolveUsageSourceUsesHourlyForLongWindowWithinRetention(t *testing.T) {
+func TestResolveUsageSourceUsesRetainedDetailBeforeDailyFallback(t *testing.T) {
 	cfg := config.Default()
 	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
 	store, err := Open(cfg)
@@ -1056,8 +1056,8 @@ func TestResolveUsageSourceUsesHourlyForLongWindowWithinRetention(t *testing.T) 
 	if err != nil {
 		t.Fatalf("resolve source: %v", err)
 	}
-	if source != DataSourceDay {
-		t.Fatalf("expected very long retained window to use day source, got %s", source)
+	if source != DataSourceHour {
+		t.Fatalf("expected long window inside hourly retention to use hour source, got %s", source)
 	}
 
 	_, err = store.ResolveUsageSource(start, end, true)
@@ -1065,13 +1065,13 @@ func TestResolveUsageSourceUsesHourlyForLongWindowWithinRetention(t *testing.T) 
 		t.Fatalf("expected minute-required long window outside 7d retention to fail, got %v", err)
 	}
 
-	shortStart := now.Add(-24 * time.Hour)
-	source, err = store.ResolveUsageSource(shortStart, now, false)
+	fullMinuteStart := now.Add(-7 * 24 * time.Hour).Truncate(time.Minute)
+	source, err = store.ResolveUsageSource(fullMinuteStart, now, false)
 	if err != nil {
-		t.Fatalf("resolve short source: %v", err)
+		t.Fatalf("resolve minute retention source: %v", err)
 	}
 	if source != DataSourceMinute {
-		t.Fatalf("expected 24h window to keep minute source, got %s", source)
+		t.Fatalf("expected full retained minute window to keep minute source, got %s", source)
 	}
 }
 

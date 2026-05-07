@@ -55,10 +55,18 @@ func (s stubRuntime) Diagnostics() model.CollectorDiagnostics {
 }
 
 func newTestServer(t *testing.T) *Server {
+	return newTestServerWithConfig(t, func(cfg *config.Config) {
+		cfg.Retention.MinuteDays = 90
+	})
+}
+
+func newTestServerWithConfig(t *testing.T, configure func(*config.Config)) *Server {
 	t.Helper()
 	cfg := config.Default()
-	cfg.Retention.MinuteDays = 90
 	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
+	if configure != nil {
+		configure(&cfg)
+	}
 	trafficStore, err := store.Open(cfg)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -562,11 +570,11 @@ func TestUsageFiltersByRemotePort(t *testing.T) {
 	}
 }
 
-func TestUsageLongWindowUsesHourlySourceWithoutMinuteOnlyFilters(t *testing.T) {
-	server := newTestServer(t)
+func TestUsageWindowOutsideMinuteRetentionUsesHourlySourceWithoutMinuteOnlyFilters(t *testing.T) {
+	server := newTestServerWithConfig(t, nil)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Hour)
-	minute := now.Add(-2 * time.Hour).Add(30 * time.Minute)
+	minute := now.Add(-8 * 24 * time.Hour).Add(30 * time.Minute)
 
 	if err := server.store.FlushMinute(ctx, minute.Unix(), map[model.UsageKey]model.UsageDelta{
 		{
@@ -594,8 +602,8 @@ func TestUsageLongWindowUsesHourlySourceWithoutMinuteOnlyFilters(t *testing.T) {
 		t.Fatalf("aggregate hour: %v", err)
 	}
 
-	start := url.QueryEscape(now.Add(-7 * 24 * time.Hour).Format(time.RFC3339))
-	end := url.QueryEscape(now.Format(time.RFC3339))
+	start := url.QueryEscape(minute.Truncate(time.Hour).Format(time.RFC3339))
+	end := url.QueryEscape(minute.Truncate(time.Hour).Add(time.Hour).Format(time.RFC3339))
 	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/usage?start=%s&end=%s&page=1&page_size=10", start, end), nil)
 	rec := httptest.NewRecorder()
 
@@ -607,7 +615,7 @@ func TestUsageLongWindowUsesHourlySourceWithoutMinuteOnlyFilters(t *testing.T) {
 	body, _ := io.ReadAll(rec.Body)
 	bodyText := string(body)
 	if !strings.Contains(bodyText, `"data_source":"usage_1h"`) {
-		t.Fatalf("expected long usage window to use hourly source: %s", bodyText)
+		t.Fatalf("expected retained hourly usage window to use hourly source: %s", bodyText)
 	}
 	if !strings.Contains(bodyText, `"pid":null`) || !strings.Contains(bodyText, `"remote_port":null`) {
 		t.Fatalf("expected hourly usage row to omit minute-only dimensions: %s", bodyText)
