@@ -25,6 +25,8 @@ const (
 	DataSourceDay    = "usage_1d"
 
 	DataSourceInterfaceMinute = "interface_1m"
+	DataSourceInterfaceHour   = "interface_1h"
+	DataSourceInterfaceDay    = "interface_1d"
 
 	DataSourceMinuteForward = "usage_1m_forward"
 	DataSourceHourForward   = "usage_1h_forward"
@@ -58,11 +60,39 @@ type cachedProcessList struct {
 	expiresAt time.Time
 }
 
-func effectiveRetentionMonths(retention config.Retention) int {
-	if retention.Months <= 0 {
+func effectiveMinuteRetentionDays(retention config.Retention) int {
+	if retention.MinuteDays <= 0 {
+		return 7
+	}
+	return retention.MinuteDays
+}
+
+func effectiveHourRetentionMonths(retention config.Retention) int {
+	if retention.HourMonths <= 0 {
 		return 3
 	}
-	return retention.Months
+	return retention.HourMonths
+}
+
+func effectiveDayRetentionMonths(retention config.Retention) int {
+	if retention.DayMonths <= 0 {
+		return 12
+	}
+	return retention.DayMonths
+}
+
+func effectiveEvidenceRetentionDays(retention config.Retention) int {
+	if retention.EvidenceDays <= 0 {
+		return 14
+	}
+	return retention.EvidenceDays
+}
+
+func effectiveChainRetentionDays(retention config.Retention) int {
+	if retention.ChainDays <= 0 {
+		return 14
+	}
+	return retention.ChainDays
 }
 
 func monthStartUTC(value time.Time) time.Time {
@@ -70,8 +100,40 @@ func monthStartUTC(value time.Time) time.Time {
 	return time.Date(year, month, 1, 0, 0, 0, 0, time.UTC)
 }
 
-func retentionStartUTC(now time.Time, retention config.Retention) time.Time {
-	return monthStartUTC(now).AddDate(0, -(effectiveRetentionMonths(retention) - 1), 0)
+func minuteRetentionStartUTC(now time.Time, retention config.Retention) time.Time {
+	return now.UTC().AddDate(0, 0, -effectiveMinuteRetentionDays(retention)).Truncate(time.Minute)
+}
+
+func hourRetentionStartUTC(now time.Time, retention config.Retention) time.Time {
+	return monthStartUTC(now).AddDate(0, -(effectiveHourRetentionMonths(retention) - 1), 0)
+}
+
+func dayRetentionStartUTC(now time.Time, retention config.Retention) time.Time {
+	return monthStartUTC(now).AddDate(0, -(effectiveDayRetentionMonths(retention) - 1), 0)
+}
+
+func evidenceRetentionStartUTC(now time.Time, retention config.Retention) time.Time {
+	return now.UTC().AddDate(0, 0, -effectiveEvidenceRetentionDays(retention)).Truncate(time.Minute)
+}
+
+func chainRetentionStartUTC(now time.Time, retention config.Retention) time.Time {
+	return now.UTC().AddDate(0, 0, -effectiveChainRetentionDays(retention)).Truncate(time.Minute)
+}
+
+func ceilHourUTC(value time.Time) time.Time {
+	truncated := value.UTC().Truncate(time.Hour)
+	if value.UTC().Equal(truncated) {
+		return truncated
+	}
+	return truncated.Add(time.Hour)
+}
+
+func monthlyMinuteBoundaryUTC(now time.Time, retention config.Retention) time.Time {
+	return ceilHourUTC(minuteRetentionStartUTC(now, retention))
+}
+
+func monthlyChainBoundaryUTC(now time.Time, retention config.Retention) time.Time {
+	return ceilHourUTC(chainRetentionStartUTC(now, retention))
 }
 
 func Open(cfg config.Config) (*Store, error) {
@@ -137,6 +199,7 @@ func sqliteDSN(path string, queryOnly bool) string {
 	values.Add("_pragma", "busy_timeout=5000")
 	values.Add("_pragma", "journal_mode(WAL)")
 	values.Add("_pragma", "synchronous(NORMAL)")
+	values.Add("_pragma", "journal_size_limit(67108864)")
 	if queryOnly {
 		values.Add("_pragma", "query_only(1)")
 	}
@@ -155,6 +218,25 @@ func (s *Store) queryDB() *sql.DB {
 		return nil
 	}
 	return s.db
+}
+
+func (s *Store) invalidateMonthlyCache() {
+	if s == nil {
+		return
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.monthlyCache = nil
+	s.monthlyCacheUntil = time.Time{}
+}
+
+func (s *Store) invalidateProcessCache() {
+	if s == nil {
+		return
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.processCache = nil
 }
 
 func (s *Store) invalidateCaches() {
@@ -209,7 +291,11 @@ func (s *Store) Diagnostics(ctx context.Context) (model.StoreDiagnostics, error)
 		DataSourceMinuteChain,
 		DataSourceHourChain,
 		DataSourceInterfaceMinute,
+		DataSourceInterfaceHour,
+		DataSourceInterfaceDay,
 		"usage_monthly",
+		"monthly_retained_counts",
+		"known_processes",
 		"log_evidence",
 		"dirty_chain_hours",
 	}
@@ -264,6 +350,89 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	if err := s.backfillKnownProcesses(ctx); err != nil {
+		return err
+	}
+	if err := s.backfillInterfaceAggregates(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) backfillInterfaceAggregates(ctx context.Context) error {
+	var existing int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM interface_1h`).Scan(&existing); err != nil {
+		return fmt.Errorf("count interface 1h: %w", err)
+	}
+	if existing > 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO interface_1h (
+    hour_ts, interface, rx_bytes, tx_bytes
+)
+SELECT (minute_ts / 3600) * 3600 AS hour_ts,
+       interface,
+       SUM(rx_bytes),
+       SUM(tx_bytes)
+FROM interface_1m
+GROUP BY hour_ts, interface
+HAVING 1
+ON CONFLICT(hour_ts, interface) DO UPDATE SET
+    rx_bytes = excluded.rx_bytes,
+    tx_bytes = excluded.tx_bytes
+`); err != nil {
+		return fmt.Errorf("backfill interface hourly aggregates: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO interface_1d (
+    day_ts, interface, rx_bytes, tx_bytes
+)
+SELECT (hour_ts / 86400) * 86400 AS day_ts,
+       interface,
+       SUM(rx_bytes),
+       SUM(tx_bytes)
+FROM interface_1h
+GROUP BY day_ts, interface
+HAVING 1
+ON CONFLICT(day_ts, interface) DO UPDATE SET
+    rx_bytes = excluded.rx_bytes,
+    tx_bytes = excluded.tx_bytes
+`); err != nil {
+		return fmt.Errorf("backfill interface daily aggregates: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) backfillKnownProcesses(ctx context.Context) error {
+	var existing int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM known_processes`).Scan(&existing); err != nil {
+		return fmt.Errorf("count known processes: %w", err)
+	}
+	if existing > 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO known_processes (pid, comm, exe, seen_ts)
+SELECT pid, comm, exe, MAX(minute_ts) AS seen_ts
+FROM usage_1m
+WHERE pid > 0 OR comm <> '' OR exe <> ''
+GROUP BY pid, comm, exe
+`); err != nil {
+		return fmt.Errorf("backfill known processes from minute usage: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO known_processes (pid, comm, exe, seen_ts)
+SELECT 0, comm, '', MAX(hour_ts) AS seen_ts
+FROM usage_1h
+WHERE comm <> ''
+GROUP BY comm
+HAVING 1
+ON CONFLICT(pid, comm, exe) DO UPDATE SET
+    seen_ts = MAX(known_processes.seen_ts, excluded.seen_ts)
+`); err != nil {
+		return fmt.Errorf("backfill known processes from hourly usage: %w", err)
+	}
 	return nil
 }
 
@@ -297,6 +466,16 @@ DO UPDATE SET
 		}
 		defer stmt.Close()
 
+		processStmt, err := tx.PrepareContext(ctx, `
+INSERT INTO known_processes (pid, comm, exe, seen_ts)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(pid, comm, exe) DO UPDATE SET
+    seen_ts = MAX(known_processes.seen_ts, excluded.seen_ts)`)
+		if err != nil {
+			return fmt.Errorf("prepare known process upsert: %w", err)
+		}
+		defer processStmt.Close()
+
 		for key, delta := range usage {
 			if key.MinuteTS == 0 {
 				key.MinuteTS = minuteTS
@@ -320,6 +499,11 @@ DO UPDATE SET
 				delta.FlowCount,
 			); err != nil {
 				return fmt.Errorf("flush minute usage: %w", err)
+			}
+			if key.PID > 0 || strings.TrimSpace(key.Comm) != "" || strings.TrimSpace(key.Exe) != "" {
+				if _, err := processStmt.ExecContext(ctx, key.PID, key.Comm, key.Exe, key.MinuteTS); err != nil {
+					return fmt.Errorf("upsert known process: %w", err)
+				}
 			}
 		}
 	}
@@ -368,7 +552,7 @@ DO UPDATE SET
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.invalidateCaches()
+	s.invalidateProcessCache()
 	return nil
 }
 
@@ -525,6 +709,21 @@ ON CONFLICT(hour_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO
 	}
 
 	if _, err := tx.ExecContext(ctx, `
+INSERT INTO interface_1h (
+    hour_ts, interface, rx_bytes, tx_bytes
+)
+SELECT ?, interface, SUM(rx_bytes), SUM(tx_bytes)
+FROM interface_1m
+WHERE minute_ts >= ? AND minute_ts < ?
+GROUP BY interface
+ON CONFLICT(hour_ts, interface) DO UPDATE SET
+    rx_bytes = excluded.rx_bytes,
+    tx_bytes = excluded.tx_bytes
+`, hourTS, hourTS, nextHourTS); err != nil {
+		return fmt.Errorf("aggregate interface_1h: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO usage_1d (
     day_ts, proto, direction, comm, local_port, remote_ip,
     bytes_up, bytes_down, pkts_up, pkts_down, flow_count
@@ -564,6 +763,21 @@ ON CONFLICT(day_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO 
 		return fmt.Errorf("aggregate usage_1d_forward: %w", err)
 	}
 
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO interface_1d (
+    day_ts, interface, rx_bytes, tx_bytes
+)
+SELECT ?, interface, SUM(rx_bytes), SUM(tx_bytes)
+FROM interface_1h
+WHERE hour_ts >= ? AND hour_ts < ?
+GROUP BY interface
+ON CONFLICT(day_ts, interface) DO UPDATE SET
+    rx_bytes = excluded.rx_bytes,
+    tx_bytes = excluded.tx_bytes
+`, dayTS, dayTS, nextDayTS); err != nil {
+		return fmt.Errorf("aggregate interface_1d: %w", err)
+	}
+
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dirty_chain_hours WHERE hour_ts = ?`, hourTS); err != nil {
 		return fmt.Errorf("clear dirty chain hour: %w", err)
 	}
@@ -571,14 +785,18 @@ ON CONFLICT(day_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO 
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.invalidateCaches()
 	return nil
 }
 
 func (s *Store) Cleanup(ctx context.Context) error {
 	now := s.now().UTC()
-	cutoff := retentionStartUTC(now, s.retention).Unix()
+	minuteCutoff := minuteRetentionStartUTC(now, s.retention).Unix()
+	hourCutoff := hourRetentionStartUTC(now, s.retention).Unix()
+	dayCutoff := dayRetentionStartUTC(now, s.retention).Unix()
+	evidenceCutoff := evidenceRetentionStartUTC(now, s.retention).Unix()
+	chainCutoff := chainRetentionStartUTC(now, s.retention).Unix()
 	closedMonthCutoff := monthStartUTC(now).Unix()
+	summaryCutoff := minInt64(maxInt64(minuteCutoff, hourCutoff, dayCutoff, evidenceCutoff, chainCutoff), closedMonthCutoff)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -589,7 +807,10 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	if err := s.summarizeClosedMonths(ctx, tx, closedMonthCutoff, now); err != nil {
 		return err
 	}
-	if err := s.summarizeCleanupMonthsIfMissing(ctx, tx, cutoff, now); err != nil {
+	if err := s.retainExpiringMonthlyCounts(ctx, tx, now, evidenceCutoff, chainCutoff); err != nil {
+		return err
+	}
+	if err := s.summarizeCleanupMonthsIfMissing(ctx, tx, summaryCutoff, now); err != nil {
 		return err
 	}
 
@@ -597,17 +818,20 @@ func (s *Store) Cleanup(ctx context.Context) error {
 		query string
 		arg   int64
 	}{
-		{`DELETE FROM usage_1m WHERE minute_ts < ?`, cutoff},
-		{`DELETE FROM usage_1h WHERE hour_ts < ?`, cutoff},
-		{`DELETE FROM usage_1d WHERE day_ts < ?`, cutoff},
-		{`DELETE FROM interface_1m WHERE minute_ts < ?`, cutoff},
-		{`DELETE FROM usage_1m_forward WHERE minute_ts < ?`, cutoff},
-		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, cutoff},
-		{`DELETE FROM usage_1d_forward WHERE day_ts < ?`, cutoff},
-		{`DELETE FROM usage_chain_1m WHERE minute_ts < ?`, cutoff},
-		{`DELETE FROM usage_chain_1h WHERE hour_ts < ?`, cutoff},
-		{`DELETE FROM log_evidence WHERE event_ts < ?`, cutoff},
-		{`DELETE FROM dirty_chain_hours WHERE hour_ts < ?`, cutoff},
+		{`DELETE FROM usage_1m WHERE minute_ts < ?`, minuteCutoff},
+		{`DELETE FROM interface_1m WHERE minute_ts < ?`, minuteCutoff},
+		{`DELETE FROM interface_1h WHERE hour_ts < ?`, hourCutoff},
+		{`DELETE FROM interface_1d WHERE day_ts < ?`, dayCutoff},
+		{`DELETE FROM usage_1m_forward WHERE minute_ts < ?`, minuteCutoff},
+		{`DELETE FROM usage_1h WHERE hour_ts < ?`, hourCutoff},
+		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, hourCutoff},
+		{`DELETE FROM usage_1d WHERE day_ts < ?`, dayCutoff},
+		{`DELETE FROM usage_1d_forward WHERE day_ts < ?`, dayCutoff},
+		{`DELETE FROM usage_chain_1m WHERE minute_ts < ?`, chainCutoff},
+		{`DELETE FROM usage_chain_1h WHERE hour_ts < ?`, chainCutoff},
+		{`DELETE FROM log_evidence WHERE event_ts < ?`, evidenceCutoff},
+		{`DELETE FROM dirty_chain_hours WHERE hour_ts < ?`, chainCutoff},
+		{`DELETE FROM monthly_retained_counts WHERE month_ts < ?`, closedMonthCutoff},
 	}
 
 	for _, stmt := range statements {
@@ -619,12 +843,139 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.invalidateCaches()
+	s.invalidateMonthlyCache()
 	return nil
 }
 
+func (s *Store) retainExpiringMonthlyCounts(ctx context.Context, tx *sql.Tx, now time.Time, evidenceCutoff int64, chainCutoff int64) error {
+	currentMonth := monthStartUTC(now).Unix()
+	updatedAt := now.UTC().Unix()
+	if evidenceCutoff > currentMonth {
+		if err := s.retainExpiringEvidenceCounts(ctx, tx, currentMonth, evidenceCutoff, updatedAt); err != nil {
+			return err
+		}
+	}
+	if chainCutoff > currentMonth {
+		if err := s.retainExpiringChainCounts(ctx, tx, currentMonth, chainCutoff, updatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) retainExpiringEvidenceCounts(ctx context.Context, tx *sql.Tx, currentMonth int64, cutoff int64, updatedAt int64) error {
+	eventMonth := monthExpr("event_ts")
+	query := fmt.Sprintf(`
+WITH candidates AS (
+    SELECT %[1]s AS month_ts, COUNT(*) AS evidence_count
+    FROM log_evidence
+    LEFT JOIN monthly_retained_counts retained
+        ON retained.month_ts = %[1]s
+    WHERE event_ts >= ?
+      AND event_ts < ?
+      AND event_ts >= COALESCE(NULLIF(retained.evidence_until, 0), %[1]s)
+    GROUP BY month_ts
+)
+INSERT INTO monthly_retained_counts (
+    month_ts, evidence_count, chain_count, evidence_until, chain_until, updated_at
+)
+SELECT month_ts, evidence_count, 0, ?, 0, ?
+FROM candidates
+WHERE 1
+ON CONFLICT(month_ts) DO UPDATE SET
+    evidence_count = monthly_retained_counts.evidence_count + excluded.evidence_count,
+    evidence_until = MAX(monthly_retained_counts.evidence_until, excluded.evidence_until),
+    updated_at = excluded.updated_at
+`, eventMonth)
+	if _, err := tx.ExecContext(ctx, query, currentMonth, cutoff, cutoff, updatedAt); err != nil {
+		return fmt.Errorf("retain expiring monthly evidence counts: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) retainExpiringChainCounts(ctx context.Context, tx *sql.Tx, currentMonth int64, cutoff int64, updatedAt int64) error {
+	hourMonth := monthExpr("hour_ts")
+	minuteMonth := monthExpr("minute_ts")
+	query := fmt.Sprintf(`
+WITH retained_window AS (
+    SELECT ? AS current_month, ? AS cutoff
+),
+hour_counts AS (
+    SELECT %[1]s AS month_ts, COUNT(*) AS chain_count
+    FROM usage_chain_1h
+    LEFT JOIN monthly_retained_counts retained
+        ON retained.month_ts = %[1]s
+    JOIN retained_window
+    WHERE hour_ts >= current_month
+      AND hour_ts < cutoff
+      AND hour_ts >= COALESCE(NULLIF(retained.chain_until, 0), %[1]s)
+    GROUP BY month_ts
+),
+minute_fallback_counts AS (
+    SELECT %[2]s AS month_ts, COUNT(*) AS chain_count
+    FROM usage_chain_1m
+    LEFT JOIN monthly_retained_counts retained
+        ON retained.month_ts = %[2]s
+    JOIN retained_window
+    WHERE minute_ts >= current_month
+      AND minute_ts < cutoff
+      AND minute_ts >= COALESCE(NULLIF(retained.chain_until, 0), %[2]s)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM usage_chain_1h h
+          WHERE h.hour_ts = (usage_chain_1m.minute_ts / 3600) * 3600
+          LIMIT 1
+      )
+    GROUP BY month_ts
+),
+candidates AS (
+    SELECT month_ts, SUM(chain_count) AS chain_count
+    FROM (
+        SELECT month_ts, chain_count FROM hour_counts
+        UNION ALL
+        SELECT month_ts, chain_count FROM minute_fallback_counts
+    )
+    GROUP BY month_ts
+)
+INSERT INTO monthly_retained_counts (
+    month_ts, evidence_count, chain_count, evidence_until, chain_until, updated_at
+)
+SELECT month_ts, 0, chain_count, 0, ?, ?
+FROM candidates
+WHERE 1
+ON CONFLICT(month_ts) DO UPDATE SET
+    chain_count = monthly_retained_counts.chain_count + excluded.chain_count,
+    chain_until = MAX(monthly_retained_counts.chain_until, excluded.chain_until),
+    updated_at = excluded.updated_at
+`, hourMonth, minuteMonth)
+	if _, err := tx.ExecContext(ctx, query, currentMonth, cutoff, cutoff, updatedAt); err != nil {
+		return fmt.Errorf("retain expiring monthly chain counts: %w", err)
+	}
+	return nil
+}
+
+func maxInt64(values ...int64) int64 {
+	var max int64
+	for index, value := range values {
+		if index == 0 || value > max {
+			max = value
+		}
+	}
+	return max
+}
+
+func minInt64(values ...int64) int64 {
+	var min int64
+	for index, value := range values {
+		if index == 0 || value < min {
+			min = value
+		}
+	}
+	return min
+}
+
 func (s *Store) summarizeCleanupMonthsIfMissing(ctx context.Context, tx *sql.Tx, cutoff int64, now time.Time) error {
-	missingMonths, err := s.missingCleanupSummaryMonths(ctx, tx, cutoff)
+	missingMonths, err := s.missingCleanupSummaryMonths(ctx, tx, cutoff, now)
 	if err != nil {
 		return err
 	}
@@ -635,7 +986,7 @@ func (s *Store) summarizeCleanupMonthsIfMissing(ctx context.Context, tx *sql.Tx,
 	if err := s.summarizeClosedMonths(ctx, tx, cutoff, now); err != nil {
 		return fmt.Errorf("summarize missing cleanup months: %w", err)
 	}
-	missingMonths, err = s.missingCleanupSummaryMonths(ctx, tx, cutoff)
+	missingMonths, err = s.missingCleanupSummaryMonths(ctx, tx, cutoff, now)
 	if err != nil {
 		return err
 	}
@@ -649,14 +1000,15 @@ func (s *Store) summarizeCleanupMonthsIfMissing(ctx context.Context, tx *sql.Tx,
 	return nil
 }
 
-func (s *Store) missingCleanupSummaryMonths(ctx context.Context, tx *sql.Tx, cutoff int64) ([]int64, error) {
-	query := monthlyDetailAggregateCTE(monthlyDetailBeforeExclusive) + `
+func (s *Store) missingCleanupSummaryMonths(ctx context.Context, tx *sql.Tx, cutoff int64, now time.Time) ([]int64, error) {
+	cte, args := monthlyDetailAggregateCTE(s.monthlyArchiveWindow(cutoff, now))
+	query := cte + `
 SELECT month_ts
 FROM monthly_detail
 WHERE month_ts NOT IN (SELECT month_ts FROM usage_monthly)
 ORDER BY month_ts ASC
 `
-	rows, err := tx.QueryContext(ctx, query, monthlyDetailAggregateArgs(cutoff)...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("verify monthly summaries before cleanup: %w", err)
 	}
@@ -678,8 +1030,9 @@ ORDER BY month_ts ASC
 
 func (s *Store) summarizeClosedMonths(ctx context.Context, tx *sql.Tx, before int64, now time.Time) error {
 	updatedAt := now.UTC().Unix()
-	query := monthlyDetailAggregateCTE(monthlyDetailBeforeExclusive) + `
-INSERT OR REPLACE INTO usage_monthly (
+	cte, args := monthlyDetailAggregateCTE(s.monthlyArchiveWindow(before, now))
+	query := cte + `
+INSERT OR IGNORE INTO usage_monthly (
     month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
     forward_flow_count, evidence_count, chain_count, updated_at
 )
@@ -687,12 +1040,23 @@ SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_b
        forward_flow_count, evidence_count, chain_count, ?
 FROM monthly_detail
 `
-	args := append(monthlyDetailAggregateArgs(before), updatedAt)
+	args = append(args, updatedAt)
 	_, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("summarize closed months: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) monthlyArchiveWindow(before int64, now time.Time) monthlyAggregateWindow {
+	return monthlyAggregateWindow{
+		start:          0,
+		upper:          &before,
+		hourBoundary:   hourRetentionStartUTC(now, s.retention).Unix(),
+		minuteBoundary: monthlyMinuteBoundaryUTC(now, s.retention).Unix(),
+		evidenceStart:  0,
+		chainBoundary:  monthlyChainBoundaryUTC(now, s.retention).Unix(),
+	}
 }
 
 func (s *Store) LastAggregatedHour(ctx context.Context) (time.Time, bool, error) {
@@ -734,8 +1098,12 @@ FROM (
     SELECT (minute_ts / 3600) * 3600 AS hour_ts
     FROM usage_1m_forward
     WHERE minute_ts >= ? AND minute_ts < ?
+    UNION
+    SELECT (minute_ts / 3600) * 3600 AS hour_ts
+    FROM interface_1m
+    WHERE minute_ts >= ? AND minute_ts < ?
 )
-`, minMinute, before.UTC().Truncate(time.Hour).Unix(), minMinute, before.UTC().Truncate(time.Hour).Unix())
+`, minMinute, before.UTC().Truncate(time.Hour).Unix(), minMinute, before.UTC().Truncate(time.Hour).Unix(), minMinute, before.UTC().Truncate(time.Hour).Unix())
 
 	var value sql.NullInt64
 	if err := row.Scan(&value); err != nil {
@@ -795,6 +1163,13 @@ func (s *Store) Vacuum(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) CheckpointWAL(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("wal checkpoint truncate: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) Optimize(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `PRAGMA optimize`); err != nil {
 		return fmt.Errorf("optimize: %w", err)
@@ -806,9 +1181,13 @@ func (s *Store) ResolveUsageSource(start, end time.Time, requiresMinute bool) (s
 	if end.Before(start) {
 		return "", fmt.Errorf("end before start")
 	}
-	if start.UTC().Before(retentionStartUTC(s.now(), s.retention)) {
+	now := s.now()
+	if start.UTC().Before(minuteRetentionStartUTC(now, s.retention)) {
 		if requiresMinute {
 			return "", ErrDimensionUnavailable
+		}
+		if start.UTC().Before(hourRetentionStartUTC(now, s.retention)) || end.Sub(start) > dailyQueryMinWindow {
+			return DataSourceDay, nil
 		}
 		return DataSourceHour, nil
 	}
@@ -835,6 +1214,10 @@ func ForwardDataSource(source string) string {
 	}
 }
 
+func InterfaceDataSource(source string) string {
+	return interfaceSourceInfo(source).DataLabel
+}
+
 func (s *Store) QueryKnownProcesses(ctx context.Context, limit int) ([]model.ProcessListItem, error) {
 	resolvedLimit := clampPageSize(limit)
 	now := s.now().UTC()
@@ -848,30 +1231,8 @@ func (s *Store) QueryKnownProcesses(ctx context.Context, limit int) ([]model.Pro
 
 	db := s.queryDB()
 	rows, err := db.QueryContext(ctx, `
-WITH minute_processes AS (
-    SELECT pid, comm, exe, MAX(minute_ts) AS seen_ts
-    FROM usage_1m
-    WHERE pid > 0 OR comm <> '' OR exe <> ''
-    GROUP BY pid, comm, exe
-),
-hour_processes AS (
-    SELECT 0 AS pid, comm, '' AS exe, MAX(hour_ts) AS seen_ts
-    FROM usage_1h
-    WHERE comm <> ''
-    GROUP BY comm
-),
-combined AS (
-    SELECT pid, comm, exe, seen_ts FROM minute_processes
-    UNION ALL
-    SELECT pid, comm, exe, seen_ts FROM hour_processes
-),
-deduped AS (
-    SELECT pid, comm, exe, MAX(seen_ts) AS seen_ts
-    FROM combined
-    GROUP BY pid, comm, exe
-)
 SELECT pid, comm, exe
-FROM deduped
+FROM known_processes
 ORDER BY seen_ts DESC, comm COLLATE NOCASE ASC, pid DESC
 LIMIT ?
 `, resolvedLimit)

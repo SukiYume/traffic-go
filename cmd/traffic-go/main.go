@@ -21,7 +21,11 @@ func main() {
 
 func run() error {
 	var configPath string
+	var maintenanceOnce bool
+	var vacuum bool
 	flag.StringVar(&configPath, "config", "", "path to config file")
+	flag.BoolVar(&maintenanceOnce, "maintenance-once", false, "run aggregation, cleanup, optimize, WAL checkpoint, and exit")
+	flag.BoolVar(&vacuum, "vacuum", false, "allow VACUUM during maintenance-once")
 	flag.Parse()
 
 	cfg, err := config.Load(configPath)
@@ -38,6 +42,10 @@ func run() error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	if maintenanceOnce {
+		return application.RunMaintenanceOnce(ctx, vacuum)
+	}
 
 	if err := application.Run(ctx); err != nil {
 		return err

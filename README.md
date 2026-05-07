@@ -50,7 +50,7 @@ flowchart LR
 
 SQLite 中的运行表按粒度划分。`interface_1m` 保存网卡 RX/TX 分钟数据。`usage_1m` 保存普通入站和出站分钟明细。`usage_1m_forward` 保存转发分钟明细。`usage_1h`、`usage_1h_forward`、`usage_1d` 和 `usage_1d_forward` 保存聚合数据。`usage_monthly` 保存已结束自然月的摘要。`log_evidence` 保存日志证据缓存。`usage_chain_1m` 和 `usage_chain_1h` 保存物化后的归因链路。
 
-默认保留当前 UTC 自然月和前两个月的完整明细。过期月份清理前会先写入月度摘要，然后删除分钟、小时、链路和日志证据明细。历史页面继续展示月总量、转发总量、证据数和链路数。超出完整明细窗口的查询会使用聚合表，聚合表保留的维度少于分钟表。PID、EXE 和部分端口级过滤在这些数据源上不可用。
+默认保留 7 天分钟明细、3 个 UTC 自然月小时聚合、12 个 UTC 自然月日聚合。`log_evidence` 和 `usage_chain_*` 默认各保留 14 天。已结束自然月会写入 `usage_monthly`，所以 History 页面继续展示月总量、转发总量、证据数和链路数。超出分钟窗口的查询会使用小时或日聚合表，聚合表保留的维度少于分钟表。PID、EXE、远端端口和归因精度过滤在这些数据源上不可用。
 
 ## 运行要求
 
@@ -162,16 +162,20 @@ process_log_dirs:
 shadowsocks_journal_fallback: false
 
 retention:
-  months: 3
+  minute_days: 7
+  hour_months: 3
+  day_months: 12
+  evidence_days: 14
+  chain_days: 14
 
 prefetch:
   enabled: true
-  interval: 1m
+  interval: 5m
   evidence_lookback: 20m
   chain_lookback: 20m
-  scan_budget: 8s
-  max_scan_files: 6
-  max_scan_lines_per_file: 250000
+  scan_budget: 2s
+  max_scan_files: 3
+  max_scan_lines_per_file: 80000
 ```
 
 | 字段 | 含义 |
@@ -188,7 +192,11 @@ prefetch:
 | `auth.password` | Basic Auth 密码 |
 | `process_log_dirs` | 进程日志目录或 glob 文件模式 |
 | `shadowsocks_journal_fallback` | Shadowsocks 文件日志未命中时读取 systemd journal |
-| `retention.months` | 完整明细保留的 UTC 自然月数量 |
+| `retention.minute_days` | 分钟明细保留天数，默认 7 天 |
+| `retention.hour_months` | 小时聚合保留的 UTC 自然月数量，默认 3 个月 |
+| `retention.day_months` | 日聚合保留的 UTC 自然月数量，默认 12 个月 |
+| `retention.evidence_days` | 日志证据缓存保留天数，默认 14 天 |
+| `retention.chain_days` | 归因链路物化表保留天数，默认 14 天 |
 | `prefetch.enabled` | 启用后台日志预热和链路预物化 |
 | `prefetch.interval` | 后台预热周期 |
 | `prefetch.evidence_lookback` | 每轮日志预热的回看窗口 |
@@ -202,6 +210,8 @@ prefetch:
 `process_log_dirs` 的 key 使用进程名或可执行文件 basename，大小写不敏感。value 可以是目录，也可以是 glob 文件模式。多个进程可以指向同一个目录。Shadowsocks 常见组合可以把 `ss-server`、`ss-manager` 和 `obfs-server` 都指向 `/var/log/shadowsocks`。FRPS 可以指向 `/var/log/frps` 或具体的 `*.log` 模式。
 
 `shadowsocks_journal_fallback` 默认关闭。大多数安装应读取 `/var/log/shadowsocks` 下的文件日志。只有 Shadowsocks 仍然只写 systemd journal 的主机才需要打开它。
+
+后台维护任务每小时执行清理、`PRAGMA optimize` 和 `wal_checkpoint(TRUNCATE)`；允许 vacuum 的维护轮次最多每 7 天执行一次 `VACUUM`。
 
 ## 反向代理和日志归因
 

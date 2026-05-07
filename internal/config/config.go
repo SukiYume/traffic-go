@@ -21,7 +21,11 @@ const (
 )
 
 type Retention struct {
-	Months int `yaml:"months"`
+	MinuteDays   int `yaml:"minute_days"`
+	HourMonths   int `yaml:"hour_months"`
+	DayMonths    int `yaml:"day_months"`
+	EvidenceDays int `yaml:"evidence_days"`
+	ChainDays    int `yaml:"chain_days"`
 }
 
 type Prefetch struct {
@@ -68,16 +72,20 @@ func Default() Config {
 		ProcFS:                     defaultProcFS,
 		ShadowsocksJournalFallback: &enableShadowsocksJournalFallback,
 		Retention: Retention{
-			Months: 3,
+			MinuteDays:   7,
+			HourMonths:   3,
+			DayMonths:    12,
+			EvidenceDays: 14,
+			ChainDays:    14,
 		},
 		Prefetch: Prefetch{
 			Enabled:             true,
-			Interval:            time.Minute,
+			Interval:            5 * time.Minute,
 			EvidenceLookback:    20 * time.Minute,
 			ChainLookback:       20 * time.Minute,
-			ScanBudget:          8 * time.Second,
-			MaxScanFiles:        6,
-			MaxScanLinesPerFile: 250000,
+			ScanBudget:          2 * time.Second,
+			MaxScanFiles:        3,
+			MaxScanLinesPerFile: 80000,
 		},
 	}
 }
@@ -130,11 +138,23 @@ func Derive(cfg Config) Config {
 		enableShadowsocksJournalFallback := false
 		cfg.ShadowsocksJournalFallback = &enableShadowsocksJournalFallback
 	}
-	if cfg.Retention.Months <= 0 {
-		cfg.Retention.Months = 3
+	if cfg.Retention.MinuteDays <= 0 {
+		cfg.Retention.MinuteDays = 7
+	}
+	if cfg.Retention.HourMonths <= 0 {
+		cfg.Retention.HourMonths = 3
+	}
+	if cfg.Retention.DayMonths <= 0 {
+		cfg.Retention.DayMonths = 12
+	}
+	if cfg.Retention.EvidenceDays <= 0 {
+		cfg.Retention.EvidenceDays = 14
+	}
+	if cfg.Retention.ChainDays <= 0 {
+		cfg.Retention.ChainDays = 14
 	}
 	if cfg.Prefetch.Interval <= 0 {
-		cfg.Prefetch.Interval = time.Minute
+		cfg.Prefetch.Interval = 5 * time.Minute
 	}
 	if cfg.Prefetch.EvidenceLookback <= 0 {
 		cfg.Prefetch.EvidenceLookback = 20 * time.Minute
@@ -143,13 +163,13 @@ func Derive(cfg Config) Config {
 		cfg.Prefetch.ChainLookback = 20 * time.Minute
 	}
 	if cfg.Prefetch.ScanBudget <= 0 {
-		cfg.Prefetch.ScanBudget = 8 * time.Second
+		cfg.Prefetch.ScanBudget = 2 * time.Second
 	}
 	if cfg.Prefetch.MaxScanFiles <= 0 {
-		cfg.Prefetch.MaxScanFiles = 6
+		cfg.Prefetch.MaxScanFiles = 3
 	}
 	if cfg.Prefetch.MaxScanLinesPerFile <= 0 {
-		cfg.Prefetch.MaxScanLinesPerFile = 250000
+		cfg.Prefetch.MaxScanLinesPerFile = 80000
 	}
 	cfg.Auth.Username = strings.TrimSpace(cfg.Auth.Username)
 	cfg.Auth.Password = strings.TrimSpace(cfg.Auth.Password)
@@ -209,6 +229,16 @@ func (c Config) Validate() error {
 		return errors.New("tick_interval must be positive")
 	case c.SocketIndexInterval <= 0:
 		return errors.New("socket_index_interval must be positive")
+	case c.Retention.MinuteDays <= 0:
+		return errors.New("retention.minute_days must be positive")
+	case c.Retention.HourMonths <= 0:
+		return errors.New("retention.hour_months must be positive")
+	case c.Retention.DayMonths <= 0:
+		return errors.New("retention.day_months must be positive")
+	case c.Retention.EvidenceDays <= 0:
+		return errors.New("retention.evidence_days must be positive")
+	case c.Retention.ChainDays <= 0:
+		return errors.New("retention.chain_days must be positive")
 	case authConfigured && (c.Auth.Username == "" || c.Auth.Password == ""):
 		return errors.New("auth.username and auth.password must both be set when auth is configured")
 	case !authConfigured && !isLoopbackListenAddress(c.Listen):

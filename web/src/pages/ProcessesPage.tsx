@@ -12,7 +12,7 @@ import { normalizeProcessSortKey } from '../sort-keys';
 import type { ProcessSummaryRow } from '../types';
 import { useRangeSearchParam } from '../useRangeSearchParam';
 import { useResettingPage } from '../useResettingPage';
-import { formatBytes, rangeLabel, safeText } from '../utils';
+import { formatBytes, minuteDimensionsUnavailable, rangeLabel, safeText } from '../utils';
 
 const pageSize = 25;
 const columnHelper = createColumnHelper<ProcessSummaryRow>();
@@ -97,8 +97,8 @@ export function ProcessesPage() {
 
   const activeDataSource = pidQuery.data?.dataSource ?? commQuery.data?.dataSource;
   const pidDimensionUnavailable =
-    pidQuery.data?.dataSource === 'usage_1h' ||
-    commQuery.data?.dataSource === 'usage_1h';
+    minuteDimensionsUnavailable(pidQuery.data?.dataSource ?? null) ||
+    minuteDimensionsUnavailable(commQuery.data?.dataSource ?? null);
 
   const pidRows = pidDimensionUnavailable ? [] : (pidQuery.data?.rows ?? []);
   const commRows = commQuery.data?.rows ?? [];
@@ -357,7 +357,7 @@ export function ProcessesPage() {
           subtitle={
             selected?.section === 'pid'
               ? `按 PID 聚合 · PID ${selectedProcess.pid ?? '未知'} · 入站 / 出站总量`
-              : activeDataSource === 'usage_1h'
+              : minuteDimensionsUnavailable(activeDataSource ?? null)
                 ? '当前窗口已降级为按进程名聚合 · 入站 / 出站总量'
                 : '按进程名聚合 · 入站 / 出站总量'
           }

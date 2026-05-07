@@ -21,6 +21,7 @@ import {
   executableName,
   formatBytes,
   formatDateTime,
+  formatMonth,
   formatNumber,
   formatUrlPath,
   isLoopbackIp,
@@ -33,6 +34,12 @@ import {
 const pageSize = 25;
 const nginxTraceHeaderMaxLength = 120;
 const columnHelper = createColumnHelper<UsageRow>();
+
+type ExplicitUsageWindow = {
+  start: number;
+  end: number;
+  label: string;
+};
 
 function usageRowKey(row: UsageRow) {
   return JSON.stringify([
@@ -47,6 +54,40 @@ function usageRowKey(row: UsageRow) {
     row.remotePort ?? "",
     row.attribution ?? "",
   ]);
+}
+
+function explicitUsageWindowFromParams(params: URLSearchParams): ExplicitUsageWindow | null {
+  const start = Number(params.get("start"));
+  const end = Number(params.get("end"));
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return null;
+  }
+  return {
+    start,
+    end,
+    label: `${formatMonth(start)} 明细`,
+  };
+}
+
+function setUsageSearchParams(
+  setParams: ReturnType<typeof useRangeSearchParam>["setParams"],
+  range: ReturnType<typeof useRangeSearchParam>["range"],
+  explicitWindow: ExplicitUsageWindow | null,
+  extra?: Record<string, string>,
+) {
+  const nextParams = new URLSearchParams();
+  if (explicitWindow) {
+    nextParams.set("start", String(explicitWindow.start));
+    nextParams.set("end", String(explicitWindow.end));
+  } else {
+    nextParams.set("range", range);
+  }
+  for (const [key, value] of Object.entries(extra ?? {})) {
+    if (value !== "") {
+      nextParams.set(key, value);
+    }
+  }
+  setParams(nextParams, { replace: true });
 }
 
 function uniqueNonLoopbackIps(values: Array<string | null | undefined>) {
@@ -107,7 +148,8 @@ function loopbackLinks(row: UsageRow, explain: UsageExplain) {
 }
 
 function useUsageFilters() {
-  const { params, range, setRange, setRangedParams } = useRangeSearchParam();
+  const { params, setParams, range, setRange } = useRangeSearchParam();
+  const explicitWindow = explicitUsageWindowFromParams(params);
 
   const filters = {
     comm: params.get("comm") ?? "",
@@ -121,10 +163,10 @@ function useUsageFilters() {
   };
 
   const setFilters = (next: typeof filters) => {
-    setRangedParams(next);
+    setUsageSearchParams(setParams, range, explicitWindow, next);
   };
 
-  return { range, filters, setRange, setFilters };
+  return { range, explicitWindow, filters, setRange, setFilters };
 }
 
 function clearMinuteOnlyFilters(
@@ -184,7 +226,9 @@ function explainConfidenceLabel(confidence: "low" | "medium" | "high") {
 }
 
 function usageBucketSeconds(dataSource?: DataSource) {
-  return dataSource === "usage_1h" ? 3600 : 60;
+  if (dataSource === "usage_1d") return 86400;
+  if (dataSource === "usage_1h") return 3600;
+  return 60;
 }
 
 function UsageExpandPanel({
@@ -464,7 +508,7 @@ function UsageExpandPanel({
 
 export function UsagePage() {
   const api = useApiClient();
-  const { range, filters, setRange, setFilters } = useUsageFilters();
+  const { range, explicitWindow, filters, setRange, setFilters } = useUsageFilters();
   const [sorting, setSorting] = useState<SortingState>([
     { id: "minuteTs", desc: true },
   ]);
@@ -473,8 +517,9 @@ export function UsagePage() {
   // Serialize filters to a stable string so this effect only fires when filter
   // values actually change, not on every render (filters object is recreated each render).
   const filtersKey = JSON.stringify(filters);
+  const windowKey = explicitWindow ? `${explicitWindow.start}-${explicitWindow.end}` : range;
   const pageResetKey = JSON.stringify([
-    range,
+    windowKey,
     filtersKey,
     sorting[0]?.id ?? null,
     sorting[0]?.desc ?? null,
@@ -494,7 +539,7 @@ export function UsagePage() {
   const query = useQuery({
     queryKey: [
       "usage",
-      range,
+      windowKey,
       filters,
       page,
       currentSort?.id,
@@ -502,7 +547,7 @@ export function UsagePage() {
     ],
     queryFn: ({ signal }) =>
       api.getUsage({
-        range,
+        ...(explicitWindow ? { start: explicitWindow.start, end: explicitWindow.end } : { range }),
         ...filters,
         page,
         pageSize,
@@ -539,7 +584,7 @@ export function UsagePage() {
   );
 
   const columns = useMemo(() => {
-    const isHourly = query.data?.dataSource === "usage_1h";
+    const isAggregated = minuteDimensionsUnavailable(query.data?.dataSource ?? null);
 
     const baseColumns = [
       columnHelper.accessor("minuteTs", {
@@ -597,7 +642,7 @@ export function UsagePage() {
       }),
     ];
 
-    const detailedColumns = isHourly
+    const detailedColumns = isAggregated
       ? []
       : [
           columnHelper.accessor("pid", {
@@ -676,7 +721,7 @@ export function UsagePage() {
   }, [query.data?.dataSource, onFilterByIp]);
 
   const usageTableClassName =
-    query.data?.dataSource === "usage_1h"
+    minuteDimensionsUnavailable(query.data?.dataSource ?? null)
       ? "usage-table usage-table-hourly table-dense"
       : "usage-table table-dense";
 
@@ -697,7 +742,7 @@ export function UsagePage() {
           <section className="status-row">
             <div className="status-pill">
               <strong>时间范围</strong>
-              <span>{rangeLabel(range)}</span>
+              <span>{explicitWindow?.label ?? rangeLabel(range)}</span>
             </div>
             {query.data ? (
               <DataSourceBadge dataSource={query.data.dataSource} />

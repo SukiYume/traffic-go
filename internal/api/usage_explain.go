@@ -2523,41 +2523,62 @@ func (s *Server) loadPersistedChains(ctx context.Context, bucketTS int64, query 
 		source string
 		label  string
 	}
-	hourBucket := time.Unix(bucketTS, 0).UTC().Truncate(time.Hour).Unix()
-	lookups := []chainLookup{
-		{bucket: bucketTS, source: store.DataSourceMinuteChain, label: "分钟链路记录"},
-		{bucket: hourBucket, source: store.DataSourceHourChain, label: "小时链路记录"},
-	}
-	if query.DataSource == store.DataSourceHour || query.DataSource == store.DataSourceDay {
-		lookups[0], lookups[1] = lookups[1], lookups[0]
-	}
-
-	for _, lookup := range lookups {
+	loadLookup := func(lookup chainLookup) ([]usageExplainChain, error) {
 		rows, err := s.store.QueryUsageChainsForProcess(ctx, lookup.bucket, pidFilter, query.Comm, query.Exe, lookup.source)
 		if err != nil {
 			return nil, err
 		}
 		if len(rows) == 0 {
-			continue
+			return nil, nil
 		}
 
-		relevant := make([]model.UsageChainRecord, 0, len(rows))
+		chains := make([]usageExplainChain, 0, len(rows))
 		for _, row := range rows {
-			if chainRecordMatchesExplain(row, query) {
-				relevant = append(relevant, row)
+			if !chainRecordMatchesExplain(row, query) {
+				continue
 			}
-		}
-		if len(relevant) == 0 {
-			continue
-		}
-
-		chains := make([]usageExplainChain, 0, len(relevant))
-		for _, row := range relevant {
 			chain := usageExplainChainFromRecord(row, lookup.label)
 			if !shouldPersistCanonicalChain(chain) {
 				continue
 			}
 			chains = append(chains, chain)
+		}
+		return chains, nil
+	}
+
+	if query.DataSource == store.DataSourceDay {
+		day := time.Unix(bucketTS, 0).UTC()
+		dayStart := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)
+		merged := make([]usageExplainChain, 0)
+		for offset := 0; offset < 24; offset++ {
+			chains, err := loadLookup(chainLookup{
+				bucket: dayStart.Add(time.Duration(offset) * time.Hour).Unix(),
+				source: store.DataSourceHourChain,
+				label:  "日内小时链路记录",
+			})
+			if err != nil {
+				return nil, err
+			}
+			if len(chains) > 0 {
+				merged = mergeExplainChains(merged, chains, 0)
+			}
+		}
+		return merged, nil
+	}
+
+	hourBucket := time.Unix(bucketTS, 0).UTC().Truncate(time.Hour).Unix()
+	lookups := []chainLookup{
+		{bucket: bucketTS, source: store.DataSourceMinuteChain, label: "分钟链路记录"},
+		{bucket: hourBucket, source: store.DataSourceHourChain, label: "小时链路记录"},
+	}
+	if query.DataSource == store.DataSourceHour {
+		lookups[0], lookups[1] = lookups[1], lookups[0]
+	}
+
+	for _, lookup := range lookups {
+		chains, err := loadLookup(lookup)
+		if err != nil {
+			return nil, err
 		}
 		if len(chains) > 0 {
 			return chains, nil

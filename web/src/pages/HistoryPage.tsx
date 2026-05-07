@@ -14,15 +14,30 @@ import { formatBytes, formatMonth, formatNumber, rangeLabel } from '../utils';
 const columnHelper = createColumnHelper<MonthlyUsageSummary>();
 
 function detailPath(row: MonthlyUsageSummary) {
-  if (!row.detailRange) {
-    return null;
+  if (row.detailRange) {
+    return buildRangedPath('/usage', row.detailRange);
   }
-  return buildRangedPath('/usage', row.detailRange);
+  if (row.detailAvailable) {
+    const month = new Date(row.monthTs * 1000);
+    const end = Math.floor(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1) / 1000);
+    const params = new URLSearchParams({
+      start: String(row.monthTs),
+      end: String(end),
+    });
+    return `/usage?${params.toString()}`;
+  }
+  return null;
 }
 
 function MonthStatus({ row }: { row: MonthlyUsageSummary }) {
+  if (row.archived && row.detailRange) {
+    return <span className="archive-state live">已归档 · 聚合可查</span>;
+  }
+  if (row.archived && row.detailAvailable) {
+    return <span className="archive-state live">已归档 · 明细保留</span>;
+  }
   if (row.archived) {
-    return <span className="archive-state archived">已归档</span>;
+    return <span className="archive-state archived">已归档 · 仅汇总</span>;
   }
   if (row.detailRange) {
     return <span className="archive-state live">明细可查 · {rangeLabel(row.detailRange)}</span>;
@@ -129,13 +144,13 @@ export function HistoryPage() {
           <p className="eyebrow">History</p>
           <h2>月度归档</h2>
           <p>
-            按 UTC 自然月查看所有已保存历史。保留期内的月份可以继续进入明细页；已归档月份只保留月度总量、
+            按 UTC 自然月查看所有已保存历史。仍有聚合数据的月份可以继续进入明细页；已归档月份只保留月度总量、
             转发总量、证据数和链路数。
           </p>
           <section className="status-row">
             <div className="status-pill">
-              <strong>完整明细</strong>
-              <span>本月 / 上月 / 上上月</span>
+              <strong>可查明细</strong>
+              <span>分钟 / 小时 / 日聚合</span>
             </div>
             <div className="status-pill">
               <strong>历史归档</strong>

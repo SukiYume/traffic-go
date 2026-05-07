@@ -17,6 +17,19 @@ function normalizeTrafficView(value: string | null): DashboardTrafficView {
   return value === 'direction' ? 'direction' : 'interface';
 }
 
+function StatGridSkeleton() {
+  return (
+    <section className="stat-grid stat-grid-loading" aria-label="总览统计加载中">
+      {['总上行', '总下行', '活跃连接', '活跃进程'].map((label) => (
+        <div key={label} className="stat-card stat-card-skeleton">
+          <span>{label}</span>
+          <strong aria-hidden="true" />
+        </div>
+      ))}
+    </section>
+  );
+}
+
 export function DashboardPage() {
   const api = useApiClient();
   const { params, setParams, range, setRange } = useRangeSearchParam();
@@ -110,7 +123,7 @@ export function DashboardPage() {
           ))}
         </section>
       ) : (
-        <EmptyState title="总览加载中" description="正在获取当前口径的总览统计。" />
+        <StatGridSkeleton />
       )}
 
       {trafficView === 'interface' && networkSeries.isError ? null : trafficView === 'direction' && series.isError ? (

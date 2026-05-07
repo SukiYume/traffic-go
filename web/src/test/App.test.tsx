@@ -13,7 +13,7 @@ import { RemotesPage } from "../pages/RemotesPage";
 import { UsagePage } from "../pages/UsagePage";
 import { DashboardPage } from "../pages/DashboardPage";
 import { HistoryPage } from "../pages/HistoryPage";
-import type { ProcessGroupBy, TrafficApiClient } from "../types";
+import type { DataSource, ProcessGroupBy, TrafficApiClient } from "../types";
 
 function renderWithProviders(
   path: string,
@@ -46,7 +46,7 @@ function expectStatValue(label: string, value: string) {
   expect(within(card).getByText(value)).toBeInTheDocument();
 }
 
-function createHourlyClient(): TrafficApiClient {
+function createAggregatedClient(dataSource: Extract<DataSource, "usage_1h" | "usage_1d">): TrafficApiClient {
   const base = createMockApiClient();
   return {
     ...base,
@@ -54,7 +54,7 @@ function createHourlyClient(): TrafficApiClient {
       const response = await base.getUsage(query, requestOptions);
       return {
         ...response,
-        dataSource: "usage_1h",
+        dataSource,
         rows: response.rows.map((row) => ({
           ...row,
           pid: null,
@@ -68,7 +68,7 @@ function createHourlyClient(): TrafficApiClient {
       const response = await base.getTopProcesses(range, options, requestOptions);
       return {
         ...response,
-        dataSource: "usage_1h",
+        dataSource,
         rows: response.rows.map((row) => ({ ...row, pid: null, exe: null })),
       };
     },
@@ -83,6 +83,22 @@ describe("traffic-go web ui", () => {
     expect(screen.getByRole("tab", { name: "网卡口径" })).toHaveAttribute("aria-selected", "true");
     expect(await screen.findByText("总上行")).toBeInTheDocument();
     expect(await screen.findByText("Top 进程")).toBeInTheDocument();
+  });
+
+  it("keeps dashboard chart loading separate from overview stat loading", async () => {
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      getOverview() {
+        return pendingPromise();
+      },
+    };
+
+    renderWithProviders("/", <DashboardPage />, client);
+
+    expect(await screen.findByText("网卡流量趋势")).toBeInTheDocument();
+    expect(screen.getByLabelText("总览统计加载中")).toBeInTheDocument();
+    expect(screen.queryByText("总览加载中")).not.toBeInTheDocument();
   });
 
   it("defaults dashboard trend to network mode and switches to direction mode", async () => {
@@ -191,10 +207,35 @@ describe("traffic-go web ui", () => {
   });
 
   it("keeps dashboard top processes in comm fallback when the window is hourly", async () => {
-    renderWithProviders("/?range=last_month", <DashboardPage />, createHourlyClient());
+    renderWithProviders("/?range=last_month", <DashboardPage />, createAggregatedClient("usage_1h"));
 
     expect((await screen.findAllByText("当前窗口已降级为按进程名聚合")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("小时聚合 / EXE 在此视图不展示").length).toBeGreaterThan(0);
+  });
+
+  it("keeps dashboard monthly ranges on the aggregated interface trend", async () => {
+    const base = createMockApiClient();
+    let networkCalls = 0;
+    let directionCalls = 0;
+    const client: TrafficApiClient = {
+      ...base,
+      async getNetworkTimeSeries(range, requestOptions) {
+        networkCalls += 1;
+        return base.getNetworkTimeSeries(range, requestOptions);
+      },
+      async getTimeSeries(range, groupBy, filters, requestOptions) {
+        directionCalls += 1;
+        return base.getTimeSeries(range, groupBy, filters, requestOptions);
+      },
+    };
+
+    renderWithProviders("/?range=last_month", <DashboardPage />, client);
+
+    expect(await screen.findByText("网卡流量趋势")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "网卡口径" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("interface_1d")).toBeInTheDocument();
+    await waitFor(() => expect(networkCalls).toBeGreaterThan(0));
+    expect(directionCalls).toBe(0);
   });
 
   it("keeps dashboard drill-down links on the current range and preserves the loopback flag for remotes", async () => {
@@ -216,7 +257,7 @@ describe("traffic-go web ui", () => {
   });
 
   it("disables pid and exe when the backend returns hourly data", async () => {
-    const base = createHourlyClient();
+    const base = createAggregatedClient("usage_1h");
     let usageCalls = 0;
     const client: TrafficApiClient = {
       ...base,
@@ -254,7 +295,7 @@ describe("traffic-go web ui", () => {
   });
 
   it("hides minute-only columns when usage data comes from the hourly source", async () => {
-    renderWithProviders("/usage?range=last_month", <UsagePage />, createHourlyClient());
+    renderWithProviders("/usage?range=last_month", <UsagePage />, createAggregatedClient("usage_1h"));
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
     expect(
       screen.queryByRole("columnheader", { name: "PID" }),
@@ -267,9 +308,17 @@ describe("traffic-go web ui", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("hides minute-only columns when usage data comes from the daily source", async () => {
+    renderWithProviders("/usage?range=this_month", <UsagePage />, createAggregatedClient("usage_1d"));
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "PID" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "EXE" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "归因" })).not.toBeInTheDocument();
+  });
+
   it("replays persisted chain analysis for hourly usage rows", async () => {
     const user = userEvent.setup();
-    renderWithProviders("/usage?range=last_month", <UsagePage />, createHourlyClient());
+    renderWithProviders("/usage?range=last_month", <UsagePage />, createAggregatedClient("usage_1h"));
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
     const rows = await screen.findAllByRole("row");
@@ -283,7 +332,7 @@ describe("traffic-go web ui", () => {
 
   it("uses the real hourly bucket span when rendering average rate", async () => {
     const user = userEvent.setup();
-    renderWithProviders("/usage?range=last_month", <UsagePage />, createHourlyClient());
+    renderWithProviders("/usage?range=last_month", <UsagePage />, createAggregatedClient("usage_1h"));
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
     const remoteIp = await screen.findByRole("button", { name: "203.0.113.24" });
@@ -296,6 +345,42 @@ describe("traffic-go web ui", () => {
     expect(
       await screen.findByText((_, element) =>
         element?.textContent === "↑ 51.0 B/s · ↓ 344 B/s",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("uses the real daily bucket span when rendering average rate", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        const response = await base.getUsage(query, requestOptions);
+        return {
+          ...response,
+          dataSource: "usage_1d",
+          rows: response.rows.slice(0, 1).map((row) => ({
+            ...row,
+            pid: null,
+            exe: null,
+            remotePort: null,
+            attribution: null,
+            bytesUp: 86400,
+            bytesDown: 172800,
+          })),
+        };
+      },
+    };
+
+    renderWithProviders("/usage?range=this_month", <UsagePage />, client);
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+
+    const rows = await screen.findAllByRole("row");
+    await user.click(rows[1]);
+
+    expect(
+      await screen.findByText((_, element) =>
+        element?.textContent === "↑ 1.00 B/s · ↓ 2.00 B/s",
       ),
     ).toBeInTheDocument();
   });
@@ -324,7 +409,7 @@ describe("traffic-go web ui", () => {
   });
 
   it("clears minute-only filters when the backend downgrades usage to hourly data", async () => {
-    const base = createHourlyClient();
+    const base = createAggregatedClient("usage_1h");
     let usageCalls = 0;
     const client: TrafficApiClient = {
       ...base,
@@ -415,17 +500,97 @@ describe("traffic-go web ui", () => {
     expect(screen.getByRole("link", { name: "History" })).toBeInTheDocument();
   });
 
+  it("keeps explicit usage windows in app metadata", async () => {
+    renderWithProviders("/usage?start=1767225600&end=1769904000", <App />);
+
+    await waitFor(() => {
+      expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute(
+        "href",
+        `${window.location.origin}/usage?start=1767225600&end=1769904000`,
+      );
+    });
+    expect(document.head.querySelector('meta[property="og:url"]')).toHaveAttribute(
+      "content",
+      `${window.location.origin}/usage?start=1767225600&end=1769904000`,
+    );
+  });
+
   it("shows monthly history and links retained months to detail", async () => {
     renderWithProviders("/history", <HistoryPage />);
 
     expect(await screen.findByText("月度归档")).toBeInTheDocument();
     expect(await screen.findByText("历史总流量")).toBeInTheDocument();
-    expect(screen.getByText("已归档")).toBeInTheDocument();
+    expect(screen.getByText("已归档 · 仅汇总")).toBeInTheDocument();
     expect(screen.getAllByRole("link", { name: "查看明细" })[0]).toHaveAttribute(
       "href",
       "/usage?range=this_month",
     );
     expect(screen.getByText("仅月度汇总")).toBeInTheDocument();
+  });
+
+  it("links older retained months with an explicit usage window", async () => {
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getMonthlyUsage() {
+        return {
+          rows: [
+            {
+              monthTs: 1767225600,
+              bytesUp: 100,
+              bytesDown: 200,
+              flowCount: 3,
+              forwardBytesOrig: 10,
+              forwardBytesReply: 20,
+              forwardFlowCount: 1,
+              evidenceCount: 2,
+              chainCount: 1,
+              updatedAt: 1769904000,
+              archived: true,
+              detailAvailable: true,
+              detailRange: null,
+              totalBytes: 300,
+              forwardTotalBytes: 30,
+            },
+          ],
+        };
+      },
+    };
+
+    renderWithProviders("/history", <HistoryPage />, client);
+
+    expect(await screen.findByText("已归档 · 明细保留")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看明细" })).toHaveAttribute(
+      "href",
+      "/usage?start=1767225600&end=1769904000",
+    );
+  });
+
+  it("preserves explicit usage windows when filters change", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const usageCalls: Array<Record<string, unknown>> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        usageCalls.push({ ...query });
+        return base.getUsage(query, requestOptions);
+      },
+    };
+
+    renderWithProviders("/usage?start=1767225600&end=1769904000", <UsagePage />, client);
+    expect(await screen.findByText("2026年1月 明细")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("对端 IP"), "198.51.100.44");
+
+    await waitFor(() => {
+      expect(usageCalls.some((call) => call.remoteIp === "198.51.100.44")).toBe(true);
+    });
+    expect(
+      usageCalls
+        .filter((call) => call.remoteIp === "198.51.100.44")
+        .every((call) => call.start === 1767225600 && call.end === 1769904000 && call.range === undefined),
+    ).toBe(true);
   });
 
   it("expands a usage row to show detail panel on click", async () => {
@@ -560,6 +725,12 @@ describe("traffic-go web ui", () => {
     await waitFor(() => {
       expect(processCalls).toEqual(expect.arrayContaining(["pid", "comm"]));
     });
+  });
+
+  it("hides PID process rows when natural month windows use daily aggregates", async () => {
+    renderWithProviders("/processes?range=this_month", <ProcessesPage />, createAggregatedClient("usage_1d"));
+    expect(await screen.findByText("当前窗口不提供 PID 维度")).toBeInTheDocument();
+    expect(screen.getByText("usage_1d")).toBeInTheDocument();
   });
 
   it("selects the first process row by default so the chart matches the highlighted row", async () => {

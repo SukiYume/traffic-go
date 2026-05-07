@@ -496,6 +496,34 @@ button {
   font-family: var(--font-display);
 }
 
+.stat-card-skeleton {
+  min-height: 116px;
+  pointer-events: none;
+}
+
+.stat-card-skeleton strong {
+  width: min(160px, 68%);
+  height: 38px;
+  border-radius: 8px;
+  background: linear-gradient(
+    90deg,
+    rgba(148, 163, 184, 0.12),
+    rgba(148, 163, 184, 0.22),
+    rgba(148, 163, 184, 0.12)
+  );
+  background-size: 220% 100%;
+  animation: skeleton-shimmer 1.35s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
 .panel {
   padding: 24px;
   display: flex;

@@ -57,7 +57,7 @@ func TestFlushAndQueryInterfaceTimeseries(t *testing.T) {
 		t.Fatalf("flush second interface minute: %v", err)
 	}
 
-	points, err := store.QueryInterfaceTimeseries(ctx, minute, minute.Add(10*time.Minute), 5*time.Minute)
+	points, err := store.QueryInterfaceTimeseries(ctx, minute, minute.Add(10*time.Minute), 5*time.Minute, DataSourceMinute)
 	if err != nil {
 		t.Fatalf("query interface timeseries: %v", err)
 	}
@@ -72,6 +72,44 @@ func TestFlushAndQueryInterfaceTimeseries(t *testing.T) {
 	}
 }
 
+func TestInterfaceUsageAggregatesToHourAndDay(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	hour := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	if err := store.FlushInterfaceMinute(ctx, hour.Add(2*time.Minute).Unix(), map[string]model.InterfaceUsageDelta{
+		"eth0": {RxBytes: 1000, TxBytes: 2000},
+	}); err != nil {
+		t.Fatalf("flush first interface minute: %v", err)
+	}
+	if err := store.FlushInterfaceMinute(ctx, hour.Add(37*time.Minute).Unix(), map[string]model.InterfaceUsageDelta{
+		"eth0": {RxBytes: 3000, TxBytes: 4000},
+	}); err != nil {
+		t.Fatalf("flush second interface minute: %v", err)
+	}
+
+	if err := store.AggregateHour(ctx, hour); err != nil {
+		t.Fatalf("aggregate interface hour: %v", err)
+	}
+
+	hourPoints, err := store.QueryInterfaceTimeseries(ctx, hour, hour.Add(time.Hour), time.Hour, DataSourceHour)
+	if err != nil {
+		t.Fatalf("query interface hour: %v", err)
+	}
+	if len(hourPoints) != 1 || hourPoints[0].DataSource != DataSourceInterfaceHour || hourPoints[0].RxBytes != 4000 || hourPoints[0].TxBytes != 6000 {
+		t.Fatalf("unexpected hourly interface points: %+v", hourPoints)
+	}
+
+	day := hour.Truncate(24 * time.Hour)
+	dayPoints, err := store.QueryInterfaceTimeseries(ctx, day, day.Add(24*time.Hour), 24*time.Hour, DataSourceDay)
+	if err != nil {
+		t.Fatalf("query interface day: %v", err)
+	}
+	if len(dayPoints) != 1 || dayPoints[0].DataSource != DataSourceInterfaceDay || dayPoints[0].RxBytes != 4000 || dayPoints[0].TxBytes != 6000 {
+		t.Fatalf("unexpected daily interface points: %+v", dayPoints)
+	}
+}
+
 func TestResolveUsageSource(t *testing.T) {
 	store := newTestStore(t)
 	start := time.Unix(0, 0)
@@ -81,7 +119,7 @@ func TestResolveUsageSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve source: %v", err)
 	}
-	if source != DataSourceHour {
+	if source != DataSourceDay {
 		t.Fatalf("unexpected source: %s", source)
 	}
 
@@ -180,7 +218,6 @@ func TestCleanupSummarizesExpiredCalendarMonthBeforeDeletingDetails(t *testing.T
 	january := time.Date(2026, 1, 20, 10, 15, 0, 0, time.UTC)
 	february := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
 	store.now = func() time.Time { return time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC) }
-	store.retention.Months = 3
 
 	if err := store.FlushMinute(ctx, january.Unix(), map[model.UsageKey]model.UsageDelta{
 		{
@@ -223,6 +260,12 @@ func TestCleanupSummarizesExpiredCalendarMonthBeforeDeletingDetails(t *testing.T
 	}, nil); err != nil {
 		t.Fatalf("flush february details: %v", err)
 	}
+	if err := store.AggregateHour(ctx, january); err != nil {
+		t.Fatalf("aggregate january details: %v", err)
+	}
+	if err := store.AggregateHour(ctx, february); err != nil {
+		t.Fatalf("aggregate february details: %v", err)
+	}
 
 	if err := store.UpsertLogEvidenceBatch(ctx, []model.LogEvidence{{
 		Source:      "nginx",
@@ -256,6 +299,9 @@ func TestCleanupSummarizesExpiredCalendarMonthBeforeDeletingDetails(t *testing.T
 		SampleTime:        january.Unix(),
 	}}); err != nil {
 		t.Fatalf("upsert january chain: %v", err)
+	}
+	if err := store.AggregateHour(ctx, january); err != nil {
+		t.Fatalf("aggregate january chain details: %v", err)
 	}
 
 	if err := store.Cleanup(ctx); err != nil {
@@ -300,7 +346,7 @@ WHERE month_ts = ?
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_1m WHERE minute_ts >= ?`, february.Unix()).Scan(&remainingFebruary); err != nil {
 		t.Fatalf("count remaining february detail: %v", err)
 	}
-	if remainingJanuary != 0 || remainingFebruary != 1 {
+	if remainingJanuary != 0 || remainingFebruary != 0 {
 		t.Fatalf("unexpected remaining detail rows: january=%d february=%d", remainingJanuary, remainingFebruary)
 	}
 }
@@ -312,7 +358,6 @@ func TestCleanupSummarizesClosedMonthBeforeItExpires(t *testing.T) {
 	february := time.Date(2026, 2, 18, 10, 15, 0, 0, time.UTC)
 	april := time.Date(2026, 4, 20, 12, 30, 0, 0, time.UTC)
 	store.now = func() time.Time { return time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC) }
-	store.retention.Months = 3
 
 	if err := store.FlushMinute(ctx, february.Unix(), map[model.UsageKey]model.UsageDelta{
 		{
@@ -346,6 +391,12 @@ func TestCleanupSummarizesClosedMonthBeforeItExpires(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatalf("flush april details: %v", err)
 	}
+	if err := store.AggregateHour(ctx, february); err != nil {
+		t.Fatalf("aggregate february details: %v", err)
+	}
+	if err := store.AggregateHour(ctx, april); err != nil {
+		t.Fatalf("aggregate april details: %v", err)
+	}
 
 	if err := store.Cleanup(ctx); err != nil {
 		t.Fatalf("cleanup: %v", err)
@@ -378,8 +429,129 @@ WHERE month_ts = ?
 	if err := store.db.QueryRow(`SELECT bytes_up FROM usage_monthly WHERE month_ts = ?`, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC).Unix()).Scan(&februarySummaryBytes); err != nil {
 		t.Fatalf("query february monthly summary: %v", err)
 	}
-	if aprilDetails != 1 || februaryDetails != 0 || februarySummaryBytes != 100 {
+	if aprilDetails != 0 || februaryDetails != 0 || februarySummaryBytes != 100 {
 		t.Fatalf("unexpected cleanup result: aprilDetails=%d februaryDetails=%d februarySummaryBytes=%d", aprilDetails, februaryDetails, februarySummaryBytes)
+	}
+}
+
+func TestCleanupRetainsCurrentMonthShortTTLCountsForMonthlyArchive(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	expired := time.Date(2026, 4, 2, 10, 15, 0, 0, time.UTC)
+	live := time.Date(2026, 4, 19, 11, 20, 0, 0, time.UTC)
+	pid := 42
+	exe := "/usr/bin/curl"
+
+	if err := store.UpsertLogEvidenceBatch(ctx, []model.LogEvidence{
+		{
+			Source:      "nginx",
+			EventTS:     expired.Unix(),
+			ClientIP:    "203.0.113.24",
+			TargetIP:    "198.51.100.44",
+			Host:        "old.example.test",
+			Path:        "/",
+			Method:      "GET",
+			Message:     "expired",
+			Fingerprint: "monthly-retained-expired-evidence",
+		},
+		{
+			Source:      "nginx",
+			EventTS:     live.Unix(),
+			ClientIP:    "203.0.113.25",
+			TargetIP:    "198.51.100.45",
+			Host:        "live.example.test",
+			Path:        "/",
+			Method:      "GET",
+			Message:     "live",
+			Fingerprint: "monthly-retained-live-evidence",
+		},
+	}); err != nil {
+		t.Fatalf("upsert evidence: %v", err)
+	}
+
+	if err := store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        expired.Unix(),
+			PID:               &pid,
+			Comm:              "curl",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			TargetIP:          "198.51.100.44",
+			BytesTotal:        300,
+			FlowCount:         1,
+			EvidenceCount:     1,
+			EvidenceSource:    "nginx",
+			Confidence:        "high",
+			SampleFingerprint: "monthly-retained-expired-evidence",
+			SampleMessage:     "expired",
+			SampleTime:        expired.Unix(),
+		},
+		{
+			TimeBucket:        live.Unix(),
+			PID:               &pid,
+			Comm:              "curl",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.25",
+			TargetIP:          "198.51.100.45",
+			BytesTotal:        400,
+			FlowCount:         1,
+			EvidenceCount:     1,
+			EvidenceSource:    "nginx",
+			Confidence:        "high",
+			SampleFingerprint: "monthly-retained-live-evidence",
+			SampleMessage:     "live",
+			SampleTime:        live.Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert chains: %v", err)
+	}
+	if err := store.AggregateHour(ctx, expired); err != nil {
+		t.Fatalf("aggregate expired chain hour: %v", err)
+	}
+
+	store.now = func() time.Time { return time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC) }
+	if err := store.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup current month: %v", err)
+	}
+
+	summaries, err := store.QueryMonthlyUsage(ctx)
+	if err != nil {
+		t.Fatalf("query monthly usage: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("expected one monthly summary, got %+v", summaries)
+	}
+	if summaries[0].EvidenceCount != 2 || summaries[0].ChainCount != 2 {
+		t.Fatalf("expected retained plus live counts, got %+v", summaries[0])
+	}
+
+	var expiredEvidenceRows, expiredChainRows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM log_evidence WHERE event_ts = ?`, expired.Unix()).Scan(&expiredEvidenceRows); err != nil {
+		t.Fatalf("count expired evidence: %v", err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_chain_1h WHERE hour_ts = ?`, expired.Truncate(time.Hour).Unix()).Scan(&expiredChainRows); err != nil {
+		t.Fatalf("count expired chain hour: %v", err)
+	}
+	if expiredEvidenceRows != 0 || expiredChainRows != 0 {
+		t.Fatalf("expected expired short-TTL rows deleted, evidence=%d chain=%d", expiredEvidenceRows, expiredChainRows)
+	}
+
+	store.invalidateMonthlyCache()
+	store.now = func() time.Time { return time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC) }
+	if err := store.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup closed month: %v", err)
+	}
+
+	var evidenceCount, chainCount, retainedRows int
+	if err := store.db.QueryRow(`SELECT evidence_count, chain_count FROM usage_monthly WHERE month_ts = ?`, time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC).Unix()).Scan(&evidenceCount, &chainCount); err != nil {
+		t.Fatalf("query archived monthly counts: %v", err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM monthly_retained_counts`).Scan(&retainedRows); err != nil {
+		t.Fatalf("count retained rows: %v", err)
+	}
+	if evidenceCount != 2 || chainCount != 2 || retainedRows != 0 {
+		t.Fatalf("unexpected archived counts evidence=%d chain=%d retainedRows=%d", evidenceCount, chainCount, retainedRows)
 	}
 }
 
@@ -405,6 +577,9 @@ func TestCleanupFallbackSummarizesMissingMonthBeforeDelete(t *testing.T) {
 		}: {BytesUp: 500, BytesDown: 600, PktsUp: 5, PktsDown: 6, FlowCount: 7},
 	}, nil); err != nil {
 		t.Fatalf("flush february details: %v", err)
+	}
+	if err := store.AggregateHour(ctx, february); err != nil {
+		t.Fatalf("aggregate february details: %v", err)
 	}
 
 	tx, err := store.db.BeginTx(ctx, nil)
@@ -453,7 +628,6 @@ func TestCleanupFallbackSummarizesEvidenceOnlyMonthBeforeDelete(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	store.now = func() time.Time { return time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC) }
-	store.retention.Months = 3
 
 	february := time.Date(2026, 2, 18, 10, 15, 0, 0, time.UTC)
 	if err := store.UpsertLogEvidenceBatch(ctx, []model.LogEvidence{{
@@ -499,20 +673,19 @@ func TestCleanupSummarizesExpiredHourOnlyMonth(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	store.now = func() time.Time { return time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC) }
-	store.retention.Months = 3
 
-	decemberHour := time.Date(2025, 12, 15, 3, 0, 0, 0, time.UTC).Unix()
+	decemberDay := time.Date(2025, 12, 15, 0, 0, 0, 0, time.UTC).Unix()
 	if _, err := store.db.ExecContext(ctx, `
-INSERT INTO usage_1h (
-	hour_ts, proto, direction, comm, local_port, remote_ip,
+INSERT INTO usage_1d (
+	day_ts, proto, direction, comm, local_port, remote_ip,
 	bytes_up, bytes_down, pkts_up, pkts_down, flow_count
 ) VALUES (?, 'tcp', 'out', 'curl', 50500, '1.1.1.1', 700, 800, 7, 8, 9);
-INSERT INTO usage_1h_forward (
-	hour_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport,
+INSERT INTO usage_1d_forward (
+	day_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport,
 	bytes_orig, bytes_reply, pkts_orig, pkts_reply, flow_count
 ) VALUES (?, 'tcp', '10.0.0.2', '1.1.1.1', 50000, 443, 300, 400, 3, 4, 5);
-`, decemberHour, decemberHour); err != nil {
-		t.Fatalf("seed hour-only month: %v", err)
+`, decemberDay, decemberDay); err != nil {
+		t.Fatalf("seed day-only month: %v", err)
 	}
 
 	if err := store.Cleanup(ctx); err != nil {
@@ -547,10 +720,10 @@ func TestQueryMonthlyUsageCombinesArchiveAndLiveMonths(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	store.now = func() time.Time { return time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC) }
-	store.retention.Months = 3
 
 	january := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
 	march := time.Date(2026, 3, 12, 8, 15, 0, 0, time.UTC)
+	april := time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC)
 	if _, err := store.db.ExecContext(ctx, `
 INSERT INTO usage_monthly (
 	month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
@@ -587,31 +760,132 @@ INSERT INTO usage_monthly (
 	}); err != nil {
 		t.Fatalf("flush march details: %v", err)
 	}
+	if err := store.AggregateHour(ctx, march); err != nil {
+		t.Fatalf("aggregate march details: %v", err)
+	}
+	if err := store.FlushMinute(ctx, april.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    april.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionIn,
+			PID:         99,
+			Comm:        "nginx",
+			Exe:         "/usr/sbin/nginx",
+			LocalPort:   443,
+			RemoteIP:    "2.2.2.2",
+			RemotePort:  55000,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 55, BytesDown: 66, PktsUp: 5, PktsDown: 6, FlowCount: 7},
+	}, nil); err != nil {
+		t.Fatalf("flush april details: %v", err)
+	}
 
 	summaries, err := store.QueryMonthlyUsage(ctx)
 	if err != nil {
 		t.Fatalf("query monthly usage: %v", err)
 	}
-	if len(summaries) != 2 {
+	if len(summaries) != 3 {
 		t.Fatalf("unexpected summary count: %+v", summaries)
 	}
-	if summaries[0].MonthTS != time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC).Unix() {
-		t.Fatalf("expected march first, got %+v", summaries[0])
+	if summaries[0].MonthTS != time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC).Unix() {
+		t.Fatalf("expected april first, got %+v", summaries[0])
 	}
-	if summaries[0].Archived || !summaries[0].DetailAvailable || summaries[0].DetailRange != "last_month" {
-		t.Fatalf("unexpected march detail status: %+v", summaries[0])
+	if summaries[0].Archived || !summaries[0].DetailAvailable || summaries[0].DetailRange != "this_month" {
+		t.Fatalf("unexpected april detail status: %+v", summaries[0])
 	}
-	if summaries[0].BytesUp != 11 || summaries[0].BytesDown != 22 || summaries[0].FlowCount != 1 {
-		t.Fatalf("live details should override stale monthly archive: %+v", summaries[0])
+	if summaries[0].BytesUp != 55 || summaries[0].BytesDown != 66 || summaries[0].FlowCount != 7 {
+		t.Fatalf("unexpected april live summary: %+v", summaries[0])
 	}
-	if summaries[0].ForwardBytesOrig != 33 || summaries[0].ForwardBytesReply != 44 || summaries[0].ForwardFlowCount != 2 {
-		t.Fatalf("unexpected live forward summary: %+v", summaries[0])
+	if summaries[1].MonthTS != time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC).Unix() {
+		t.Fatalf("expected march second, got %+v", summaries[1])
 	}
-	if !summaries[1].Archived || summaries[1].DetailAvailable || summaries[1].DetailRange != "" {
-		t.Fatalf("unexpected january archive status: %+v", summaries[1])
+	if !summaries[1].Archived || !summaries[1].DetailAvailable || summaries[1].DetailRange != "last_month" {
+		t.Fatalf("unexpected march archive status: %+v", summaries[1])
 	}
-	if summaries[1].BytesUp != 100 || summaries[1].BytesDown != 200 || summaries[1].EvidenceCount != 7 || summaries[1].ChainCount != 8 {
-		t.Fatalf("unexpected january archive summary: %+v", summaries[1])
+	if summaries[1].BytesUp != 999 || summaries[1].BytesDown != 999 || summaries[1].FlowCount != 99 {
+		t.Fatalf("archived month should be preferred over retained details: %+v", summaries[1])
+	}
+	if !summaries[2].Archived || !summaries[2].DetailAvailable || summaries[2].DetailRange != "" {
+		t.Fatalf("unexpected january archive status: %+v", summaries[2])
+	}
+	if summaries[2].BytesUp != 100 || summaries[2].BytesDown != 200 || summaries[2].EvidenceCount != 7 || summaries[2].ChainCount != 8 {
+		t.Fatalf("unexpected january archive summary: %+v", summaries[2])
+	}
+}
+
+func TestQueryMonthlyUsageDoesNotDoubleCountCutoffHour(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	store.now = func() time.Time { return time.Date(2026, 5, 31, 7, 44, 30, 0, time.UTC) }
+
+	cutoffHour := time.Date(2026, 5, 24, 7, 0, 0, 0, time.UTC)
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO usage_1h (
+	hour_ts, proto, direction, comm, local_port, remote_ip,
+	bytes_up, bytes_down, pkts_up, pkts_down, flow_count
+) VALUES (?, 'tcp', 'out', 'curl', 50500, '1.1.1.1', 100, 200, 1, 2, 3)
+`, cutoffHour.Unix()); err != nil {
+		t.Fatalf("seed cutoff hour aggregate: %v", err)
+	}
+	if err := store.FlushMinute(ctx, cutoffHour.Add(45*time.Minute).Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    cutoffHour.Add(45 * time.Minute).Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         42,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   50500,
+			RemoteIP:    "1.1.1.1",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 10, BytesDown: 20, PktsUp: 1, PktsDown: 1, FlowCount: 1},
+	}, nil); err != nil {
+		t.Fatalf("seed retained minute in cutoff hour: %v", err)
+	}
+
+	summaries, err := store.QueryMonthlyUsage(ctx)
+	if err != nil {
+		t.Fatalf("query monthly usage: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("expected one monthly summary, got %+v", summaries)
+	}
+	if summaries[0].BytesUp != 100 || summaries[0].BytesDown != 200 || summaries[0].FlowCount != 3 {
+		t.Fatalf("cutoff hour should be counted once from hourly aggregate, got %+v", summaries[0])
+	}
+}
+
+func TestCleanupDoesNotOverwriteExistingMonthlyArchiveWithExpiredDetail(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	store.now = func() time.Time { return time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC) }
+
+	aprilMonth := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC).Unix()
+	aprilDay := time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC).Unix()
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO usage_monthly (
+	month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
+	forward_flow_count, evidence_count, chain_count, updated_at
+) VALUES (?, 100, 200, 3, 0, 0, 0, 7, 8, 9);
+INSERT INTO usage_1d (
+	day_ts, proto, direction, comm, local_port, remote_ip,
+	bytes_up, bytes_down, pkts_up, pkts_down, flow_count
+) VALUES (?, 'tcp', 'out', 'curl', 50500, '1.1.1.1', 100, 200, 1, 2, 3);
+`, aprilMonth, aprilDay); err != nil {
+		t.Fatalf("seed archived month and retained day detail: %v", err)
+	}
+
+	if err := store.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	var evidenceCount, chainCount int64
+	if err := store.db.QueryRow(`SELECT evidence_count, chain_count FROM usage_monthly WHERE month_ts = ?`, aprilMonth).Scan(&evidenceCount, &chainCount); err != nil {
+		t.Fatalf("query monthly archive: %v", err)
+	}
+	if evidenceCount != 7 || chainCount != 8 {
+		t.Fatalf("existing monthly archive counts should be preserved, evidence=%d chain=%d", evidenceCount, chainCount)
 	}
 }
 
@@ -765,7 +1039,6 @@ func TestQueryTimeseriesUsesTimeColumnForBucketing(t *testing.T) {
 
 func TestResolveUsageSourceUsesHourlyForLongWindowWithinRetention(t *testing.T) {
 	cfg := config.Default()
-	cfg.Retention.Months = 3
 	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
 	store, err := Open(cfg)
 	if err != nil {
@@ -787,12 +1060,9 @@ func TestResolveUsageSourceUsesHourlyForLongWindowWithinRetention(t *testing.T) 
 		t.Fatalf("expected very long retained window to use day source, got %s", source)
 	}
 
-	source, err = store.ResolveUsageSource(start, end, true)
-	if err != nil {
-		t.Fatalf("resolve minute-required source: %v", err)
-	}
-	if source != DataSourceMinute {
-		t.Fatalf("expected minute-required long retained window to use minute source, got %s", source)
+	_, err = store.ResolveUsageSource(start, end, true)
+	if err != ErrDimensionUnavailable {
+		t.Fatalf("expected minute-required long window outside 7d retention to fail, got %v", err)
 	}
 
 	shortStart := now.Add(-24 * time.Hour)
@@ -817,8 +1087,8 @@ func TestResolveUsageSourceFallsBackForOldAbsoluteWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve source: %v", err)
 	}
-	if source != DataSourceHour {
-		t.Fatalf("expected old window to use hour source, got %s", source)
+	if source != DataSourceDay {
+		t.Fatalf("expected old window to use day source, got %s", source)
 	}
 
 	if _, err := store.ResolveUsageSource(start, end, true); err != ErrDimensionUnavailable {
@@ -1026,7 +1296,6 @@ func TestUsageChainsUpsertAggregateAndCleanup(t *testing.T) {
 		t.Fatalf("expected hourly chain id prefix, got %+v", hourRows[0])
 	}
 
-	store.retention.Months = 1
 	store.now = func() time.Time { return time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC) }
 	if err := store.Cleanup(ctx); err != nil {
 		t.Fatalf("cleanup: %v", err)
@@ -1650,7 +1919,6 @@ func TestCleanupRemovesExpiredLogEvidence(t *testing.T) {
 		t.Fatalf("set created_at for new row: %v", err)
 	}
 
-	store.retention.Months = 1
 	if err := store.Cleanup(ctx); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}

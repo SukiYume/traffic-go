@@ -23,10 +23,13 @@ type App struct {
 	apiServer *api.Server
 	server    *http.Server
 
-	prefetchMu      sync.Mutex
-	prefetchRunning bool
-	prefetchWG      sync.WaitGroup
+	prefetchMu              sync.Mutex
+	prefetchRunning         bool
+	prefetchWG              sync.WaitGroup
+	lastRefreshedLatestHour time.Time
 }
+
+const latestCompletedHourRefreshGrace = 5 * time.Minute
 
 func New(cfg config.Config, logger *log.Logger) (*App, error) {
 	cfg = config.Derive(cfg)
@@ -63,8 +66,11 @@ func New(cfg config.Config, logger *log.Logger) (*App, error) {
 		collector: trafficCollector,
 		apiServer: apiServer,
 		server: &http.Server{
-			Addr:    cfg.Listen,
-			Handler: apiServer.Handler(),
+			Addr:         cfg.Listen,
+			Handler:      apiServer.Handler(),
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 60 * time.Second,
+			IdleTimeout:  120 * time.Second,
 		},
 	}, nil
 }
@@ -115,6 +121,11 @@ func (a *App) Close() error {
 	return a.store.Close()
 }
 
+func (a *App) RunMaintenanceOnce(ctx context.Context, allowVacuum bool) error {
+	a.runAggregation(ctx)
+	return a.cleanup(ctx, allowVacuum, allowVacuum)
+}
+
 func (a *App) serveHTTP() error {
 	a.logger.Printf("HTTP listening on %s", a.cfg.Listen)
 	err := a.server.ListenAndServe()
@@ -156,10 +167,19 @@ func (a *App) runMaintenance(ctx context.Context) error {
 }
 
 func (a *App) runAggregation(ctx context.Context) {
-	before := time.Now().UTC().Truncate(time.Hour)
+	a.runAggregationAt(ctx, time.Now().UTC())
+}
+
+func (a *App) runAggregationAt(ctx context.Context, now time.Time) {
+	now = now.UTC()
+	before := now.Truncate(time.Hour)
 	latestCompleteHour := before.Add(-time.Hour)
-	if err := a.store.AggregateHour(ctx, latestCompleteHour); err != nil {
-		a.logger.Printf("refresh latest completed hour %s failed: %v", latestCompleteHour.Format(time.RFC3339), err)
+	if now.Sub(before) <= latestCompletedHourRefreshGrace || !a.lastRefreshedLatestHour.Equal(latestCompleteHour) {
+		if err := a.store.AggregateHour(ctx, latestCompleteHour); err != nil {
+			a.logger.Printf("refresh latest completed hour %s failed: %v", latestCompleteHour.Format(time.RFC3339), err)
+		} else {
+			a.lastRefreshedLatestHour = latestCompleteHour
+		}
 	}
 
 	for {
@@ -208,33 +228,45 @@ func (a *App) runAggregation(ctx context.Context) {
 }
 
 func (a *App) runCleanup(ctx context.Context, allowVacuum bool) {
-	if err := a.store.Cleanup(ctx); err != nil {
+	if err := a.cleanup(ctx, allowVacuum, false); err != nil {
 		a.logger.Printf("cleanup failed: %v", err)
-		return
+	}
+}
+
+func (a *App) cleanup(ctx context.Context, allowVacuum bool, forceVacuum bool) error {
+	if err := a.store.Cleanup(ctx); err != nil {
+		return err
 	}
 	if err := a.store.Optimize(ctx); err != nil {
 		a.logger.Printf("optimize failed: %v", err)
 	}
+	if err := a.store.CheckpointWAL(ctx); err != nil {
+		a.logger.Printf("wal checkpoint failed: %v", err)
+	}
 	if !allowVacuum {
-		return
+		return nil
 	}
 
-	lastVacuum, ok, err := a.store.LastVacuum(ctx)
-	if err != nil {
-		a.logger.Printf("read vacuum cursor failed: %v", err)
-		return
-	}
 	now := time.Now().UTC()
-	if ok && now.Sub(lastVacuum) < 7*24*time.Hour {
-		return
+	if !forceVacuum {
+		lastVacuum, ok, err := a.store.LastVacuum(ctx)
+		if err != nil {
+			return err
+		}
+		if ok && now.Sub(lastVacuum) < 7*24*time.Hour {
+			return nil
+		}
 	}
 	if err := a.store.Vacuum(ctx); err != nil {
-		a.logger.Printf("vacuum failed: %v", err)
-		return
+		return err
+	}
+	if err := a.store.CheckpointWAL(ctx); err != nil {
+		a.logger.Printf("wal checkpoint after vacuum failed: %v", err)
 	}
 	if err := a.store.SetLastVacuum(ctx, now); err != nil {
-		a.logger.Printf("persist vacuum cursor failed: %v", err)
+		return err
 	}
+	return nil
 }
 
 func (a *App) runPrefetch(ctx context.Context) {

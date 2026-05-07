@@ -37,6 +37,18 @@ const DATA_SOURCE_META: Record<DataSource, DataSourceMeta> = {
     autoNote: '当前页面正在读取网卡分钟数据。它不是一个手动筛选项，Dashboard 会按趋势口径自动使用。',
     minuteDimensionsUnavailable: false,
   },
+  interface_1h: {
+    label: '网卡小时',
+    description: '按小时聚合后的非 loopback 网卡 RX/TX 数据，用于较长窗口的服务商口径对比。',
+    autoNote: '当前页面正在读取网卡小时聚合。它不是一个手动筛选项，Dashboard 会按时间范围自动使用。',
+    minuteDimensionsUnavailable: true,
+  },
+  interface_1d: {
+    label: '网卡日聚合',
+    description: '按天聚合后的非 loopback 网卡 RX/TX 数据，用于自然月和账单周期对比。',
+    autoNote: '当前页面正在读取网卡日聚合。它不是一个手动筛选项，Dashboard 会按时间范围自动使用。',
+    minuteDimensionsUnavailable: true,
+  },
   usage_1m_forward: {
     label: '分钟转发明细',
     description: '逐分钟累计的 forward / NAT 明细。',

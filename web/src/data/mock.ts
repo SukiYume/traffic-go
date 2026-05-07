@@ -741,14 +741,21 @@ export function createMockApiClient(): TrafficApiClient {
         down: Math.round(point.down * 0.92 + (index % 4) * 95_000),
         flowCount: 0,
       }));
+      const dataSource =
+        range === 'this_month' || range === 'last_month' || range === 'two_months_ago'
+          ? 'interface_1d'
+          : range === '7d'
+            ? 'interface_1h'
+            : 'interface_1m';
       return {
-        dataSource: 'interface_1m',
+        dataSource,
         bucket: RANGE_TO_BUCKET[range],
         points,
       };
     },
     async getUsage(query) {
-      const rows = normalizeUsageRows(query.range, createFilteredUsage(query));
+      const range = query.range ?? '24h';
+      const rows = normalizeUsageRows(range, createFilteredUsage(query));
       const page = paginate(rows, query.page ?? 1, query.pageSize ?? 25);
       return {
         dataSource: 'usage_1m',

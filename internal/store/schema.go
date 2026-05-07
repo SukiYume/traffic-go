@@ -4,6 +4,7 @@ const schemaSQL = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA busy_timeout = 5000;
+PRAGMA journal_size_limit = 67108864;
 
 CREATE TABLE IF NOT EXISTS usage_1m (
     minute_ts INTEGER NOT NULL,
@@ -84,6 +85,26 @@ CREATE TABLE IF NOT EXISTS interface_1m (
 
 CREATE INDEX IF NOT EXISTS idx_interface_1m_minute ON interface_1m (minute_ts);
 
+CREATE TABLE IF NOT EXISTS interface_1h (
+    hour_ts INTEGER NOT NULL,
+    interface TEXT NOT NULL,
+    rx_bytes INTEGER NOT NULL,
+    tx_bytes INTEGER NOT NULL,
+    PRIMARY KEY (hour_ts, interface)
+);
+
+CREATE INDEX IF NOT EXISTS idx_interface_1h_hour ON interface_1h (hour_ts);
+
+CREATE TABLE IF NOT EXISTS interface_1d (
+    day_ts INTEGER NOT NULL,
+    interface TEXT NOT NULL,
+    rx_bytes INTEGER NOT NULL,
+    tx_bytes INTEGER NOT NULL,
+    PRIMARY KEY (day_ts, interface)
+);
+
+CREATE INDEX IF NOT EXISTS idx_interface_1d_day ON interface_1d (day_ts);
+
 CREATE TABLE IF NOT EXISTS usage_1m_forward (
     minute_ts INTEGER NOT NULL,
     proto TEXT NOT NULL,
@@ -159,6 +180,25 @@ CREATE TABLE IF NOT EXISTS usage_monthly (
     chain_count INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS monthly_retained_counts (
+    month_ts INTEGER NOT NULL PRIMARY KEY,
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    chain_count INTEGER NOT NULL DEFAULT 0,
+    evidence_until INTEGER NOT NULL DEFAULT 0,
+    chain_until INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS known_processes (
+    pid INTEGER NOT NULL,
+    comm TEXT NOT NULL,
+    exe TEXT NOT NULL,
+    seen_ts INTEGER NOT NULL,
+    PRIMARY KEY (pid, comm, exe)
+);
+
+CREATE INDEX IF NOT EXISTS idx_known_processes_seen ON known_processes (seen_ts DESC, comm COLLATE NOCASE, pid DESC);
 
 CREATE TABLE IF NOT EXISTS log_evidence (
     source TEXT NOT NULL,

@@ -24,6 +24,12 @@ func usageChainSourceInfo(source string) chainSourceInfo {
 	}
 }
 
+// BuildUsageChainID constructs a stable primary key for a chain record.
+// Fields are joined with "|" as a delimiter. Process names (comm) and exe
+// paths must not contain "|" for IDs to remain unambiguous — this holds for
+// all normal Linux process names and is enforced implicitly by the kernel's
+// comm length limit (15 bytes, no "|" in practice). The same format is
+// reproduced in SQL inside AggregateHour; both must stay in sync.
 func BuildUsageChainID(bucketTS int64, source string, record model.UsageChainRecord) string {
 	return fmt.Sprintf(
 		"%s|%d|%d|%s|%s|%s|%d|%s|%s|%d",
@@ -121,7 +127,6 @@ ON CONFLICT(chain_id) DO UPDATE SET
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.invalidateCaches()
 	return nil
 }
 

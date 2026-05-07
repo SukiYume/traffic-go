@@ -57,6 +57,7 @@ func (s stubRuntime) Diagnostics() model.CollectorDiagnostics {
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := config.Default()
+	cfg.Retention.MinuteDays = 90
 	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
 	trafficStore, err := store.Open(cfg)
 	if err != nil {
@@ -2645,6 +2646,60 @@ func TestUsageExplainReplaysHourlyPersistedChains(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, `小时聚合数据`) {
 		t.Fatalf("expected hourly replay note in body: %s", bodyText)
+	}
+}
+
+func TestUsageExplainReplaysDailyPersistedChainsAcrossWholeDay(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	day := time.Date(2026, 4, 16, 0, 0, 0, 0, time.UTC)
+	hour := day.Add(12 * time.Hour)
+	pid := 1088
+	exe := "/usr/bin/ss-server"
+	entryPort := 12096
+	targetPort := 443
+
+	if err := server.store.UpsertUsageChains(ctx, []model.UsageChainRecord{
+		{
+			TimeBucket:        hour.Add(8 * time.Minute).Unix(),
+			PID:               &pid,
+			Comm:              "ss-server",
+			Exe:               &exe,
+			SourceIP:          "203.0.113.24",
+			EntryPort:         &entryPort,
+			TargetIP:          "142.250.72.14",
+			TargetHost:        "chatgpt.com",
+			TargetPort:        &targetPort,
+			BytesTotal:        4096,
+			FlowCount:         3,
+			EvidenceCount:     2,
+			EvidenceSource:    "ss-log",
+			Confidence:        "high",
+			SampleFingerprint: "daily-chain-fp",
+			SampleMessage:     "connect to chatgpt.com:443",
+			SampleTime:        hour.Add(8 * time.Minute).Unix(),
+		},
+	}); err != nil {
+		t.Fatalf("upsert minute chain: %v", err)
+	}
+	if err := server.store.AggregateHour(ctx, hour.Add(8*time.Minute)); err != nil {
+		t.Fatalf("aggregate hour: %v", err)
+	}
+
+	url := fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1d&proto=tcp&direction=out&comm=ss-server&local_port=12096&remote_ip=142.250.72.14", day.Unix())
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body, _ := io.ReadAll(rec.Body)
+	bodyText := string(body)
+	if !strings.Contains(bodyText, `"chain_id":"usage_chain_1h|`) || !strings.Contains(bodyText, `chatgpt.com`) {
+		t.Fatalf("expected daily explain to replay an hourly chain from later in the day: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, `日聚合数据`) {
+		t.Fatalf("expected daily replay note in body: %s", bodyText)
 	}
 }
 

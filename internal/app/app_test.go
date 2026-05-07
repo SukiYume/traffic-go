@@ -87,7 +87,7 @@ func TestRunAggregationRefreshesLatestCompletedHour(t *testing.T) {
 		t.Fatalf("flush late minute: %v", err)
 	}
 
-	application.runAggregation(ctx)
+	application.runAggregationAt(ctx, latestCompleteHour.Add(time.Hour).Add(2*time.Minute))
 
 	stats, err := application.store.QueryOverview(ctx, latestCompleteHour, latestCompleteHour.Add(time.Hour), store.DataSourceHour)
 	if err != nil {
@@ -95,6 +95,62 @@ func TestRunAggregationRefreshesLatestCompletedHour(t *testing.T) {
 	}
 	if stats.BytesUp != 300 || stats.BytesDown != 100 {
 		t.Fatalf("expected re-aggregated hourly totals, got %+v", stats)
+	}
+}
+
+func TestRunAggregationDoesNotRepeatLatestCompletedHourOutsideGrace(t *testing.T) {
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(t.TempDir(), "traffic.db")
+
+	application, err := New(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = application.Close()
+	})
+
+	ctx := context.Background()
+	now := time.Date(2026, 4, 16, 10, 30, 0, 0, time.UTC)
+	latestCompleteHour := now.Truncate(time.Hour).Add(-time.Hour)
+	minuteA := latestCompleteHour.Add(10 * time.Minute).Unix()
+	minuteB := latestCompleteHour.Add(40 * time.Minute).Unix()
+	key := model.UsageKey{
+		Proto:       "tcp",
+		Direction:   model.DirectionOut,
+		PID:         42,
+		Comm:        "curl",
+		Exe:         "/usr/bin/curl",
+		LocalPort:   50500,
+		RemoteIP:    "1.1.1.1",
+		RemotePort:  443,
+		Attribution: model.AttributionExact,
+	}
+
+	key.MinuteTS = minuteA
+	if err := application.store.FlushMinute(ctx, minuteA, map[model.UsageKey]model.UsageDelta{
+		key: {BytesUp: 100, BytesDown: 40, PktsUp: 1, PktsDown: 1, FlowCount: 1},
+	}, nil); err != nil {
+		t.Fatalf("flush first minute: %v", err)
+	}
+
+	application.runAggregationAt(ctx, now)
+
+	key.MinuteTS = minuteB
+	if err := application.store.FlushMinute(ctx, minuteB, map[model.UsageKey]model.UsageDelta{
+		key: {BytesUp: 200, BytesDown: 60, PktsUp: 2, PktsDown: 2, FlowCount: 1},
+	}, nil); err != nil {
+		t.Fatalf("flush late minute: %v", err)
+	}
+
+	application.runAggregationAt(ctx, now.Add(time.Minute))
+
+	stats, err := application.store.QueryOverview(ctx, latestCompleteHour, latestCompleteHour.Add(time.Hour), store.DataSourceHour)
+	if err != nil {
+		t.Fatalf("query hourly overview: %v", err)
+	}
+	if stats.BytesUp != 100 || stats.BytesDown != 40 {
+		t.Fatalf("expected second run outside grace to skip latest-hour refresh, got %+v", stats)
 	}
 }
 

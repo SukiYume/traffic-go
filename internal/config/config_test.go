@@ -10,7 +10,7 @@ import (
 
 func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	content := []byte("retention:\n  months: 0\n")
+	content := []byte("retention:\n  minute_days: 0\n  hour_months: 0\n  day_months: 0\n  evidence_days: 0\n  chain_days: 0\n")
 	if err := os.WriteFile(configPath, content, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -19,8 +19,20 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Retention.Months != 3 {
-		t.Fatalf("expected default month retention, got %d", cfg.Retention.Months)
+	if cfg.Retention.MinuteDays != 7 {
+		t.Fatalf("expected default minute retention, got %d", cfg.Retention.MinuteDays)
+	}
+	if cfg.Retention.HourMonths != 3 {
+		t.Fatalf("expected default hour retention, got %d", cfg.Retention.HourMonths)
+	}
+	if cfg.Retention.DayMonths != 12 {
+		t.Fatalf("expected default day retention, got %d", cfg.Retention.DayMonths)
+	}
+	if cfg.Retention.EvidenceDays != 14 {
+		t.Fatalf("expected default evidence retention, got %d", cfg.Retention.EvidenceDays)
+	}
+	if cfg.Retention.ChainDays != 14 {
+		t.Fatalf("expected default chain retention, got %d", cfg.Retention.ChainDays)
 	}
 	if len(cfg.ProcessLogDirs) != 0 {
 		t.Fatalf("expected no default process_log_dirs entries, got %v", cfg.ProcessLogDirs)
@@ -31,8 +43,8 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if !cfg.Prefetch.Enabled {
 		t.Fatalf("expected prefetch enabled by default")
 	}
-	if cfg.Prefetch.Interval != time.Minute {
-		t.Fatalf("expected default prefetch interval 1m, got %s", cfg.Prefetch.Interval)
+	if cfg.Prefetch.Interval != 5*time.Minute {
+		t.Fatalf("expected default prefetch interval 5m, got %s", cfg.Prefetch.Interval)
 	}
 	if cfg.Prefetch.EvidenceLookback != 20*time.Minute {
 		t.Fatalf("expected default evidence lookback 20m, got %s", cfg.Prefetch.EvidenceLookback)
@@ -40,17 +52,33 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if cfg.Prefetch.ChainLookback != 20*time.Minute {
 		t.Fatalf("expected default chain lookback 20m, got %s", cfg.Prefetch.ChainLookback)
 	}
-	if cfg.Prefetch.ScanBudget != 8*time.Second {
-		t.Fatalf("expected default scan budget 8s, got %s", cfg.Prefetch.ScanBudget)
+	if cfg.Prefetch.ScanBudget != 2*time.Second {
+		t.Fatalf("expected default scan budget 2s, got %s", cfg.Prefetch.ScanBudget)
 	}
-	if cfg.Prefetch.MaxScanFiles != 6 {
-		t.Fatalf("expected default max scan files 6, got %d", cfg.Prefetch.MaxScanFiles)
+	if cfg.Prefetch.MaxScanFiles != 3 {
+		t.Fatalf("expected default max scan files 3, got %d", cfg.Prefetch.MaxScanFiles)
 	}
-	if cfg.Prefetch.MaxScanLinesPerFile != 250000 {
-		t.Fatalf("expected default max scan lines 250000, got %d", cfg.Prefetch.MaxScanLinesPerFile)
+	if cfg.Prefetch.MaxScanLinesPerFile != 80000 {
+		t.Fatalf("expected default max scan lines 80000, got %d", cfg.Prefetch.MaxScanLinesPerFile)
 	}
 	if cfg.SocketIndexInterval != 10*time.Second {
 		t.Fatalf("expected default socket index interval 10s, got %s", cfg.SocketIndexInterval)
+	}
+}
+
+func TestLoadRetentionOverrides(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := []byte("retention:\n  minute_days: 10\n  hour_months: 4\n  day_months: 6\n  evidence_days: 3\n  chain_days: 5\n")
+	if err := os.WriteFile(configPath, content, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Retention.MinuteDays != 10 || cfg.Retention.HourMonths != 4 || cfg.Retention.DayMonths != 6 || cfg.Retention.EvidenceDays != 3 || cfg.Retention.ChainDays != 5 {
+		t.Fatalf("unexpected retention override: %+v", cfg.Retention)
 	}
 }
 
@@ -238,8 +266,8 @@ func TestDeriveRestoresPrefetchDefaultsForZeroValues(t *testing.T) {
 
 	derived := Derive(cfg)
 
-	if derived.Prefetch.Interval != time.Minute {
-		t.Fatalf("expected derived interval 1m, got %s", derived.Prefetch.Interval)
+	if derived.Prefetch.Interval != 5*time.Minute {
+		t.Fatalf("expected derived interval 5m, got %s", derived.Prefetch.Interval)
 	}
 	if derived.Prefetch.EvidenceLookback != 20*time.Minute {
 		t.Fatalf("expected derived evidence lookback 20m, got %s", derived.Prefetch.EvidenceLookback)
@@ -247,14 +275,14 @@ func TestDeriveRestoresPrefetchDefaultsForZeroValues(t *testing.T) {
 	if derived.Prefetch.ChainLookback != 20*time.Minute {
 		t.Fatalf("expected derived chain lookback 20m, got %s", derived.Prefetch.ChainLookback)
 	}
-	if derived.Prefetch.ScanBudget != 8*time.Second {
-		t.Fatalf("expected derived scan budget 8s, got %s", derived.Prefetch.ScanBudget)
+	if derived.Prefetch.ScanBudget != 2*time.Second {
+		t.Fatalf("expected derived scan budget 2s, got %s", derived.Prefetch.ScanBudget)
 	}
-	if derived.Prefetch.MaxScanFiles != 6 {
-		t.Fatalf("expected derived max scan files 6, got %d", derived.Prefetch.MaxScanFiles)
+	if derived.Prefetch.MaxScanFiles != 3 {
+		t.Fatalf("expected derived max scan files 3, got %d", derived.Prefetch.MaxScanFiles)
 	}
-	if derived.Prefetch.MaxScanLinesPerFile != 250000 {
-		t.Fatalf("expected derived max scan lines 250000, got %d", derived.Prefetch.MaxScanLinesPerFile)
+	if derived.Prefetch.MaxScanLinesPerFile != 80000 {
+		t.Fatalf("expected derived max scan lines 80000, got %d", derived.Prefetch.MaxScanLinesPerFile)
 	}
 	if derived.SocketIndexInterval != 10*time.Second {
 		t.Fatalf("expected derived socket index interval 10s, got %s", derived.SocketIndexInterval)

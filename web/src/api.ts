@@ -284,10 +284,13 @@ function appendListQuery<SortKey extends string>(
 }
 
 function buildUsageQuery(query: UsageQuery) {
+  const hasExplicitWindow = query.start != null && query.end != null;
   return buildQuery(
     appendListQuery(
       [
-        ['range', query.range],
+        ['range', hasExplicitWindow ? undefined : query.range],
+        ['start', query.start],
+        ['end', query.end],
         ['comm', query.comm],
         ['pid', query.pid],
         ['exe', query.exe],

@@ -97,6 +97,30 @@ describe('http api client', () => {
     );
   });
 
+  it('uses explicit start and end for retained monthly detail links', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data_source: 'usage_1d',
+          next_cursor: null,
+          page: 1,
+          page_size: 25,
+          total_rows: 0,
+          data: [],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    await client.getUsage({ start: 1767225600, end: 1769904000, page: 1, pageSize: 25 });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/usage?start=1767225600&end=1769904000&page=1&page_size=25',
+      expect.any(Object),
+    );
+  });
+
   it('decodes monthly archive rows', async () => {
     vi.stubGlobal('fetch', fetchMock);
     fetchMock.mockResolvedValue(

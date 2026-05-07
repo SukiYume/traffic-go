@@ -41,6 +41,17 @@ func forwardSourceInfo(source string) sourceInfo {
 	}
 }
 
+func interfaceSourceInfo(source string) sourceInfo {
+	switch source {
+	case DataSourceDay:
+		return sourceInfo{Table: DataSourceInterfaceDay, TimeCol: "day_ts", DataLabel: DataSourceInterfaceDay}
+	case DataSourceHour:
+		return sourceInfo{Table: DataSourceInterfaceHour, TimeCol: "hour_ts", DataLabel: DataSourceInterfaceHour}
+	default:
+		return sourceInfo{Table: DataSourceInterfaceMinute, TimeCol: "minute_ts", DataLabel: DataSourceInterfaceMinute}
+	}
+}
+
 func EncodeCursor(ts, rowID int64) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d:%d", ts, rowID)))
 }
@@ -187,25 +198,37 @@ func (s *Store) QueryMonthlyUsage(ctx context.Context) ([]model.MonthlyUsageSumm
 	}
 	s.cacheMu.RUnlock()
 
-	liveStart := retentionStartUTC(now, s.retention).Unix()
+	liveMonth := monthStartUTC(now)
+	liveStart := liveMonth.Unix()
+	hourBoundary := hourRetentionStartUTC(now, s.retention).Unix()
+	minuteBoundary := monthlyMinuteBoundaryUTC(now, s.retention).Unix()
+	evidenceCutoff := evidenceRetentionStartUTC(now, s.retention).Unix()
+	chainBoundary := monthlyChainBoundaryUTC(now, s.retention).Unix()
 	liveUpdatedAt := now.Unix()
-	query := monthlyDetailAggregateCTE(monthlyDetailFromInclusive) + `,
+	cte, args := monthlySingleMonthAggregateCTE(monthlyAggregateWindow{
+		start:          liveStart,
+		hourBoundary:   hourBoundary,
+		minuteBoundary: minuteBoundary,
+		evidenceStart:  evidenceCutoff,
+		chainBoundary:  chainBoundary,
+	}, liveStart)
+	query := cte + `,
 combined AS (
     SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
            forward_flow_count, evidence_count, chain_count, updated_at, 1 AS archived
     FROM usage_monthly
-    WHERE month_ts NOT IN (SELECT month_ts FROM monthly_detail)
     UNION ALL
     SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
            forward_flow_count, evidence_count, chain_count, ? AS updated_at, 0 AS archived
     FROM monthly_detail
+    WHERE month_ts NOT IN (SELECT month_ts FROM usage_monthly)
 )
 SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
        forward_flow_count, evidence_count, chain_count, updated_at, archived
 FROM combined
 ORDER BY month_ts DESC
 `
-	args := append(monthlyDetailAggregateArgs(liveStart), liveUpdatedAt)
+	args = append(args, liveUpdatedAt)
 	db := s.queryDB()
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -233,9 +256,7 @@ ORDER BY month_ts DESC
 			return nil, fmt.Errorf("scan monthly usage: %w", err)
 		}
 		summary.Archived = archived != 0
-		if !summary.Archived {
-			summary.DetailRange, summary.DetailAvailable = s.detailRangeForMonth(summary.MonthTS)
-		}
+		summary.DetailRange, summary.DetailAvailable = s.detailRangeForMonth(summary.MonthTS)
 		summaries = append(summaries, summary)
 	}
 	if err := rows.Err(); err != nil {
@@ -252,7 +273,7 @@ func (s *Store) detailRangeForMonth(monthTS int64) (string, bool) {
 	now := s.now().UTC()
 	month := monthStartUTC(time.Unix(monthTS, 0))
 	current := monthStartUTC(now)
-	if month.Before(retentionStartUTC(now, s.retention)) || !month.Before(current.AddDate(0, 1, 0)) {
+	if month.Before(dayRetentionStartUTC(now, s.retention)) || !month.Before(current.AddDate(0, 1, 0)) {
 		return "", false
 	}
 
@@ -324,22 +345,23 @@ WHERE %[1]s >= ? AND %[1]s < ?
 	return points, rows.Err()
 }
 
-func (s *Store) QueryInterfaceTimeseries(ctx context.Context, start, end time.Time, bucket time.Duration) ([]model.InterfaceTimeseriesPoint, error) {
+func (s *Store) QueryInterfaceTimeseries(ctx context.Context, start, end time.Time, bucket time.Duration, source string) ([]model.InterfaceTimeseriesPoint, error) {
+	info := interfaceSourceInfo(source)
 	bucketSeconds := int64(bucket / time.Second)
 	if bucketSeconds <= 0 {
 		bucketSeconds = 60
 	}
 	db := s.queryDB()
-	rows, err := db.QueryContext(ctx, `
-SELECT ((minute_ts / ?) * ?) AS bucket_ts,
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+SELECT ((%[1]s / ?) * ?) AS bucket_ts,
        interface,
        COALESCE(SUM(rx_bytes), 0),
        COALESCE(SUM(tx_bytes), 0)
-FROM interface_1m
-WHERE minute_ts >= ? AND minute_ts < ?
+FROM %[2]s
+WHERE %[1]s >= ? AND %[1]s < ?
 GROUP BY bucket_ts, interface
 ORDER BY bucket_ts ASC, interface ASC
-`, bucketSeconds, bucketSeconds, start.Unix(), end.Unix())
+`, info.TimeCol, info.Table), bucketSeconds, bucketSeconds, start.Unix(), end.Unix())
 	if err != nil {
 		return nil, fmt.Errorf("query interface timeseries: %w", err)
 	}
@@ -348,7 +370,7 @@ ORDER BY bucket_ts ASC, interface ASC
 	points := make([]model.InterfaceTimeseriesPoint, 0)
 	for rows.Next() {
 		var point model.InterfaceTimeseriesPoint
-		point.DataSource = DataSourceInterfaceMinute
+		point.DataSource = info.DataLabel
 		if err := rows.Scan(&point.BucketTS, &point.Interface, &point.RxBytes, &point.TxBytes); err != nil {
 			return nil, fmt.Errorf("scan interface timeseries: %w", err)
 		}
@@ -911,13 +933,21 @@ func appendUsageFiltersDetailed(builder *strings.Builder, args *[]any, query mod
 	}
 }
 
+func escapeLike(value string) string {
+	value = strings.ReplaceAll(value, "!", "!!")
+	value = strings.ReplaceAll(value, "%", "!%")
+	value = strings.ReplaceAll(value, "_", "!_")
+	return value
+}
+
 func appendExeFilter(builder *strings.Builder, args *[]any, exe string) {
 	trimmed := strings.TrimSpace(exe)
 	if trimmed == "" {
 		return
 	}
-	builder.WriteString(" AND (exe = ? OR exe LIKE ? OR exe LIKE ?)")
-	*args = append(*args, trimmed, "%/"+trimmed, "%\\"+trimmed)
+	escaped := escapeLike(trimmed)
+	builder.WriteString(" AND (exe = ? OR exe LIKE ? ESCAPE '!' OR exe LIKE ? ESCAPE '!')")
+	*args = append(*args, trimmed, "%/"+escaped, `%\`+escaped)
 }
 
 func nullableInt(value sql.NullInt64) *int {

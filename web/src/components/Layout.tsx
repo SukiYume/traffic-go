@@ -20,7 +20,7 @@ type RouteMeta = {
 
 const canonicalQueryAllowlist: Record<string, string[]> = {
   '/': ['range'],
-  '/usage': ['range', 'comm', 'pid', 'exe', 'remoteIp', 'localPort', 'direction', 'proto', 'attribution'],
+  '/usage': ['range', 'start', 'end', 'comm', 'pid', 'exe', 'remoteIp', 'localPort', 'direction', 'proto', 'attribution'],
   '/processes': ['range'],
   '/remotes': ['range', 'direction', 'include_loopback', 'exclude_loopback'],
   '/forward': ['range', 'origSrcIp', 'origDstIp', 'proto'],
@@ -176,7 +176,7 @@ export function Layout({ children }: { children: ReactNode }) {
         </nav>
         <div className="sidebar-note">
           <strong>范围规则</strong>
-          <span>完整明细保留本月、上月和上上月；更早月份在 History 中查看月度汇总。</span>
+          <span>分钟明细保留 7 天，小时和日聚合用于更早查询；History 保留自然月汇总。</span>
         </div>
       </aside>
       <main className="content">{children}</main>

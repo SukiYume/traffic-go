@@ -28,6 +28,8 @@ export function useRangeSearchParam(fallback: RangeKey = defaultRange) {
   const setRange = (next: RangeKey) => {
     const nextParams = new URLSearchParams(params);
     nextParams.set('range', next);
+    nextParams.delete('start');
+    nextParams.delete('end');
     setParams(nextParams, { replace: true });
   };
   const setRangedParams = (extra?: Record<string, SearchParamValue>) => {

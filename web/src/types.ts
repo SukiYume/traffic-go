@@ -8,6 +8,8 @@ export type DataSource =
   | 'usage_1h'
   | 'usage_1d'
   | 'interface_1m'
+  | 'interface_1h'
+  | 'interface_1d'
   | 'usage_1m_forward'
   | 'usage_1h_forward'
   | 'usage_1d_forward';
@@ -133,7 +135,9 @@ export interface ProcessOption {
 }
 
 export interface UsageQuery {
-  range: RangeKey;
+  range?: RangeKey;
+  start?: number;
+  end?: number;
   comm?: string;
   pid?: string;
   exe?: string;

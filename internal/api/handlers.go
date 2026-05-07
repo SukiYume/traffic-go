@@ -189,16 +189,26 @@ func (s *Server) handleInterfaceTimeseries(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid_range", err)
 		return
 	}
+	source, ok := s.resolveSourceForWindow(w, start, end, false)
+	if !ok {
+		return
+	}
 	bucket := parseBucket(r.URL.Query().Get("bucket"))
 	if r.URL.Query().Get("bucket") == "" {
-		bucket = defaultBucketForWindow(end.Sub(start), store.DataSourceMinute)
+		bucket = defaultBucketForWindow(end.Sub(start), source)
 	}
-	points, err := s.store.QueryInterfaceTimeseries(r.Context(), start, end, bucket)
+	if source == store.DataSourceDay && bucket < 24*time.Hour {
+		bucket = 24 * time.Hour
+	}
+	if source == store.DataSourceHour && bucket < time.Hour {
+		bucket = time.Hour
+	}
+	points, err := s.store.QueryInterfaceTimeseries(r.Context(), start, end, bucket, source)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope{"data_source": store.DataSourceInterfaceMinute, "data": points})
+	writeJSON(w, http.StatusOK, envelope{"data_source": store.InterfaceDataSource(source), "data": points})
 }
 
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {

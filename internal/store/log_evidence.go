@@ -96,7 +96,6 @@ ON CONFLICT(fingerprint) DO UPDATE SET
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.invalidateCaches()
 	return nil
 }
 
@@ -107,6 +106,11 @@ func (s *Store) QueryLogEvidence(ctx context.Context, query LogEvidenceQuery) ([
 		return s.queryLogEvidenceAnyIP(ctx, query, limit)
 	}
 
+	// event_ts range is intentionally closed on both ends (>= start AND <= end).
+	// The evidence subsystem treats EndTS as inclusive throughout — both the
+	// file-scanning collector (evidence/search.go) and all callers of
+	// LogEvidenceQuery pass EndTS as the last second to include, not as an
+	// exclusive upper bound. Do not change to < without updating all callers.
 	sqlText := `
 SELECT source, event_ts, client_ip, target_ip, host, host_normalized, path, method, entry_port, target_port, status, message, fingerprint
 FROM log_evidence
@@ -170,6 +174,7 @@ func (s *Store) queryLogEvidenceAnyIP(ctx context.Context, query LogEvidenceQuer
 		extraArgs = append(extraArgs, query.TargetPort)
 	}
 
+	// See QueryLogEvidence for why event_ts uses a closed interval (<=).
 	sqlText := `
 SELECT source, event_ts, client_ip, target_ip, host, host_normalized, path, method, entry_port, target_port, status, message, fingerprint
 FROM (

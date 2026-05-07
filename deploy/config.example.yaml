@@ -50,16 +50,21 @@ process_log_dirs:
 shadowsocks_journal_fallback: false
 
 retention:
-  months: 3
-  # Full detail is retained by UTC calendar month: current month plus the
-  # previous two months. Expired months are summarized before detail cleanup.
+  minute_days: 7
+  hour_months: 3
+  day_months: 12
+  evidence_days: 14
+  chain_days: 14
+  # minute_days keeps high-cardinality per-minute rows short. hour_months and
+  # day_months keep progressively coarser aggregates for detail pages. Closed
+  # UTC calendar months are summarized into usage_monthly before detail cleanup.
 
 prefetch:
   enabled: true
-  interval: 1m
+  interval: 5m
   evidence_lookback: 20m
   chain_lookback: 20m
-  scan_budget: 8s
-  max_scan_files: 6
-  max_scan_lines_per_file: 250000
-# Hourly cleanup and weekly vacuum are built in and are not configurable here.
+  scan_budget: 2s
+  max_scan_files: 3
+  max_scan_lines_per_file: 80000
+# Hourly cleanup, WAL truncation, and weekly vacuum are built in and are not configurable here.
