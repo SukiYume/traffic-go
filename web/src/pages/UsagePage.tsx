@@ -10,7 +10,7 @@ import { QueryErrorState } from "../components/QueryErrorState";
 import { RangeSelect } from "../components/RangeSelect";
 import { isDimensionUnavailableError, normalizeUsageSortKey } from "../api";
 import { useApiClient } from "../api-context";
-import type { DataSource, UsageExplain, UsageRow } from "../types";
+import type { DataSource, RangeKey, UsageExplain, UsageRow } from "../types";
 import { useRangeSearchParam } from "../useRangeSearchParam";
 import { useResettingPage } from "../useResettingPage";
 import {
@@ -88,6 +88,18 @@ function setUsageSearchParams(
     }
   }
   setParams(nextParams, { replace: true });
+}
+
+function defaultUsageSorting(range: RangeKey, explicitWindow: ExplicitUsageWindow | null): SortingState {
+  if (
+    explicitWindow ||
+    range === "this_month" ||
+    range === "last_month" ||
+    range === "two_months_ago"
+  ) {
+    return [{ id: "bytesTotal", desc: true }];
+  }
+  return [{ id: "minuteTs", desc: true }];
 }
 
 function uniqueNonLoopbackIps(values: Array<string | null | undefined>) {
@@ -509,9 +521,11 @@ function UsageExpandPanel({
 export function UsagePage() {
   const api = useApiClient();
   const { range, explicitWindow, filters, setRange, setFilters } = useUsageFilters();
-  const [sorting, setSorting] = useState<SortingState>([
-    { id: "minuteTs", desc: true },
-  ]);
+  const defaultSorting = useMemo(
+    () => defaultUsageSorting(range, explicitWindow),
+    [range, explicitWindow?.start, explicitWindow?.end],
+  );
+  const [sorting, setSorting] = useState<SortingState>(defaultSorting);
   const [expandedRowKey, setExpandedRowKey] = useState<string | null>(null);
 
   // Serialize filters to a stable string so this effect only fires when filter
@@ -525,6 +539,10 @@ export function UsagePage() {
     sorting[0]?.desc ?? null,
   ]);
   const [page, setPage] = useResettingPage(pageResetKey);
+
+  useEffect(() => {
+    setSorting(defaultSorting);
+  }, [defaultSorting]);
 
   useEffect(() => {
     setExpandedRowKey(null);

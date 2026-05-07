@@ -318,7 +318,18 @@ describe("traffic-go web ui", () => {
 
   it("replays persisted chain analysis for hourly usage rows", async () => {
     const user = userEvent.setup();
-    renderWithProviders("/usage?range=last_month", <UsagePage />, createAggregatedClient("usage_1h"));
+    const base = createAggregatedClient("usage_1h");
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        return base.getUsage(
+          { ...query, sortBy: "minuteTs", sortOrder: "desc" },
+          requestOptions,
+        );
+      },
+    };
+
+    renderWithProviders("/usage?range=last_month", <UsagePage />, client);
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
     const rows = await screen.findAllByRole("row");
@@ -491,6 +502,52 @@ describe("traffic-go web ui", () => {
       expect(usageCalls.length).toBeGreaterThan(0);
     });
     expect(usageCalls.every((call) => call.page === 1)).toBe(true);
+  });
+
+  it("defaults monthly usage windows to total traffic sorting", async () => {
+    const base = createAggregatedClient("usage_1h");
+    const usageCalls: Array<Record<string, unknown>> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        usageCalls.push({ ...query });
+        return base.getUsage(query, requestOptions);
+      },
+    };
+
+    renderWithProviders("/usage?range=last_month", <UsagePage />, client);
+
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        usageCalls.some(
+          (call) => call.sortBy === "bytesTotal" && call.sortOrder === "desc",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("keeps recent usage windows sorted by time", async () => {
+    const base = createMockApiClient();
+    const usageCalls: Array<Record<string, unknown>> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        usageCalls.push({ ...query });
+        return base.getUsage(query, requestOptions);
+      },
+    };
+
+    renderWithProviders("/usage?range=7d", <UsagePage />, client);
+
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        usageCalls.some(
+          (call) => call.sortBy === "minuteTs" && call.sortOrder === "desc",
+        ),
+      ).toBe(true);
+    });
   });
 
   it("mounts the app shell with navigation", () => {
