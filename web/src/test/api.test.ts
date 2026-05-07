@@ -97,6 +97,30 @@ describe('http api client', () => {
     );
   });
 
+  it('maps usage protocol sorting to the backend query param', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data_source: 'usage_1m',
+          next_cursor: null,
+          page: 1,
+          page_size: 25,
+          total_rows: 0,
+          data: [],
+        }),
+      ),
+    );
+
+    const client = createHttpClient();
+    await client.getUsage({ range: '24h', page: 1, pageSize: 25, sortBy: 'proto', sortOrder: 'asc' });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/usage?range=24h&page=1&page_size=25&sort_by=proto&sort_order=asc',
+      expect.any(Object),
+    );
+  });
+
   it('uses explicit start and end for retained monthly detail links', async () => {
     vi.stubGlobal('fetch', fetchMock);
     fetchMock.mockResolvedValue(
@@ -201,6 +225,11 @@ describe('http api client', () => {
       activeProcesses: 2,
       dataSource: 'usage_1m',
     });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/v1/stats/overview?range=24h&summary=1',
+      expect.any(Object),
+    );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       '/api/v1/stats/timeseries?range=24h&bucket=5m&group_by=direction&comm=ss-server',
@@ -353,6 +382,62 @@ describe('http api client', () => {
     );
     expect(processes.rows[0]).toMatchObject({ pid: 1045, comm: 'nginx', totalBytes: 480 });
     expect(remotes.rows[0]).toMatchObject({ direction: 'in', remoteIp: '203.0.113.24', totalBytes: 480 });
+  });
+
+  it('builds dashboard summary queries', async () => {
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data_source: 'usage_1h',
+            page: 1,
+            page_size: 5,
+            total_rows: 6,
+            data: [{ pid: null, comm: 'nginx', exe: null, bytes_up: 120, bytes_down: 360, flow_count: 3 }],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data_source: 'usage_1h',
+            page: 1,
+            page_size: 5,
+            total_rows: 6,
+            data: [{ direction: 'in', remote_ip: '203.0.113.24', bytes_up: 120, bytes_down: 360, flow_count: 3 }],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data_source: 'usage_1h',
+            data: [{ key: '443', bytes_up: 120, bytes_down: 360, flow_count: 3 }],
+          }),
+        ),
+      );
+
+    const client = createHttpClient();
+    await client.getTopProcesses('24h', { page: 1, pageSize: 5, groupBy: 'pid', summary: true });
+    await client.getTopRemotes('24h', { page: 1, pageSize: 5, direction: 'in', includeLoopback: true, summary: true });
+    await client.getTopPorts('24h');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/v1/top/processes?range=24h&page=1&page_size=5&sort_by=bytes_total&group_by=pid&summary=1',
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/v1/top/remotes?range=24h&page=1&page_size=5&sort_by=bytes_total&direction=in&include_loopback=1&summary=1',
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      '/api/v1/top/ports?range=24h&by=total&summary=1',
+      expect.any(Object),
+    );
   });
 
   it('preserves empty process names in hourly process summaries', async () => {
@@ -738,5 +823,6 @@ describe('normalizeUsageSortKey', () => {
 
   it('keeps supported sort keys unchanged', () => {
     expect(normalizeUsageSortKey('bytesTotal')).toBe('bytesTotal');
+    expect(normalizeUsageSortKey('proto')).toBe('proto');
   });
 });

@@ -110,4 +110,29 @@ describe('DataTable row expansion', () => {
     await user.keyboard('{Enter}');
     expect(onExpandRow).toHaveBeenCalledWith(0);
   });
+
+  it('supports direct page jumps', async () => {
+    const user = userEvent.setup();
+    const onPageChange = vi.fn();
+    render(
+      <DataTable
+        columns={columns}
+        data={data}
+        pagination={{
+          page: 2,
+          pageSize: 25,
+          totalRows: 200,
+          totalRowsExact: true,
+          onPageChange,
+        }}
+      />,
+    );
+
+    const input = screen.getByLabelText('跳转页码');
+    await user.clear(input);
+    await user.type(input, '6');
+    await user.click(screen.getByRole('button', { name: '跳页' }));
+
+    expect(onPageChange).toHaveBeenCalledWith(6);
+  });
 });

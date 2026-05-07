@@ -110,6 +110,52 @@ func TestInterfaceUsageAggregatesToHourAndDay(t *testing.T) {
 	}
 }
 
+func TestQueryInterfaceTimeseriesSummaryIncludesMinuteTail(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 8, 12, 35, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	oldHour := now.Add(-8 * 24 * time.Hour).Truncate(time.Hour)
+	if err := store.FlushInterfaceMinute(ctx, oldHour.Add(5*time.Minute).Unix(), map[string]model.InterfaceUsageDelta{
+		"eth0": {RxBytes: 1000, TxBytes: 2000},
+	}); err != nil {
+		t.Fatalf("flush old interface minute: %v", err)
+	}
+	if err := store.AggregateHour(ctx, oldHour); err != nil {
+		t.Fatalf("aggregate old interface hour: %v", err)
+	}
+
+	currentMinute := now.Truncate(time.Minute)
+	if err := store.FlushInterfaceMinute(ctx, currentMinute.Unix(), map[string]model.InterfaceUsageDelta{
+		"eth0": {RxBytes: 300, TxBytes: 700},
+	}); err != nil {
+		t.Fatalf("flush current interface minute: %v", err)
+	}
+
+	points, source, err := store.QueryInterfaceTimeseriesSummary(ctx, oldHour, now.Add(time.Minute), time.Hour)
+	if err != nil {
+		t.Fatalf("query interface summary: %v", err)
+	}
+	if source != DataSourceInterfaceHour {
+		t.Fatalf("expected hourly summary source, got %s", source)
+	}
+	byBucket := make(map[int64]model.InterfaceTimeseriesPoint)
+	for _, point := range points {
+		if point.Interface == "eth0" {
+			byBucket[point.BucketTS] = point
+		}
+	}
+	oldPoint, ok := byBucket[oldHour.Unix()]
+	if !ok || oldPoint.RxBytes != 1000 || oldPoint.TxBytes != 2000 {
+		t.Fatalf("expected old hourly point, got %+v", points)
+	}
+	tailPoint, ok := byBucket[now.Truncate(time.Hour).Unix()]
+	if !ok || tailPoint.RxBytes != 300 || tailPoint.TxBytes != 700 {
+		t.Fatalf("expected current minute tail point, got %+v", points)
+	}
+}
+
 func TestResolveUsageSource(t *testing.T) {
 	store := newTestStore(t)
 	start := time.Unix(0, 0)
@@ -1143,6 +1189,137 @@ func TestQueryUsageHourlyReturnsNullForMinuteOnlyDimensions(t *testing.T) {
 	}
 }
 
+func TestQueryUsageHourlyCollapsesOutboundEphemeralLocalPorts(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	hour := time.Date(2026, 4, 30, 23, 0, 0, 0, time.UTC)
+	if err := store.FlushMinute(ctx, hour.Add(2*time.Minute).Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    hour.Add(2 * time.Minute).Unix(),
+			Proto:       "udp",
+			Direction:   model.DirectionOut,
+			PID:         0,
+			Comm:        "",
+			Exe:         "",
+			LocalPort:   60997,
+			RemoteIP:    "2001:4860:4860::8888",
+			RemotePort:  53,
+			Attribution: model.AttributionUnknown,
+		}: {
+			BytesUp:   160,
+			BytesDown: 350,
+			PktsUp:    1,
+			PktsDown:  1,
+			FlowCount: 1,
+		},
+		{
+			MinuteTS:    hour.Add(8 * time.Minute).Unix(),
+			Proto:       "udp",
+			Direction:   model.DirectionOut,
+			PID:         0,
+			Comm:        "",
+			Exe:         "",
+			LocalPort:   60900,
+			RemoteIP:    "2001:4860:4860::8888",
+			RemotePort:  53,
+			Attribution: model.AttributionUnknown,
+		}: {
+			BytesUp:   170,
+			BytesDown: 262,
+			PktsUp:    1,
+			PktsDown:  1,
+			FlowCount: 1,
+		},
+		{
+			MinuteTS:    hour.Add(12 * time.Minute).Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionIn,
+			PID:         3312,
+			Comm:        "nginx",
+			Exe:         "/usr/sbin/nginx",
+			LocalPort:   80,
+			RemoteIP:    "198.51.100.24",
+			RemotePort:  50000,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   100,
+			BytesDown: 200,
+			PktsUp:    1,
+			PktsDown:  1,
+			FlowCount: 1,
+		},
+		{
+			MinuteTS:    hour.Add(18 * time.Minute).Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionIn,
+			PID:         3312,
+			Comm:        "nginx",
+			Exe:         "/usr/sbin/nginx",
+			LocalPort:   443,
+			RemoteIP:    "198.51.100.24",
+			RemotePort:  50001,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   300,
+			BytesDown: 400,
+			PktsUp:    2,
+			PktsDown:  2,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("flush minute: %v", err)
+	}
+	if err := store.AggregateHour(ctx, hour); err != nil {
+		t.Fatalf("aggregate hour: %v", err)
+	}
+
+	rows, _, totalRows, err := store.QueryUsage(ctx, model.UsageQuery{
+		Start:        hour,
+		End:          hour.Add(time.Hour),
+		UsePage:      true,
+		Page:         1,
+		PageSize:     10,
+		IncludeTotal: true,
+		SortBy:       "bytes_total",
+		SortOrder:    "desc",
+	}, DataSourceHour)
+	if err != nil {
+		t.Fatalf("query hourly usage: %v", err)
+	}
+	if totalRows != 3 || len(rows) != 3 {
+		t.Fatalf("expected one collapsed outbound row plus two inbound ports, total=%d rows=%+v", totalRows, rows)
+	}
+	rowTotal := func(row model.UsageRecord) int64 {
+		return row.BytesUp + row.BytesDown
+	}
+	if rows[0].RemoteIP != "2001:4860:4860::8888" || rowTotal(rows[0]) != 942 {
+		t.Fatalf("expected largest collapsed DNS row first after total-byte sort, got %+v", rows)
+	}
+	if rows[1].LocalPort != 443 || rowTotal(rows[1]) != 700 {
+		t.Fatalf("expected second largest inbound 443 row after total-byte sort, got %+v", rows)
+	}
+	if rows[2].LocalPort != 80 || rowTotal(rows[2]) != 300 {
+		t.Fatalf("expected smallest inbound 80 row after total-byte sort, got %+v", rows)
+	}
+
+	var dnsRows int
+	for _, row := range rows {
+		if row.Direction == model.DirectionOut && row.RemoteIP == "2001:4860:4860::8888" {
+			dnsRows++
+			if row.LocalPort != 0 {
+				t.Fatalf("expected collapsed outbound local port to be zero, got %+v", row)
+			}
+			if row.BytesUp != 330 || row.BytesDown != 612 || row.FlowCount != 2 {
+				t.Fatalf("unexpected collapsed dns totals: %+v", row)
+			}
+		}
+	}
+	if dnsRows != 1 {
+		t.Fatalf("expected exactly one collapsed dns row, got %d rows=%+v", dnsRows, rows)
+	}
+}
+
 func TestQueryUsageSupportsExeBasenameFilter(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1637,6 +1814,91 @@ func TestQueryOverviewRespectsRequestedWindow(t *testing.T) {
 	}
 	if fullStats.BytesUp != 400 || fullStats.BytesDown != 600 {
 		t.Fatalf("unexpected full stats: %+v", fullStats)
+	}
+}
+
+func TestUsageSummaryQueriesPreserveMinuteEdgeTotals(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 8, 12, 35, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	start := time.Date(2026, 5, 8, 9, 15, 0, 0, time.UTC)
+	end := now
+
+	usage := map[model.UsageKey]model.UsageDelta{}
+	addRow := func(ts time.Time, localPort int, remoteIP string, up int64, down int64) {
+		usage[model.UsageKey{
+			MinuteTS:    ts.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         42,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   localPort,
+			RemoteIP:    remoteIP,
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}] = model.UsageDelta{BytesUp: up, BytesDown: down, PktsUp: 1, PktsDown: 1, FlowCount: 1}
+	}
+	addRow(time.Date(2026, 5, 8, 9, 20, 0, 0, time.UTC), 50001, "198.51.100.10", 100, 10)
+	addRow(time.Date(2026, 5, 8, 10, 20, 0, 0, time.UTC), 50002, "198.51.100.10", 200, 20)
+	addRow(time.Date(2026, 5, 8, 11, 20, 0, 0, time.UTC), 50003, "203.0.113.20", 300, 30)
+	addRow(time.Date(2026, 5, 8, 12, 10, 0, 0, time.UTC), 50004, "203.0.113.20", 400, 40)
+	if err := store.FlushMinute(ctx, start.Unix(), usage, nil); err != nil {
+		t.Fatalf("flush minute usage: %v", err)
+	}
+	for _, hour := range []time.Time{
+		time.Date(2026, 5, 8, 9, 0, 0, 0, time.UTC),
+		time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
+		time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC),
+	} {
+		if err := store.AggregateHour(ctx, hour); err != nil {
+			t.Fatalf("aggregate hour %s: %v", hour, err)
+		}
+	}
+
+	exact, err := store.QueryOverview(ctx, start, end, DataSourceMinute)
+	if err != nil {
+		t.Fatalf("query exact overview: %v", err)
+	}
+	summary, err := store.QueryOverviewSummary(ctx, start, end)
+	if err != nil {
+		t.Fatalf("query summary overview: %v", err)
+	}
+	if summary.BytesUp != exact.BytesUp || summary.BytesDown != exact.BytesDown || summary.FlowCount != exact.FlowCount {
+		t.Fatalf("summary overview changed totals: exact=%+v summary=%+v", exact, summary)
+	}
+
+	remotes, _, remoteSource, err := store.QueryTopRemotesSummary(ctx, start, end, model.DirectionOut, true, "bytes_total", "desc", 10, 0, true)
+	if err != nil {
+		t.Fatalf("query summary remotes: %v", err)
+	}
+	if remoteSource != DataSourceHour {
+		t.Fatalf("expected mixed summary to report hourly data source, got %s", remoteSource)
+	}
+	if len(remotes) != 2 {
+		t.Fatalf("expected two remote groups, got %+v", remotes)
+	}
+	var remoteTotal int64
+	for _, row := range remotes {
+		remoteTotal += row.BytesUp + row.BytesDown
+	}
+	if remoteTotal != exact.BytesUp+exact.BytesDown {
+		t.Fatalf("summary remote totals changed: exact=%d remoteTotal=%d rows=%+v", exact.BytesUp+exact.BytesDown, remoteTotal, remotes)
+	}
+
+	processes, _, processSource, err := store.QueryTopProcessesSummary(ctx, start, end, "pid", "bytes_total", "desc", 10, 0, true)
+	if err != nil {
+		t.Fatalf("query summary processes: %v", err)
+	}
+	if processSource != DataSourceHour {
+		t.Fatalf("expected process summary to report hourly data source, got %s", processSource)
+	}
+	if len(processes) != 1 || processes[0].PID != nil || processes[0].Comm != "curl" {
+		t.Fatalf("expected aggregated process summary to fall back to comm, got %+v", processes)
+	}
+	if processes[0].BytesUp != exact.BytesUp || processes[0].BytesDown != exact.BytesDown || processes[0].FlowCount != exact.FlowCount {
+		t.Fatalf("summary process totals changed: exact=%+v processes=%+v", exact, processes)
 	}
 }
 

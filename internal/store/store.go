@@ -150,7 +150,7 @@ func Open(cfg config.Config) (*Store, error) {
 		retention: cfg.Retention,
 		now:       time.Now,
 	}
-	if err := store.Migrate(context.Background()); err != nil {
+	if err := store.ensureSchema(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -344,92 +344,9 @@ func poolDiagnostics(stats sql.DBStats) model.StorePoolDiagnostics {
 	}
 }
 
-func (s *Store) Migrate(ctx context.Context) error {
+func (s *Store) ensureSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
-	}
-	if err := s.backfillKnownProcesses(ctx); err != nil {
-		return err
-	}
-	if err := s.backfillInterfaceAggregates(ctx); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Store) backfillInterfaceAggregates(ctx context.Context) error {
-	var existing int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM interface_1h`).Scan(&existing); err != nil {
-		return fmt.Errorf("count interface 1h: %w", err)
-	}
-	if existing > 0 {
-		return nil
-	}
-	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO interface_1h (
-    hour_ts, interface, rx_bytes, tx_bytes
-)
-SELECT (minute_ts / 3600) * 3600 AS hour_ts,
-       interface,
-       SUM(rx_bytes),
-       SUM(tx_bytes)
-FROM interface_1m
-GROUP BY hour_ts, interface
-HAVING 1
-ON CONFLICT(hour_ts, interface) DO UPDATE SET
-    rx_bytes = excluded.rx_bytes,
-    tx_bytes = excluded.tx_bytes
-`); err != nil {
-		return fmt.Errorf("backfill interface hourly aggregates: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO interface_1d (
-    day_ts, interface, rx_bytes, tx_bytes
-)
-SELECT (hour_ts / 86400) * 86400 AS day_ts,
-       interface,
-       SUM(rx_bytes),
-       SUM(tx_bytes)
-FROM interface_1h
-GROUP BY day_ts, interface
-HAVING 1
-ON CONFLICT(day_ts, interface) DO UPDATE SET
-    rx_bytes = excluded.rx_bytes,
-    tx_bytes = excluded.tx_bytes
-`); err != nil {
-		return fmt.Errorf("backfill interface daily aggregates: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) backfillKnownProcesses(ctx context.Context) error {
-	var existing int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM known_processes`).Scan(&existing); err != nil {
-		return fmt.Errorf("count known processes: %w", err)
-	}
-	if existing > 0 {
-		return nil
-	}
-	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO known_processes (pid, comm, exe, seen_ts)
-SELECT pid, comm, exe, MAX(minute_ts) AS seen_ts
-FROM usage_1m
-WHERE pid > 0 OR comm <> '' OR exe <> ''
-GROUP BY pid, comm, exe
-`); err != nil {
-		return fmt.Errorf("backfill known processes from minute usage: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO known_processes (pid, comm, exe, seen_ts)
-SELECT 0, comm, '', MAX(hour_ts) AS seen_ts
-FROM usage_1h
-WHERE comm <> ''
-GROUP BY comm
-HAVING 1
-ON CONFLICT(pid, comm, exe) DO UPDATE SET
-    seen_ts = MAX(known_processes.seen_ts, excluded.seen_ts)
-`); err != nil {
-		return fmt.Errorf("backfill known processes from hourly usage: %w", err)
 	}
 	return nil
 }

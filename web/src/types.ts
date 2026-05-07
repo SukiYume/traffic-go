@@ -14,7 +14,7 @@ export type DataSource =
   | 'usage_1h_forward'
   | 'usage_1d_forward';
 export type SortOrder = 'asc' | 'desc';
-export type UsageSortKey = 'minuteTs' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount' | 'remoteIp' | 'direction' | 'localPort' | 'comm' | 'pid';
+export type UsageSortKey = 'minuteTs' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount' | 'remoteIp' | 'direction' | 'proto' | 'localPort' | 'comm' | 'pid';
 export type ForwardSortKey = 'minuteTs' | 'bytesOrig' | 'bytesReply' | 'bytesTotal' | 'flowCount' | 'origSrc' | 'origDst';
 export type RemoteSortKey = 'remoteIp' | 'direction' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount';
 export type ProcessSortKey = 'comm' | 'pid' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount';
@@ -304,8 +304,8 @@ export interface TrafficApiClient {
   getNetworkTimeSeries(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<NetworkTimeSeriesResponse>;
   getUsage(query: UsageQuery, requestOptions?: ApiRequestOptions): Promise<UsageResponse>;
   getUsageExplain(row: UsageRow, options?: { dataSource?: DataSource; allowScan?: boolean }, requestOptions?: ApiRequestOptions): Promise<UsageExplain>;
-  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean }, requestOptions?: ApiRequestOptions): Promise<ProcessSummaryResponse>;
-  getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean; includeTotal?: boolean }, requestOptions?: ApiRequestOptions): Promise<RemoteSummaryResponse>;
+  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean; summary?: boolean }, requestOptions?: ApiRequestOptions): Promise<ProcessSummaryResponse>;
+  getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean; includeTotal?: boolean; summary?: boolean }, requestOptions?: ApiRequestOptions): Promise<RemoteSummaryResponse>;
   getTopPorts(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<TopResponse>;
   getProcesses(requestOptions?: ApiRequestOptions): Promise<ProcessesResponse>;
   getForwardUsage(query: ForwardUsageQuery, requestOptions?: ApiRequestOptions): Promise<ForwardUsageResponse>;

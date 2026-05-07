@@ -87,11 +87,11 @@ export function ForwardPage() {
         cell: (info) => formatBytes(info.getValue()),
       }),
       columnHelper.accessor('flowCount', { id: 'flowCount', header: '流数', meta: { className: 'col-fwd-count', align: 'right', nowrap: true } }),
-      columnHelper.display({
+      columnHelper.accessor((row) => row.bytesOrig + row.bytesReply, {
         id: 'bytesTotal',
         header: '总量',
         meta: { className: 'col-bytes col-bytes-total', align: 'right', nowrap: true },
-        cell: (info) => formatBytes(info.row.original.bytesOrig + info.row.original.bytesReply),
+        cell: (info) => formatBytes(info.getValue()),
       }),
     ],
     [],

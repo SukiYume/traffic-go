@@ -1,4 +1,4 @@
-import { Fragment } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import {
   flexRender,
   getCoreRowModel,
@@ -8,7 +8,7 @@ import {
   type OnChangeFn,
   type SortingState,
 } from '@tanstack/react-table';
-import type { KeyboardEvent, ReactNode } from 'react';
+import type { FormEvent, KeyboardEvent, ReactNode } from 'react';
 import { formatNumber } from '../utils';
 
 type PaginationState = {
@@ -89,6 +89,7 @@ export function DataTable<TData>({
   onSortingChange,
   manualSorting = false,
   pagination,
+  busy = false,
   onRowClick,
   isRowSelected,
   expandedRowIndex,
@@ -107,6 +108,7 @@ export function DataTable<TData>({
   onSortingChange?: OnChangeFn<SortingState>;
   manualSorting?: boolean;
   pagination?: PaginationState;
+  busy?: boolean;
   onRowClick?: (row: TData) => void;
   isRowSelected?: (row: TData) => boolean;
   expandedRowIndex?: number | null;
@@ -140,9 +142,26 @@ export function DataTable<TData>({
         : `已加载 ${formatNumber(pagination.totalRows)} 条`
       : `共 ${formatNumber(pagination.totalRows)} 条`
     : '';
+  const [pageInput, setPageInput] = useState(String(pagination?.page ?? 1));
+  useEffect(() => {
+    setPageInput(String(pagination?.page ?? 1));
+  }, [pagination?.page]);
+  const parsedJumpPage = Number.parseInt(pageInput, 10);
+  const jumpPage =
+    pagination && Number.isFinite(parsedJumpPage) && parsedJumpPage > 0
+      ? pagination.totalRowsExact === false && pagination.hasMore
+        ? parsedJumpPage
+        : Math.min(parsedJumpPage, totalPages)
+      : null;
+  const canJump = pagination != null && jumpPage != null && jumpPage !== pagination.page;
+  const submitPageJump = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!pagination || jumpPage == null || jumpPage === pagination.page) return;
+    pagination.onPageChange(jumpPage);
+  };
 
   return (
-    <div className={cardClassName ? `table-card ${cardClassName}` : 'table-card'}>
+    <div className={cardClassName ? `table-card ${cardClassName}` : 'table-card'} aria-busy={busy || undefined}>
       <div className="table-wrap">
         <table className={tableClassName ? `table ${tableClassName}` : 'table'}>
           <thead>
@@ -250,10 +269,26 @@ export function DataTable<TData>({
       </div>
       {pagination ? (
         <footer className="table-footer">
-          <span>
-            第 {pagination.page} / {formatNumber(totalPages)} 页，{totalLabel}
+          <span className="table-footer-summary">
+            <span>
+              第 {pagination.page} / {formatNumber(totalPages)} 页，{totalLabel}
+            </span>
+            {busy ? <span className="table-refreshing">刷新中</span> : null}
           </span>
           <div className="table-footer-actions">
+            <form className="table-page-jump" onSubmit={submitPageJump}>
+              <input
+                aria-label="跳转页码"
+                inputMode="numeric"
+                min={1}
+                type="number"
+                value={pageInput}
+                onChange={(event) => setPageInput(event.target.value)}
+              />
+              <button type="submit" className="chip ghost" disabled={!canJump}>
+                跳页
+              </button>
+            </form>
             <button type="button" className="chip ghost" onClick={() => pagination.onPageChange(1)} disabled={pagination.page <= 1}>
               首页
             </button>

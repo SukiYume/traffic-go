@@ -281,6 +281,9 @@ function sortUsageRows(rows: UsageRow[], sortBy?: UsageSortKey, sortOrder?: Sort
       case 'direction':
         result = compareText(left.direction, right.direction);
         break;
+      case 'proto':
+        result = compareText(left.proto, right.proto);
+        break;
       case 'localPort':
         result = compareNumber(left.localPort, right.localPort);
         break;
@@ -756,16 +759,20 @@ export function createMockApiClient(): TrafficApiClient {
     async getUsage(query) {
       const range = query.range ?? '24h';
       const rows = normalizeUsageRows(range, createFilteredUsage(query));
-      const page = paginate(rows, query.page ?? 1, query.pageSize ?? 25);
+      const safePage = Math.max(query.page ?? 1, 1);
+      const safePageSize = Math.min(Math.max(1, query.pageSize ?? 25), 200);
+      const offset = (safePage - 1) * safePageSize;
+      const windowRows = rows.slice(offset, offset + safePageSize + 1);
+      const hasMore = windowRows.length > safePageSize;
       return {
         dataSource: 'usage_1m',
-        rows: page.rows,
+        rows: windowRows.slice(0, safePageSize),
         nextCursor: null,
-        page: page.page,
-        pageSize: page.pageSize,
-        totalRows: page.totalRows,
-        hasMore: page.page * page.pageSize < page.totalRows,
-        totalRowsExact: true,
+        page: safePage,
+        pageSize: safePageSize,
+        totalRows: query.includeTotal ? rows.length : offset + Math.min(windowRows.length, safePageSize) + (hasMore ? 1 : 0),
+        hasMore,
+        totalRowsExact: Boolean(query.includeTotal),
       };
     },
     async getUsageExplain(row) {

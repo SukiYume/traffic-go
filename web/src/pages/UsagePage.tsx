@@ -91,12 +91,7 @@ function setUsageSearchParams(
 }
 
 function defaultUsageSorting(range: RangeKey, explicitWindow: ExplicitUsageWindow | null): SortingState {
-  if (
-    explicitWindow ||
-    range === "this_month" ||
-    range === "last_month" ||
-    range === "two_months_ago"
-  ) {
+  if (!explicitWindow && (range === "last_month" || range === "two_months_ago")) {
     return [{ id: "bytesTotal", desc: true }];
   }
   return [{ id: "minuteTs", desc: true }];
@@ -571,7 +566,7 @@ export function UsagePage() {
         pageSize,
         sortBy: normalizeUsageSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? "desc" : "asc",
-        includeTotal: true,
+        includeTotal: false,
       }, { signal }),
     placeholderData: keepPreviousData,
   });
@@ -723,7 +718,7 @@ export function UsagePage() {
         meta: { className: "col-bytes", align: "right", nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
-      columnHelper.display({
+      columnHelper.accessor((row) => row.bytesUp + row.bytesDown, {
         id: "bytesTotal",
         header: "总流量",
         meta: {
@@ -731,8 +726,7 @@ export function UsagePage() {
           align: "right",
           nowrap: true,
         },
-        cell: (info) =>
-          formatBytes(info.row.original.bytesUp + info.row.original.bytesDown),
+        cell: (info) => formatBytes(info.getValue()),
       }),
     ];
 
@@ -796,6 +790,7 @@ export function UsagePage() {
           sorting={sorting}
           onSortingChange={setSorting}
           manualSorting
+          busy={query.isFetching}
           expandedRowKey={expandedRowKey}
           onExpandRowKeyChange={setExpandedRowKey}
           getExpandedRowKey={usageRowKey}

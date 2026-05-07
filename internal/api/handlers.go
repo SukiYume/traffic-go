@@ -109,11 +109,21 @@ func (s *Server) resolvePagedWindowSource(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
-	window, ok := s.resolveWindowSource(w, r, false)
-	if !ok {
+	start, end, rangeLabel, err := parseWindow(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_range", err)
 		return
 	}
-	stats, err := s.store.QueryOverview(r.Context(), window.Start, window.End, window.Source)
+	var stats model.OverviewStats
+	if summaryRequested(r) {
+		stats, err = s.store.QueryOverviewSummary(r.Context(), start, end)
+	} else {
+		source, ok := s.resolveSourceForWindow(w, start, end, false)
+		if !ok {
+			return
+		}
+		stats, err = s.store.QueryOverview(r.Context(), start, end, source)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
@@ -121,7 +131,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	activeStats := s.runtime.ActiveStats()
 	stats.ActiveConnections = activeStats.Connections
 	stats.ActiveProcesses = activeStats.Processes
-	stats.Range = window.RangeLabel
+	stats.Range = rangeLabel
 	writeJSON(w, http.StatusOK, envelope{"data": stats})
 }
 
@@ -150,7 +160,8 @@ func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 		pidFilter = &pid
 	}
 	exeFilter := r.URL.Query().Get("exe")
-	source, ok := s.resolveSourceForWindow(w, start, end, pidFilter != nil || exeFilter != "")
+	requiresMinute := pidFilter != nil || exeFilter != ""
+	source, ok := s.resolveSourceForWindow(w, start, end, requiresMinute)
 	if !ok {
 		return
 	}
@@ -203,12 +214,18 @@ func (s *Server) handleInterfaceTimeseries(w http.ResponseWriter, r *http.Reques
 	if source == store.DataSourceHour && bucket < time.Hour {
 		bucket = time.Hour
 	}
-	points, err := s.store.QueryInterfaceTimeseries(r.Context(), start, end, bucket, source)
+	var points []model.InterfaceTimeseriesPoint
+	dataSource := store.InterfaceDataSource(source)
+	if source == store.DataSourceMinute {
+		points, err = s.store.QueryInterfaceTimeseries(r.Context(), start, end, bucket, source)
+	} else {
+		points, dataSource, err = s.store.QueryInterfaceTimeseriesSummary(r.Context(), start, end, bucket)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope{"data_source": store.InterfaceDataSource(source), "data": points})
+	writeJSON(w, http.StatusOK, envelope{"data_source": dataSource, "data": points})
 }
 
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
@@ -251,6 +268,25 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if summaryRequested(r) {
+		entries, totalRows, source, err := s.store.QueryTopProcessesSummary(
+			r.Context(),
+			window.Start,
+			window.End,
+			r.URL.Query().Get("group_by"),
+			r.URL.Query().Get("sort_by"),
+			r.URL.Query().Get("sort_order"),
+			window.PageSize,
+			window.Offset,
+			window.IncludeTotal,
+		)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err)
+			return
+		}
+		writePagedData(w, source, entries, totalRows, window.Page, window.PageSize, window.IncludeTotal)
+		return
+	}
 	entries, totalRows, err := s.store.QueryTopProcesses(
 		r.Context(),
 		window.Start,
@@ -281,6 +317,26 @@ func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
 	}
 	if parseBoolFlag(r.URL.Query().Get("exclude_loopback")) {
 		includeLoopback = false
+	}
+	if summaryRequested(r) {
+		entries, totalRows, source, err := s.store.QueryTopRemotesSummary(
+			r.Context(),
+			window.Start,
+			window.End,
+			model.Direction(r.URL.Query().Get("direction")),
+			includeLoopback,
+			r.URL.Query().Get("sort_by"),
+			r.URL.Query().Get("sort_order"),
+			window.PageSize,
+			window.Offset,
+			window.IncludeTotal,
+		)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err)
+			return
+		}
+		writePagedData(w, source, entries, totalRows, window.Page, window.PageSize, window.IncludeTotal)
+		return
 	}
 	entries, totalRows, err := s.store.QueryTopRemotes(
 		r.Context(),
@@ -313,6 +369,15 @@ func (s *Server) handleTop(
 ) {
 	window, ok := s.resolveWindowSource(w, r, false)
 	if !ok {
+		return
+	}
+	if summaryRequested(r) {
+		entries, source, err := s.store.QueryTopPortsSummary(r.Context(), window.Start, window.End, r.URL.Query().Get("by"))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, envelope{"data_source": source, "data": entries})
 		return
 	}
 	entries, err := queryFunc(r.Context(), window.Start, window.End, window.Source, r.URL.Query().Get("by"))
@@ -747,6 +812,10 @@ func parseBoolFlag(value string) bool {
 	default:
 		return false
 	}
+}
+
+func summaryRequested(r *http.Request) bool {
+	return parseBoolFlag(r.URL.Query().Get("summary"))
 }
 
 func mergeProcessListItems(primary []model.ProcessListItem, secondary []model.ProcessListItem) []model.ProcessListItem {

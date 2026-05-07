@@ -219,14 +219,24 @@ func parseUsageExplainQuery(r *http.Request) (usageExplainQuery, error) {
 		if err != nil {
 			return query, fmt.Errorf("invalid local_port: %w", err)
 		}
-		query.LocalPort = &port
+		if port < 0 {
+			return query, fmt.Errorf("invalid local_port: must be non-negative")
+		}
+		if port > 0 {
+			query.LocalPort = &port
+		}
 	}
 	if value := strings.TrimSpace(r.URL.Query().Get("remote_port")); value != "" {
 		port, err := strconv.Atoi(value)
 		if err != nil {
 			return query, fmt.Errorf("invalid remote_port: %w", err)
 		}
-		query.RemotePort = &port
+		if port < 0 {
+			return query, fmt.Errorf("invalid remote_port: must be non-negative")
+		}
+		if port > 0 {
+			query.RemotePort = &port
+		}
 	}
 
 	return query, nil

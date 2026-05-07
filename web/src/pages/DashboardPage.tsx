@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { ChartPanel } from '../components/ChartPanel';
 import { DataSourceBadge } from '../components/DataSourceBadge';
@@ -47,32 +47,39 @@ export function DashboardPage() {
   const overview = useQuery({
     queryKey: ['overview', range],
     queryFn: ({ signal }) => api.getOverview(range, { signal }),
+    placeholderData: keepPreviousData,
   });
   const networkSeries = useQuery({
     queryKey: ['network-series', range],
     queryFn: ({ signal }) => api.getNetworkTimeSeries(range, { signal }),
     enabled: trafficView === 'interface',
+    placeholderData: keepPreviousData,
   });
   const series = useQuery({
     queryKey: ['series', range, 'direction'],
     queryFn: ({ signal }) => api.getTimeSeries(range, 'direction', undefined, { signal }),
     enabled: trafficView === 'direction',
+    placeholderData: keepPreviousData,
   });
   const topProcesses = useQuery({
     queryKey: ['top-processes', range, 'dashboard'],
-    queryFn: ({ signal }) => api.getTopProcesses(range, { page: 1, pageSize: 5, groupBy: 'pid' }, { signal }),
+    queryFn: ({ signal }) => api.getTopProcesses(range, { page: 1, pageSize: 5, groupBy: 'pid', summary: true }, { signal }),
+    placeholderData: keepPreviousData,
   });
   const topInboundRemotes = useQuery({
     queryKey: ['top-remotes', range, 'in'],
-    queryFn: ({ signal }) => api.getTopRemotes(range, { page: 1, pageSize: 5, direction: 'in', includeLoopback: true }, { signal }),
+    queryFn: ({ signal }) => api.getTopRemotes(range, { page: 1, pageSize: 5, direction: 'in', includeLoopback: true, summary: true }, { signal }),
+    placeholderData: keepPreviousData,
   });
   const topOutboundRemotes = useQuery({
     queryKey: ['top-remotes', range, 'out'],
-    queryFn: ({ signal }) => api.getTopRemotes(range, { page: 1, pageSize: 5, direction: 'out', includeLoopback: true }, { signal }),
+    queryFn: ({ signal }) => api.getTopRemotes(range, { page: 1, pageSize: 5, direction: 'out', includeLoopback: true, summary: true }, { signal }),
+    placeholderData: keepPreviousData,
   });
   const topPorts = useQuery({
     queryKey: ['top-ports', range],
     queryFn: ({ signal }) => api.getTopPorts(range, { signal }),
+    placeholderData: keepPreviousData,
   });
 
   const selectedTrafficTotals =

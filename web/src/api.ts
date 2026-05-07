@@ -339,7 +339,7 @@ function buildUsageExplainQuery(row: UsageRow, options?: { dataSource?: UsageRes
 
 function buildTopProcessesQuery(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean },
+  options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean; summary?: boolean },
 ) {
   return buildQuery([
     ['range', range],
@@ -349,12 +349,13 @@ function buildTopProcessesQuery(
     ['sort_order', options?.sortOrder ?? undefined],
     ['group_by', options?.groupBy],
     ['include_total', options?.includeTotal ? 1 : undefined],
+    ['summary', options?.summary ? 1 : undefined],
   ]);
 }
 
 function buildTopRemotesQuery(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: 'in' | 'out'; includeLoopback?: boolean; includeTotal?: boolean },
+  options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: 'in' | 'out'; includeLoopback?: boolean; includeTotal?: boolean; summary?: boolean },
 ) {
   return buildQuery([
     ['range', range],
@@ -366,6 +367,7 @@ function buildTopRemotesQuery(
     ['include_loopback', options?.includeLoopback === true ? 1 : undefined],
     ['exclude_loopback', options?.includeLoopback === false ? 1 : undefined],
     ['include_total', options?.includeTotal ? 1 : undefined],
+    ['summary', options?.summary ? 1 : undefined],
   ]);
 }
 
@@ -706,7 +708,7 @@ function decodeForwardUsage(raw: unknown): ForwardUsageResponse {
 export function createHttpClient(): TrafficApiClient {
   return {
     getOverview(range, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/stats/overview${buildQuery([['range', range]])}`), decodeOverview, requestOptions);
+      return requestJson(withAppBase(`/api/v1/stats/overview${buildQuery([['range', range], ['summary', 1]])}`), decodeOverview, requestOptions);
     },
     getMonthlyUsage(requestOptions) {
       return requestJson(withAppBase('/api/v1/stats/monthly'), decodeMonthlyUsage, requestOptions);
@@ -740,7 +742,7 @@ export function createHttpClient(): TrafficApiClient {
       return requestJson(withAppBase(`/api/v1/top/remotes${buildTopRemotesQuery(range, options)}`), decodeRemoteSummary, requestOptions);
     },
     getTopPorts(range, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/top/ports${buildQuery([['range', range], ['by', 'total']])}`), decodeTop, requestOptions);
+      return requestJson(withAppBase(`/api/v1/top/ports${buildQuery([['range', range], ['by', 'total'], ['summary', 1]])}`), decodeTop, requestOptions);
     },
     getProcesses(requestOptions) {
       return requestJson(withAppBase('/api/v1/processes'), decodeProcesses, requestOptions);

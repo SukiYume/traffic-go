@@ -189,11 +189,11 @@ describe("traffic-go web ui", () => {
 
   it("queries dashboard top processes by pid and shows pid/exe in minute windows", async () => {
     const base = createMockApiClient();
-    const topProcessCalls: ProcessGroupBy[] = [];
+    const topProcessCalls: Array<{ groupBy: ProcessGroupBy; summary: boolean }> = [];
     const client: TrafficApiClient = {
       ...base,
       async getTopProcesses(range, options, requestOptions) {
-        topProcessCalls.push(options?.groupBy ?? 'pid');
+        topProcessCalls.push({ groupBy: options?.groupBy ?? 'pid', summary: !!options?.summary });
         return base.getTopProcesses(range, options, requestOptions);
       },
     };
@@ -203,7 +203,7 @@ describe("traffic-go web ui", () => {
     expect(await screen.findByText("PID 1088")).toBeInTheDocument();
     expect(await screen.findAllByText("ss-server")).not.toHaveLength(0);
     expect(screen.queryByText("未归因 / EXE 不可用")).not.toBeInTheDocument();
-    expect(topProcessCalls).toContain("pid");
+    expect(topProcessCalls).toContainEqual({ groupBy: "pid", summary: true });
   });
 
   it("keeps dashboard top processes in comm fallback when the window is hourly", async () => {
@@ -488,7 +488,7 @@ describe("traffic-go web ui", () => {
 
     renderWithProviders("/usage", <UsagePage />, client);
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
-    expect(usageCalls.some((call) => call.includeTotal === true)).toBe(true);
+    expect(usageCalls.some((call) => call.includeTotal === true)).toBe(false);
 
     await user.click(await screen.findByRole("button", { name: "下一页" }));
     await waitFor(() => {
@@ -547,6 +547,52 @@ describe("traffic-go web ui", () => {
           (call) => call.sortBy === "minuteTs" && call.sortOrder === "desc",
         ),
       ).toBe(true);
+    });
+  });
+
+  it("keeps the current month usage window sorted by time by default", async () => {
+    const base = createMockApiClient();
+    const usageCalls: Array<Record<string, unknown>> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        usageCalls.push({ ...query });
+        return base.getUsage(query, requestOptions);
+      },
+    };
+
+    renderWithProviders("/usage?range=this_month", <UsagePage />, client);
+
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        usageCalls.some(
+          (call) => call.sortBy === "minuteTs" && call.sortOrder === "desc",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("sends protocol sorting from the usage table header", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const usageCalls: Array<Record<string, unknown>> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        usageCalls.push({ ...query });
+        return base.getUsage(query, requestOptions);
+      },
+    };
+
+    renderWithProviders("/usage", <UsagePage />, client);
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
+
+    const protoHeader = await screen.findByRole("columnheader", { name: /协议/ });
+    await user.click(within(protoHeader).getByRole("button", { name: /协议/ }));
+
+    await waitFor(() => {
+      expect(usageCalls.some((call) => call.sortBy === "proto")).toBe(true);
     });
   });
 
@@ -895,5 +941,26 @@ describe("traffic-go web ui", () => {
   it("renders the forward investigation page", async () => {
     renderWithProviders("/forward", <ForwardPage />);
     expect(await screen.findByText("转发流量")).toBeInTheDocument();
+  });
+
+  it("sorts the forward total column through the API", async () => {
+    const base = createMockApiClient();
+    const forwardCalls: Array<Record<string, unknown>> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getForwardUsage(query, requestOptions) {
+        forwardCalls.push({ ...query });
+        return base.getForwardUsage(query, requestOptions);
+      },
+    };
+    const user = userEvent.setup();
+
+    renderWithProviders("/forward", <ForwardPage />, client);
+
+    const totalSort = await screen.findByRole("button", { name: /总量/ });
+    await user.click(totalSort);
+    await waitFor(() => {
+      expect(forwardCalls.some((call) => call.sortBy === "bytesTotal")).toBe(true);
+    });
   });
 });

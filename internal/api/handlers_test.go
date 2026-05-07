@@ -622,6 +622,64 @@ func TestUsageWindowOutsideMinuteRetentionUsesHourlySourceWithoutMinuteOnlyFilte
 	}
 }
 
+func TestSummaryTopProcessesUsesHourlySourceInsideMinuteRetention(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Hour)
+	minute := now.Add(-2*time.Hour + 30*time.Minute)
+
+	if err := server.store.FlushMinute(ctx, minute.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1088,
+			Comm:        "ss-server",
+			Exe:         "/usr/bin/ss-server",
+			LocalPort:   47920,
+			RemoteIP:    "198.51.100.44",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {
+			BytesUp:   1024,
+			BytesDown: 2048,
+			PktsUp:    3,
+			PktsDown:  5,
+			FlowCount: 1,
+		},
+	}, nil); err != nil {
+		t.Fatalf("seed usage row: %v", err)
+	}
+	if err := server.store.AggregateHour(ctx, minute); err != nil {
+		t.Fatalf("aggregate hour: %v", err)
+	}
+
+	start := url.QueryEscape(now.Add(-3 * time.Hour).Format(time.RFC3339))
+	end := url.QueryEscape(now.Format(time.RFC3339))
+
+	normalReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/top/processes?start=%s&end=%s&page=1&page_size=5&group_by=pid", start, end), nil)
+	normalRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(normalRec, normalReq)
+	if normalRec.Code != http.StatusOK {
+		t.Fatalf("unexpected normal status: %d", normalRec.Code)
+	}
+	normalBody := normalRec.Body.String()
+	if !strings.Contains(normalBody, `"data_source":"usage_1m"`) || !strings.Contains(normalBody, `"pid":1088`) {
+		t.Fatalf("expected normal query to keep minute PID detail: %s", normalBody)
+	}
+
+	summaryReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/top/processes?start=%s&end=%s&page=1&page_size=5&group_by=pid&summary=1", start, end), nil)
+	summaryRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(summaryRec, summaryReq)
+	if summaryRec.Code != http.StatusOK {
+		t.Fatalf("unexpected summary status: %d", summaryRec.Code)
+	}
+	summaryBody := summaryRec.Body.String()
+	if !strings.Contains(summaryBody, `"data_source":"usage_1h"`) || !strings.Contains(summaryBody, `"pid":null`) {
+		t.Fatalf("expected summary query to use hourly comm fallback: %s", summaryBody)
+	}
+}
+
 func TestUsageLongWindowKeepsMinuteSourceForAttributionFilter(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
@@ -2654,6 +2712,19 @@ func TestUsageExplainReplaysHourlyPersistedChains(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, `小时聚合数据`) {
 		t.Fatalf("expected hourly replay note in body: %s", bodyText)
+	}
+
+	collapsedURL := fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1h&proto=tcp&direction=out&comm=ss-server&local_port=0&remote_ip=142.250.72.14", hour.Unix())
+	rec = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, collapsedURL, nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected collapsed-row status: %d", rec.Code)
+	}
+	body, _ = io.ReadAll(rec.Body)
+	bodyText = string(body)
+	if !strings.Contains(bodyText, `"chain_id":"usage_chain_1h|`) {
+		t.Fatalf("expected collapsed hourly row to replay chain without local port filter: %s", bodyText)
 	}
 }
 
