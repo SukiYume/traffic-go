@@ -58,6 +58,7 @@ func New(cfg config.Config, logger *log.Logger) (*App, error) {
 			Password: cfg.Auth.Password,
 		},
 		enableSSJournalFallback,
+		cfg.Cache,
 	)
 	return &App{
 		cfg:       cfg,

@@ -176,6 +176,12 @@ prefetch:
   scan_budget: 2s
   max_scan_files: 3
   max_scan_lines_per_file: 80000
+
+cache:
+  count_cache_size: 256
+  result_cache_size: 16
+  sliding_ttl: 60s
+  archived_ttl: 1h
 ```
 
 | 字段 | 含义 |
@@ -204,10 +210,16 @@ prefetch:
 | `prefetch.scan_budget` | 单个日志源每轮扫描预算 |
 | `prefetch.max_scan_files` | 单个日志源每轮最多扫描文件数 |
 | `prefetch.max_scan_lines_per_file` | 单个文件每轮最多读取行数 |
+| `cache.count_cache_size` | `/api/v1/usage` 和 `/api/v1/forward/usage` 精确总数 LRU 容量；设为 0 关闭 |
+| `cache.result_cache_size` | `/api/v1/top/processes` 和 `/api/v1/top/remotes` 全量分组结果 LRU 容量；设为 0 关闭 |
+| `cache.sliding_ttl` | 1h、24h、7d 等滑动窗口缓存 TTL |
+| `cache.archived_ttl` | 上月、上上月等固定历史月份缓存 TTL |
 
 `network_interfaces` 用于 Dashboard 的网卡 RX/TX 口径。要和服务商流量图对齐，应只填写公网网卡。单公网口主机通常只需要一个值，例如 `eth0`、`ens3` 或 `enp1s0`。多个公网口可以写多项。未配置时，系统会采集所有 up 且非 loopback 的网卡。有 Docker、VPN、隧道或 bridge 的机器应显式配置公网口，避免虚拟网卡重复计入。
 
 `process_log_dirs` 的 key 使用进程名或可执行文件 basename，大小写不敏感。value 可以是目录，也可以是 glob 文件模式。多个进程可以指向同一个目录。Shadowsocks 常见组合可以把 `ss-server`、`ss-manager` 和 `obfs-server` 都指向 `/var/log/shadowsocks`。FRPS 可以指向 `/var/log/frps` 或具体的 `*.log` 模式。
+
+分页接口默认使用内存缓存减少 SQLite 压力：`/api/v1/usage` 和 `/api/v1/forward/usage` 的 `include_total=1` 会命中 `count_cache_size` 大小的 COUNT LRU；`/api/v1/top/processes` 与 `/api/v1/top/remotes` 会命中 `result_cache_size` 大小的全量分组结果 LRU，同一时间窗下换排序键或翻页在内存完成。两个缓存都只占用进程内存，不写磁盘；任一 size 设为 0 即关闭对应缓存。
 
 `shadowsocks_journal_fallback` 默认关闭。大多数安装应读取 `/var/log/shadowsocks` 下的文件日志。只有 Shadowsocks 仍然只写 systemd journal 的主机才需要打开它。
 

@@ -78,6 +78,7 @@ export function ProcessesPage() {
         groupBy: 'pid',
         sortBy: normalizeProcessSortKey(currentPIDSort?.id),
         sortOrder: currentPIDSort?.desc ? 'desc' : 'asc',
+        includeTotal: true,
       }, { signal }),
     placeholderData: keepPreviousData,
   });
@@ -91,6 +92,7 @@ export function ProcessesPage() {
         groupBy: 'comm',
         sortBy: normalizeProcessSortKey(currentCommSort?.id),
         sortOrder: currentCommSort?.desc ? 'desc' : 'asc',
+        includeTotal: true,
       }, { signal }),
     placeholderData: keepPreviousData,
   });

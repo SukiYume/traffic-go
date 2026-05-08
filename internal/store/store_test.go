@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -2239,5 +2240,185 @@ func TestQueryLogEvidenceMatchesHostOnlyRowsByTargetPort(t *testing.T) {
 	}
 	if fetched[0].TargetPort != 443 || fetched[0].HostNormalized != "chatgpt.com" {
 		t.Fatalf("unexpected normalized evidence row: %+v", fetched[0])
+	}
+}
+
+func TestQueryUsageCountMatchesPagedTotal(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 5, 8, 9, 0, 0, 0, time.UTC)
+	usage := map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1001,
+			Comm:        "alpha",
+			Exe:         "/usr/bin/alpha",
+			LocalPort:   40001,
+			RemoteIP:    "198.51.100.10",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 100, BytesDown: 20, FlowCount: 1},
+		{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         1002,
+			Comm:        "beta",
+			Exe:         "/usr/bin/beta",
+			LocalPort:   40002,
+			RemoteIP:    "198.51.100.11",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 200, BytesDown: 40, FlowCount: 1},
+	}
+	if err := store.FlushMinute(ctx, minute.Unix(), usage, nil); err != nil {
+		t.Fatalf("flush minute: %v", err)
+	}
+	q := model.UsageQuery{
+		Start:        minute.Add(-time.Minute),
+		End:          minute.Add(time.Minute),
+		Page:         1,
+		PageSize:     1,
+		UsePage:      true,
+		IncludeTotal: true,
+	}
+	_, _, fullTotal, err := store.QueryUsage(ctx, q, DataSourceMinute)
+	if err != nil {
+		t.Fatalf("paged query: %v", err)
+	}
+	got, err := store.QueryUsageCount(ctx, q, DataSourceMinute)
+	if err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if got != fullTotal {
+		t.Fatalf("QueryUsageCount=%d, paged total=%d", got, fullTotal)
+	}
+}
+
+func TestQueryForwardUsageCountMatchesPagedTotal(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 5, 8, 9, 0, 0, 0, time.UTC)
+	forward := map[model.ForwardUsageKey]model.UsageDelta{
+		{
+			MinuteTS:  minute.Unix(),
+			Proto:     "tcp",
+			OrigSrcIP: "10.0.0.2",
+			OrigDstIP: "203.0.113.10",
+			OrigSPort: 52000,
+			OrigDPort: 443,
+		}: {BytesUp: 100, BytesDown: 20, FlowCount: 1},
+		{
+			MinuteTS:  minute.Unix(),
+			Proto:     "udp",
+			OrigSrcIP: "10.0.0.3",
+			OrigDstIP: "203.0.113.11",
+			OrigSPort: 53000,
+			OrigDPort: 53,
+		}: {BytesUp: 200, BytesDown: 40, FlowCount: 1},
+	}
+	if err := store.FlushMinute(ctx, minute.Unix(), nil, forward); err != nil {
+		t.Fatalf("flush minute: %v", err)
+	}
+	q := model.ForwardQuery{
+		Start:        minute.Add(-time.Minute),
+		End:          minute.Add(time.Minute),
+		Page:         1,
+		PageSize:     1,
+		UsePage:      true,
+		IncludeTotal: true,
+	}
+	_, _, fullTotal, err := store.QueryForwardUsage(ctx, q, DataSourceMinute)
+	if err != nil {
+		t.Fatalf("paged query: %v", err)
+	}
+	got, err := store.QueryForwardUsageCount(ctx, q, DataSourceMinute)
+	if err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if got != fullTotal {
+		t.Fatalf("QueryForwardUsageCount=%d, paged total=%d", got, fullTotal)
+	}
+}
+
+func TestQueryTopProcessesAllReturnsAllGroups(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
+	usage := map[model.UsageKey]model.UsageDelta{}
+	for i := 0; i < 5; i++ {
+		usage[model.UsageKey{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         6000 + i,
+			Comm:        "worker",
+			Exe:         "/usr/bin/worker",
+			LocalPort:   43000 + i,
+			RemoteIP:    "198.51.100.50",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}] = model.UsageDelta{BytesUp: int64(10 + i), FlowCount: 1}
+	}
+	if err := store.FlushMinute(ctx, minute.Unix(), usage, nil); err != nil {
+		t.Fatalf("flush minute: %v", err)
+	}
+
+	all, err := store.QueryTopProcessesAll(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, "pid")
+	if err != nil {
+		t.Fatalf("query all top processes: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("expected all 5 pid groups, got %d: %+v", len(all), all)
+	}
+
+	byComm, err := store.QueryTopProcessesAll(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, "comm")
+	if err != nil {
+		t.Fatalf("query all top processes by comm: %v", err)
+	}
+	if len(byComm) != 1 || byComm[0].BytesUp != 60 {
+		t.Fatalf("expected one comm group with 60 bytes_up, got %+v", byComm)
+	}
+}
+
+func TestQueryTopRemotesAllReturnsAllGroups(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
+	usage := map[model.UsageKey]model.UsageDelta{}
+	for i := 0; i < 4; i++ {
+		usage[model.UsageKey{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         7000 + i,
+			Comm:        "remote-worker",
+			Exe:         "/usr/bin/remote-worker",
+			LocalPort:   44000 + i,
+			RemoteIP:    fmt.Sprintf("203.0.113.%d", 50+i),
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}] = model.UsageDelta{BytesUp: int64(10 + i), FlowCount: 1}
+	}
+	if err := store.FlushMinute(ctx, minute.Unix(), usage, nil); err != nil {
+		t.Fatalf("flush minute: %v", err)
+	}
+
+	all, err := store.QueryTopRemotesAll(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, model.DirectionOut, true)
+	if err != nil {
+		t.Fatalf("query all top remotes: %v", err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("expected all 4 remote groups, got %d: %+v", len(all), all)
+	}
+
+	inbound, err := store.QueryTopRemotesAll(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, model.DirectionIn, true)
+	if err != nil {
+		t.Fatalf("query inbound top remotes: %v", err)
+	}
+	if len(inbound) != 0 {
+		t.Fatalf("expected no inbound groups, got %+v", inbound)
 	}
 }

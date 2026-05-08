@@ -18,6 +18,10 @@ const (
 	defaultTickInterval        = 2 * time.Second
 	defaultSocketIndexInterval = 10 * time.Second
 	defaultProcFS              = "/proc"
+	defaultCountCacheSize      = 256
+	defaultResultCacheSize     = 16
+	defaultSlidingTTL          = 60 * time.Second
+	defaultArchivedTTL         = 3600 * time.Second
 )
 
 type Retention struct {
@@ -36,6 +40,48 @@ type Prefetch struct {
 	ScanBudget          time.Duration `yaml:"scan_budget"`
 	MaxScanFiles        int           `yaml:"max_scan_files"`
 	MaxScanLinesPerFile int           `yaml:"max_scan_lines_per_file"`
+}
+
+type Cache struct {
+	CountCacheSize  int           `yaml:"count_cache_size"`
+	ResultCacheSize int           `yaml:"result_cache_size"`
+	SlidingTTL      time.Duration `yaml:"sliding_ttl"`
+	ArchivedTTL     time.Duration `yaml:"archived_ttl"`
+
+	countCacheSizeSet  bool
+	resultCacheSizeSet bool
+	slidingTTLSet      bool
+	archivedTTLSet     bool
+}
+
+func (c *Cache) UnmarshalYAML(value *yaml.Node) error {
+	type rawCache struct {
+		CountCacheSize  *int           `yaml:"count_cache_size"`
+		ResultCacheSize *int           `yaml:"result_cache_size"`
+		SlidingTTL      *time.Duration `yaml:"sliding_ttl"`
+		ArchivedTTL     *time.Duration `yaml:"archived_ttl"`
+	}
+	var raw rawCache
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	if raw.CountCacheSize != nil {
+		c.CountCacheSize = *raw.CountCacheSize
+		c.countCacheSizeSet = true
+	}
+	if raw.ResultCacheSize != nil {
+		c.ResultCacheSize = *raw.ResultCacheSize
+		c.resultCacheSizeSet = true
+	}
+	if raw.SlidingTTL != nil {
+		c.SlidingTTL = *raw.SlidingTTL
+		c.slidingTTLSet = true
+	}
+	if raw.ArchivedTTL != nil {
+		c.ArchivedTTL = *raw.ArchivedTTL
+		c.archivedTTLSet = true
+	}
+	return nil
 }
 
 type Auth struct {
@@ -60,6 +106,7 @@ type Config struct {
 	Auth                       Auth      `yaml:"auth"`
 	Retention                  Retention `yaml:"retention"`
 	Prefetch                   Prefetch  `yaml:"prefetch"`
+	Cache                      Cache     `yaml:"cache"`
 }
 
 func Default() Config {
@@ -86,6 +133,12 @@ func Default() Config {
 			ScanBudget:          2 * time.Second,
 			MaxScanFiles:        3,
 			MaxScanLinesPerFile: 80000,
+		},
+		Cache: Cache{
+			CountCacheSize:  defaultCountCacheSize,
+			ResultCacheSize: defaultResultCacheSize,
+			SlidingTTL:      defaultSlidingTTL,
+			ArchivedTTL:     defaultArchivedTTL,
 		},
 	}
 }
@@ -171,6 +224,18 @@ func Derive(cfg Config) Config {
 	if cfg.Prefetch.MaxScanLinesPerFile <= 0 {
 		cfg.Prefetch.MaxScanLinesPerFile = 80000
 	}
+	if cfg.Cache.CountCacheSize == 0 && !cfg.Cache.countCacheSizeSet {
+		cfg.Cache.CountCacheSize = defaultCountCacheSize
+	}
+	if cfg.Cache.ResultCacheSize == 0 && !cfg.Cache.resultCacheSizeSet {
+		cfg.Cache.ResultCacheSize = defaultResultCacheSize
+	}
+	if cfg.Cache.SlidingTTL == 0 && !cfg.Cache.slidingTTLSet {
+		cfg.Cache.SlidingTTL = defaultSlidingTTL
+	}
+	if cfg.Cache.ArchivedTTL == 0 && !cfg.Cache.archivedTTLSet {
+		cfg.Cache.ArchivedTTL = defaultArchivedTTL
+	}
 	cfg.Auth.Username = strings.TrimSpace(cfg.Auth.Username)
 	cfg.Auth.Password = strings.TrimSpace(cfg.Auth.Password)
 	return cfg
@@ -255,6 +320,14 @@ func (c Config) Validate() error {
 		return errors.New("prefetch.max_scan_files must be positive")
 	case c.Prefetch.MaxScanLinesPerFile <= 0:
 		return errors.New("prefetch.max_scan_lines_per_file must be positive")
+	case c.Cache.CountCacheSize < 0:
+		return errors.New("cache.count_cache_size must be >= 0")
+	case c.Cache.ResultCacheSize < 0:
+		return errors.New("cache.result_cache_size must be >= 0")
+	case c.Cache.SlidingTTL < 0:
+		return errors.New("cache.sliding_ttl must be >= 0")
+	case c.Cache.ArchivedTTL < 0:
+		return errors.New("cache.archived_ttl must be >= 0")
 	default:
 		return nil
 	}

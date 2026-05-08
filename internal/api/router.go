@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"traffic-go/internal/config"
 	"traffic-go/internal/model"
 	"traffic-go/internal/store"
 )
@@ -35,6 +36,10 @@ type Server struct {
 	auth                    BasicAuthConfig
 	enableSSJournalFallback bool
 	readShadowsocksJournal  shadowsocksJournalReader
+	countCache              *lruCache[string, int]
+	resultCache             *lruCache[string, cachedResult]
+	slidingCacheTTL         time.Duration
+	archivedCacheTTL        time.Duration
 }
 
 func NewServer(
@@ -45,6 +50,7 @@ func NewServer(
 	processLogDirs map[string]string,
 	auth BasicAuthConfig,
 	enableSSJournalFallback bool,
+	cacheCfg config.Cache,
 ) *Server {
 	return &Server{
 		store:                   trafficStore,
@@ -55,6 +61,10 @@ func NewServer(
 		auth:                    auth,
 		enableSSJournalFallback: enableSSJournalFallback,
 		readShadowsocksJournal:  defaultShadowsocksJournalReader,
+		countCache:              newLRUCache[string, int](cacheCfg.CountCacheSize, cacheCfg.SlidingTTL),
+		resultCache:             newLRUCache[string, cachedResult](cacheCfg.ResultCacheSize, cacheCfg.SlidingTTL),
+		slidingCacheTTL:         cacheCfg.SlidingTTL,
+		archivedCacheTTL:        cacheCfg.ArchivedTTL,
 	}
 }
 

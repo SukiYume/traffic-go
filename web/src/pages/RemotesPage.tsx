@@ -52,6 +52,7 @@ export function RemotesPage() {
         includeLoopback,
         sortBy: normalizeRemoteSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
+        includeTotal: true,
       }, { signal }),
     placeholderData: keepPreviousData,
   });

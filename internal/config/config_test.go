@@ -288,3 +288,46 @@ func TestDeriveRestoresPrefetchDefaultsForZeroValues(t *testing.T) {
 		t.Fatalf("expected derived socket index interval 10s, got %s", derived.SocketIndexInterval)
 	}
 }
+
+func TestDefaultCacheValues(t *testing.T) {
+	cfg := Default()
+	if cfg.Cache.CountCacheSize != 256 {
+		t.Fatalf("count_cache_size default = %d, want 256", cfg.Cache.CountCacheSize)
+	}
+	if cfg.Cache.ResultCacheSize != 16 {
+		t.Fatalf("result_cache_size default = %d, want 16", cfg.Cache.ResultCacheSize)
+	}
+	if cfg.Cache.SlidingTTL != 60*time.Second {
+		t.Fatalf("sliding_ttl default = %v, want 60s", cfg.Cache.SlidingTTL)
+	}
+	if cfg.Cache.ArchivedTTL != 3600*time.Second {
+		t.Fatalf("archived_ttl default = %v, want 3600s", cfg.Cache.ArchivedTTL)
+	}
+}
+
+func TestCacheValidateNegative(t *testing.T) {
+	cfg := Default()
+	cfg.Cache.CountCacheSize = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for negative count_cache_size")
+	}
+}
+
+func TestLoadCacheAllowsExplicitZeroSizes(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := []byte("cache:\n  count_cache_size: 0\n  result_cache_size: 0\n")
+	if err := os.WriteFile(configPath, content, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Cache.CountCacheSize != 0 || cfg.Cache.ResultCacheSize != 0 {
+		t.Fatalf("expected explicit zero cache sizes to be preserved, got %+v", cfg.Cache)
+	}
+	if cfg.Cache.SlidingTTL != 60*time.Second || cfg.Cache.ArchivedTTL != 3600*time.Second {
+		t.Fatalf("expected omitted cache ttls to use defaults, got %+v", cfg.Cache)
+	}
+}

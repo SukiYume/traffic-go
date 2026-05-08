@@ -91,7 +91,7 @@ func newTestServerWithConfig(t *testing.T, configure func(*config.Config)) *Serv
 			SocketIndexReady: true,
 			LocalIPCount:     2,
 		},
-	}, nil, embed.StaticFS(), cfg.ProcessLogDirs, BasicAuthConfig{}, true)
+	}, nil, embed.StaticFS(), cfg.ProcessLogDirs, BasicAuthConfig{}, true, cfg.Cache)
 }
 
 func setProcessLogDir(server *Server, processKey string, dir string) {
@@ -1531,7 +1531,7 @@ func TestStoreDiagnosticsEndpointReturnsTableStats(t *testing.T) {
 	}
 }
 
-func TestPagedTopProcessesUsesEstimatedTotalsByDefault(t *testing.T) {
+func TestPagedTopProcessesReturnsExactTotalsFromResultCache(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	minute := time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC)
@@ -1574,7 +1574,7 @@ func TestPagedTopProcessesUsesEstimatedTotalsByDefault(t *testing.T) {
 	bodyText := rec.Body.String()
 	for _, expected := range []string{
 		`"total_rows":2`,
-		`"total_rows_exact":false`,
+		`"total_rows_exact":true`,
 		`"has_more":true`,
 	} {
 		if !strings.Contains(bodyText, expected) {
@@ -3262,5 +3262,216 @@ func TestUsageExplainConfirmsShadowsocksSourceIPFromUDPCacheMiss(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, `203.0.113.24`) {
 		t.Fatalf("expected confirmed source ip in body: %s", bodyText)
+	}
+}
+
+func TestHandleUsageExactTotalUsesCountCache(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Now().UTC().Truncate(time.Minute)
+	usage := map[model.UsageKey]model.UsageDelta{}
+	for i := 0; i < 3; i++ {
+		usage[model.UsageKey{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         5000 + i,
+			Comm:        fmt.Sprintf("proc%d", i),
+			Exe:         "/usr/bin/proc",
+			LocalPort:   41000 + i,
+			RemoteIP:    fmt.Sprintf("198.51.100.%d", 20+i),
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}] = model.UsageDelta{BytesUp: int64(100 + i), FlowCount: 1}
+	}
+	if err := server.store.FlushMinute(ctx, minute.Unix(), usage, nil); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/usage?range=24h&page=1&page_size=1&include_total=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		TotalRows      int  `json:"total_rows"`
+		TotalRowsExact bool `json:"total_rows_exact"`
+		HasMore        bool `json:"has_more"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.TotalRows != 3 || !resp.TotalRowsExact || !resp.HasMore {
+		t.Fatalf("unexpected exact pagination metadata: %+v", resp)
+	}
+	if server.countCache.Len() != 1 {
+		t.Fatalf("expected one count cache entry, got %d", server.countCache.Len())
+	}
+
+	rec = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/usage?range=24h&page=2&page_size=1&include_total=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if server.countCache.Len() != 1 {
+		t.Fatalf("second request should reuse count cache, got %d entries", server.countCache.Len())
+	}
+}
+
+func TestHandleForwardUsageExactTotalUsesCountCache(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Now().UTC().Truncate(time.Minute)
+	forward := map[model.ForwardUsageKey]model.UsageDelta{}
+	for i := 0; i < 2; i++ {
+		forward[model.ForwardUsageKey{
+			MinuteTS:  minute.Unix(),
+			Proto:     "tcp",
+			OrigSrcIP: fmt.Sprintf("10.0.0.%d", i+2),
+			OrigDstIP: "203.0.113.20",
+			OrigSPort: 52000 + i,
+			OrigDPort: 443,
+		}] = model.UsageDelta{BytesUp: int64(100 + i), FlowCount: 1}
+	}
+	if err := server.store.FlushMinute(ctx, minute.Unix(), nil, forward); err != nil {
+		t.Fatalf("seed forward usage: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/forward/usage?range=24h&page=1&page_size=1&include_total=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		TotalRows      int  `json:"total_rows"`
+		TotalRowsExact bool `json:"total_rows_exact"`
+		HasMore        bool `json:"has_more"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.TotalRows != 2 || !resp.TotalRowsExact || !resp.HasMore {
+		t.Fatalf("unexpected exact forward pagination metadata: %+v", resp)
+	}
+	if server.countCache.Len() != 1 {
+		t.Fatalf("expected one count cache entry, got %d", server.countCache.Len())
+	}
+}
+
+func TestHandleTopProcessesPaginatesFromCache(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Now().UTC().Truncate(time.Minute)
+	usage := map[model.UsageKey]model.UsageDelta{}
+	for i := 0; i < 8; i++ {
+		usage[model.UsageKey{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         8000 + i,
+			Comm:        fmt.Sprintf("proc%d", i),
+			Exe:         "/usr/bin/proc",
+			LocalPort:   45000 + i,
+			RemoteIP:    "198.51.100.80",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}] = model.UsageDelta{BytesUp: int64(10 - i), FlowCount: 1}
+	}
+	if err := server.store.FlushMinute(ctx, minute.Unix(), usage, nil); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/top/processes?range=24h&page=1&page_size=3&sort_by=bytes_total&sort_order=desc&group_by=pid", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	before := server.resultCache.Len()
+	rec = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/top/processes?range=24h&page=2&page_size=3&sort_by=bytes_up&sort_order=asc&group_by=pid", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if server.resultCache.Len() != before {
+		t.Fatalf("second call should hit cache (entries before=%d after=%d)", before, server.resultCache.Len())
+	}
+	var resp struct {
+		TotalRows      int  `json:"total_rows"`
+		TotalRowsExact bool `json:"total_rows_exact"`
+		Data           []struct {
+			Comm    string `json:"comm"`
+			BytesUp int64  `json:"bytes_up"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if !resp.TotalRowsExact || resp.TotalRows != 8 {
+		t.Fatalf("got total_rows=%d exact=%v, want 8 true", resp.TotalRows, resp.TotalRowsExact)
+	}
+	if len(resp.Data) != 3 {
+		t.Fatalf("expected page_size=3 rows, got %d", len(resp.Data))
+	}
+	if resp.Data[0].Comm != "proc4" {
+		t.Fatalf("unexpected first row on page 2 asc bytes_up: %+v", resp.Data[0])
+	}
+}
+
+func TestHandleTopRemotesPaginatesFromCache(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	minute := time.Now().UTC().Truncate(time.Minute)
+	usage := map[model.UsageKey]model.UsageDelta{}
+	for i := 0; i < 6; i++ {
+		usage[model.UsageKey{
+			MinuteTS:    minute.Unix(),
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         9000 + i,
+			Comm:        "remote-proc",
+			Exe:         "/usr/bin/remote-proc",
+			LocalPort:   46000 + i,
+			RemoteIP:    fmt.Sprintf("8.8.%d.%d", i, i+1),
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}] = model.UsageDelta{BytesUp: int64(i + 1), FlowCount: 1}
+	}
+	if err := server.store.FlushMinute(ctx, minute.Unix(), usage, nil); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/top/remotes?range=24h&page=1&page_size=2&sort_by=bytes_total&sort_order=desc", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	before := server.resultCache.Len()
+	rec = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/top/remotes?range=24h&page=2&page_size=2&sort_by=remote_ip&sort_order=asc", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if server.resultCache.Len() != before {
+		t.Fatalf("second call should hit cache")
+	}
+	var resp struct {
+		TotalRows      int  `json:"total_rows"`
+		TotalRowsExact bool `json:"total_rows_exact"`
+		Data           []struct {
+			RemoteIP string `json:"remote_ip"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if resp.TotalRows != 6 || !resp.TotalRowsExact {
+		t.Fatalf("got total=%d exact=%v want 6 true", resp.TotalRows, resp.TotalRowsExact)
+	}
+	if len(resp.Data) != 2 || resp.Data[0].RemoteIP != "8.8.2.3" {
+		t.Fatalf("unexpected second page by remote_ip asc: %+v", resp.Data)
 	}
 }

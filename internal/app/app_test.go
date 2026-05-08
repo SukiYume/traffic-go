@@ -295,7 +295,7 @@ func TestRunWaitsForCollectorShutdownBeforeReturning(t *testing.T) {
 		returned: make(chan struct{}),
 	}
 	application.collector = collector
-	application.apiServer = api.NewServer(application.store, collector, log.New(io.Discard, "", 0), nil, nil, api.BasicAuthConfig{}, true)
+	application.apiServer = api.NewServer(application.store, collector, log.New(io.Discard, "", 0), nil, nil, api.BasicAuthConfig{}, true, config.Default().Cache)
 	application.server = &http.Server{
 		Addr:    cfg.Listen,
 		Handler: http.NewServeMux(),

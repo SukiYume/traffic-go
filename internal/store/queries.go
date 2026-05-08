@@ -637,10 +637,51 @@ func forwardOrderClause(sortBy string, sortOrder string, timeCol string) string 
 	}
 }
 
+func buildUsageCountSQL(query model.UsageQuery, source string) (string, []any, error) {
+	info := usageSourceInfo(source)
+	aggregatedSource := isAggregatedUsageSource(source)
+	var builder strings.Builder
+	args := []any{query.Start.Unix(), query.End.Unix()}
+	if aggregatedSource {
+		if query.Attribution != "" {
+			return "", nil, ErrDimensionUnavailable
+		}
+		if query.RemotePort != nil {
+			return "", nil, ErrDimensionUnavailable
+		}
+		localPortExpr := aggregatedUsageLocalPortExpr(query)
+		aggregatedGroupBy := fmt.Sprintf("%s, proto, direction, comm, %s, remote_ip", info.TimeCol, localPortExpr)
+		builder.WriteString(fmt.Sprintf(`
+SELECT COUNT(*)
+FROM (
+SELECT 1
+FROM %s
+WHERE %s >= ? AND %s < ?
+`, info.Table, info.TimeCol, info.TimeCol))
+		appendUsageFiltersDetailed(&builder, &args, query, true)
+		builder.WriteString(" GROUP BY " + aggregatedGroupBy + ") AS grouped_usage")
+		return builder.String(), args, nil
+	}
+	builder.WriteString(fmt.Sprintf(`
+SELECT COUNT(*)
+FROM %s
+WHERE %s >= ? AND %s < ?
+`, info.Table, info.TimeCol, info.TimeCol))
+	appendUsageFiltersDetailed(&builder, &args, query, false)
+	return builder.String(), args, nil
+}
+
+func (s *Store) QueryUsageCount(ctx context.Context, query model.UsageQuery, source string) (int, error) {
+	statement, args, err := buildUsageCountSQL(query, source)
+	if err != nil {
+		return 0, err
+	}
+	return countRows(ctx, s.queryDB(), statement, args, "usage")
+}
+
 func (s *Store) QueryUsage(ctx context.Context, query model.UsageQuery, source string) ([]model.UsageRecord, string, int, error) {
 	info := usageSourceInfo(source)
 	builder := strings.Builder{}
-	countBuilder := strings.Builder{}
 	aggregatedSource := isAggregatedUsageSource(source)
 	aggregatedGroupBy := ""
 	if aggregatedSource {
@@ -663,13 +704,6 @@ SELECT MIN(rowid) AS rowid, %[1]s, proto, direction, NULL AS pid, comm, NULL AS 
 FROM %[2]s
 WHERE %[1]s >= ? AND %[1]s < ?
 `, info.TimeCol, info.Table, localPortExpr))
-		countBuilder.WriteString(fmt.Sprintf(`
-SELECT COUNT(*)
-FROM (
-SELECT 1
-FROM %s
-WHERE %s >= ? AND %s < ?
-`, info.Table, info.TimeCol, info.TimeCol))
 	} else {
 		builder.WriteString(fmt.Sprintf(`
 SELECT rowid, %s, proto, direction, pid, comm, exe, local_port, remote_ip, remote_port,
@@ -677,26 +711,18 @@ SELECT rowid, %s, proto, direction, pid, comm, exe, local_port, remote_ip, remot
 FROM %s
 WHERE %s >= ? AND %s < ?
 `, info.TimeCol, info.Table, info.TimeCol, info.TimeCol))
-		countBuilder.WriteString(fmt.Sprintf(`
-SELECT COUNT(*)
-FROM %s
-WHERE %s >= ? AND %s < ?
-`, info.Table, info.TimeCol, info.TimeCol))
 	}
 	args := []any{query.Start.Unix(), query.End.Unix()}
-	countArgs := []any{query.Start.Unix(), query.End.Unix()}
 	appendUsageFiltersDetailed(&builder, &args, query, aggregatedSource)
-	appendUsageFiltersDetailed(&countBuilder, &countArgs, query, aggregatedSource)
 	if aggregatedSource {
 		builder.WriteString(" GROUP BY " + aggregatedGroupBy)
-		countBuilder.WriteString(" GROUP BY " + aggregatedGroupBy + ") AS grouped_usage")
 	}
 	if query.UsePage {
 		db := s.queryDB()
 		var totalRows int
 		if query.IncludeTotal {
 			var err error
-			totalRows, err = countRows(ctx, db, countBuilder.String(), countArgs, "usage")
+			totalRows, err = s.QueryUsageCount(ctx, query, source)
 			if err != nil {
 				return nil, "", 0, err
 			}
@@ -745,6 +771,35 @@ WHERE %s >= ? AND %s < ?
 		return record.RowID
 	})
 	return records, nextCursor, 0, nil
+}
+
+func buildForwardUsageCountSQL(query model.ForwardQuery, source string) (string, []any) {
+	info := forwardSourceInfo(source)
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf(`
+SELECT COUNT(*)
+FROM %s
+WHERE %s >= ? AND %s < ?
+`, info.Table, info.TimeCol, info.TimeCol))
+	args := []any{query.Start.Unix(), query.End.Unix()}
+	if query.Proto != "" {
+		builder.WriteString(" AND proto = ?")
+		args = append(args, query.Proto)
+	}
+	if query.OrigSrcIP != "" {
+		builder.WriteString(" AND orig_src_ip = ?")
+		args = append(args, query.OrigSrcIP)
+	}
+	if query.OrigDstIP != "" {
+		builder.WriteString(" AND orig_dst_ip = ?")
+		args = append(args, query.OrigDstIP)
+	}
+	return builder.String(), args
+}
+
+func (s *Store) QueryForwardUsageCount(ctx context.Context, query model.ForwardQuery, source string) (int, error) {
+	statement, args := buildForwardUsageCountSQL(query, source)
+	return countRows(ctx, s.queryDB(), statement, args, "forward usage")
 }
 
 func scanUsageRows(rows *sql.Rows, dataSource string) ([]model.UsageRecord, error) {
@@ -884,6 +939,57 @@ LIMIT ? OFFSET ?
 	return entries, totalRows, nil
 }
 
+func (s *Store) QueryTopProcessesAll(ctx context.Context, start, end time.Time, source string, groupBy string) ([]model.ProcessSummary, error) {
+	info := usageSourceInfo(source)
+	resolvedGroupBy := "pid"
+	if isAggregatedUsageSource(source) || strings.EqualFold(groupBy, "comm") {
+		resolvedGroupBy = "comm"
+	}
+	groupExpr := "pid, comm, exe"
+	selectExpr := "pid, comm, exe"
+	if resolvedGroupBy == "comm" {
+		groupExpr = "comm"
+		selectExpr = "NULL AS pid, comm, NULL AS exe"
+	}
+
+	rows, err := s.queryDB().QueryContext(ctx, fmt.Sprintf(`
+SELECT %s,
+       COALESCE(SUM(bytes_up), 0),
+       COALESCE(SUM(bytes_down), 0),
+       COALESCE(SUM(flow_count), 0)
+FROM %s
+WHERE %s >= ? AND %s < ?
+GROUP BY %s
+`, selectExpr, info.Table, info.TimeCol, info.TimeCol, groupExpr), start.Unix(), end.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("query all top processes: %w", err)
+	}
+	defer rows.Close()
+	return scanProcessSummaries(rows, info.DataLabel)
+}
+
+func scanProcessSummaries(rows *sql.Rows, dataSource string) ([]model.ProcessSummary, error) {
+	var entries []model.ProcessSummary
+	for rows.Next() {
+		var (
+			entry    model.ProcessSummary
+			pidValue sql.NullInt64
+			exeValue sql.NullString
+		)
+		entry.DataSource = dataSource
+		if err := rows.Scan(&pidValue, &entry.Comm, &exeValue, &entry.BytesUp, &entry.BytesDown, &entry.FlowCount); err != nil {
+			return nil, fmt.Errorf("scan top processes: %w", err)
+		}
+		entry.PID = nullableInt(pidValue)
+		entry.Exe = nullableString(exeValue)
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
 func processSummarySortExpr(sortBy string, resolvedGroupBy string) string {
 	sortExpr := "(SUM(bytes_up) + SUM(bytes_down))"
 	switch sortBy {
@@ -1005,6 +1111,54 @@ LIMIT ? OFFSET ?
 	return entries, totalRows, dataSource, nil
 }
 
+func (s *Store) QueryTopProcessesSummaryAll(ctx context.Context, start, end time.Time, groupBy string) ([]model.ProcessSummary, string, error) {
+	parts := s.usageSummaryParts(start, end)
+	dataSource := usageSummaryDataLabel(parts)
+	resolvedGroupBy := "pid"
+	if dataSource != DataSourceMinute || strings.EqualFold(groupBy, "comm") {
+		resolvedGroupBy = "comm"
+	}
+	partSQL, args := buildSummaryUnion(
+		parts,
+		`SELECT NULL AS pid, '' AS comm, NULL AS exe, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count WHERE 0`,
+		func(part summaryPart) string {
+			if resolvedGroupBy == "pid" && part.info.DataLabel == DataSourceMinute {
+				return fmt.Sprintf(`
+SELECT pid, comm, exe, bytes_up, bytes_down, flow_count
+FROM %[1]s
+WHERE %[2]s >= ? AND %[2]s < ?`, part.info.Table, part.info.TimeCol)
+			}
+			return fmt.Sprintf(`
+SELECT NULL AS pid, comm, NULL AS exe, bytes_up, bytes_down, flow_count
+FROM %[1]s
+WHERE %[2]s >= ? AND %[2]s < ?`, part.info.Table, part.info.TimeCol)
+		},
+	)
+	groupExpr := "pid, comm, exe"
+	selectExpr := "pid, comm, exe"
+	if resolvedGroupBy == "comm" {
+		groupExpr = "comm"
+		selectExpr = "NULL AS pid, comm, NULL AS exe"
+	}
+	rows, err := s.queryDB().QueryContext(ctx, fmt.Sprintf(`
+WITH summary_usage AS (
+%s
+)
+SELECT %s,
+       COALESCE(SUM(bytes_up), 0),
+       COALESCE(SUM(bytes_down), 0),
+       COALESCE(SUM(flow_count), 0)
+FROM summary_usage
+GROUP BY %s
+`, partSQL, selectExpr, groupExpr), args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("query all top process summary: %w", err)
+	}
+	defer rows.Close()
+	entries, err := scanProcessSummaries(rows, dataSource)
+	return entries, dataSource, err
+}
+
 func (s *Store) QueryTopRemotes(ctx context.Context, start, end time.Time, source string, direction model.Direction, includeLoopback bool, sortBy, sortOrder string, limit, offset int, includeTotal bool) ([]model.RemoteSummary, int, error) {
 	info := usageSourceInfo(source)
 	pageSize := clampPageSize(limit)
@@ -1066,6 +1220,46 @@ LIMIT ? OFFSET ?
 		entries, totalRows = trimOffsetPage(entries, 1+(pageOffset/pageSize), pageSize)
 	}
 	return entries, totalRows, nil
+}
+
+func (s *Store) QueryTopRemotesAll(ctx context.Context, start, end time.Time, source string, direction model.Direction, includeLoopback bool) ([]model.RemoteSummary, error) {
+	info := usageSourceInfo(source)
+	filterBuilder := strings.Builder{}
+	filterBuilder.WriteString(fmt.Sprintf("FROM %s WHERE %s >= ? AND %s < ?", info.Table, info.TimeCol, info.TimeCol))
+	args := []any{start.Unix(), end.Unix()}
+	if direction != "" {
+		filterBuilder.WriteString(" AND direction = ?")
+		args = append(args, direction)
+	}
+	if !includeLoopback {
+		filterBuilder.WriteString(" AND remote_ip <> '' AND remote_ip NOT LIKE '127.%' AND remote_ip <> '::1'")
+	}
+	rows, err := s.queryDB().QueryContext(ctx, `
+SELECT direction, remote_ip, COALESCE(SUM(bytes_up), 0), COALESCE(SUM(bytes_down), 0), COALESCE(SUM(flow_count), 0)
+`+filterBuilder.String()+`
+GROUP BY direction, remote_ip
+`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query all top remotes: %w", err)
+	}
+	defer rows.Close()
+	return scanRemoteSummaries(rows, info.DataLabel)
+}
+
+func scanRemoteSummaries(rows *sql.Rows, dataSource string) ([]model.RemoteSummary, error) {
+	var entries []model.RemoteSummary
+	for rows.Next() {
+		var entry model.RemoteSummary
+		entry.DataSource = dataSource
+		if err := rows.Scan(&entry.Direction, &entry.RemoteIP, &entry.BytesUp, &entry.BytesDown, &entry.FlowCount); err != nil {
+			return nil, fmt.Errorf("scan top remotes: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 func remoteSummarySortExpr(sortBy string) string {
@@ -1172,6 +1366,47 @@ LIMIT ? OFFSET ?
 		entries, totalRows = trimOffsetPage(entries, 1+(pageOffset/pageSize), pageSize)
 	}
 	return entries, totalRows, dataSource, nil
+}
+
+func (s *Store) QueryTopRemotesSummaryAll(ctx context.Context, start, end time.Time, direction model.Direction, includeLoopback bool) ([]model.RemoteSummary, string, error) {
+	parts := s.usageSummaryParts(start, end)
+	dataSource := usageSummaryDataLabel(parts)
+	partSQL, args := buildSummaryUnion(
+		parts,
+		`SELECT '' AS direction, '' AS remote_ip, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count WHERE 0`,
+		func(part summaryPart) string {
+			return fmt.Sprintf(`
+SELECT direction, remote_ip, bytes_up, bytes_down, flow_count
+FROM %[1]s
+WHERE %[2]s >= ? AND %[2]s < ?`, part.info.Table, part.info.TimeCol)
+		},
+	)
+	filterBuilder := strings.Builder{}
+	filterArgs := make([]any, 0, 1)
+	filterBuilder.WriteString("WHERE 1=1")
+	if direction != "" {
+		filterBuilder.WriteString(" AND direction = ?")
+		filterArgs = append(filterArgs, direction)
+	}
+	if !includeLoopback {
+		filterBuilder.WriteString(" AND remote_ip <> '' AND remote_ip NOT LIKE '127.%' AND remote_ip <> '::1'")
+	}
+	queryArgs := append(append([]any{}, args...), filterArgs...)
+	rows, err := s.queryDB().QueryContext(ctx, fmt.Sprintf(`
+WITH summary_usage AS (
+%s
+)
+SELECT direction, remote_ip, COALESCE(SUM(bytes_up), 0), COALESCE(SUM(bytes_down), 0), COALESCE(SUM(flow_count), 0)
+FROM summary_usage
+%s
+GROUP BY direction, remote_ip
+`, partSQL, filterBuilder.String()), queryArgs...)
+	if err != nil {
+		return nil, "", fmt.Errorf("query all top remote summary: %w", err)
+	}
+	defer rows.Close()
+	entries, err := scanRemoteSummaries(rows, dataSource)
+	return entries, dataSource, err
 }
 
 func (s *Store) QueryTopPorts(ctx context.Context, start, end time.Time, source string, orderBy string) ([]model.TopEntry, error) {

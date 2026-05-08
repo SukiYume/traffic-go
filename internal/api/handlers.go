@@ -238,7 +238,22 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	records, nextCursor, totalRows, err := s.store.QueryUsage(r.Context(), query, source)
+	totalRowsExact := query.IncludeTotal
+	totalRows := 0
+	fetchQuery := query
+	if query.UsePage && query.IncludeTotal {
+		totalRows, err = s.lookupUsageCount(r.Context(), query, source, normalizedRangeKey(r))
+		if err != nil {
+			if errors.Is(err, store.ErrDimensionUnavailable) {
+				writeDimensionError(w, err)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", err)
+			return
+		}
+		fetchQuery.IncludeTotal = false
+	}
+	records, nextCursor, pageTotalRows, err := s.store.QueryUsage(r.Context(), fetchQuery, source)
 	if err != nil {
 		if errors.Is(err, store.ErrDimensionUnavailable) {
 			writeDimensionError(w, err)
@@ -251,16 +266,33 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
+	if !totalRowsExact {
+		totalRows = pageTotalRows
+	}
 	writeJSON(w, http.StatusOK, envelope{
 		"data_source":      source,
 		"data":             records,
 		"next_cursor":      nextCursor,
 		"total_rows":       totalRows,
-		"total_rows_exact": query.IncludeTotal,
+		"total_rows_exact": totalRowsExact,
 		"has_more":         pagedHasMore(query.UsePage, totalRows, query.Page, query.PageSize, nextCursor),
 		"page":             query.Page,
 		"page_size":        query.PageSize,
 	})
+}
+
+func (s *Server) lookupUsageCount(ctx context.Context, query model.UsageQuery, source string, rangeKey string) (int, error) {
+	startBucket, endBucket, archived := quantizeWindow(rangeKey, query.Start.Unix(), query.End.Unix())
+	key := usageCountCacheKey(source, rangeKey, startBucket, endBucket, query)
+	if value, ok := s.countCache.Get(key); ok {
+		return value, nil
+	}
+	totalRows, err := s.store.QueryUsageCount(ctx, query, source)
+	if err != nil {
+		return 0, err
+	}
+	s.countCache.SetWithTTL(key, totalRows, s.cacheTTL(archived))
+	return totalRows, nil
 }
 
 func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
@@ -268,42 +300,48 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if summaryRequested(r) {
-		entries, totalRows, source, err := s.store.QueryTopProcessesSummary(
-			r.Context(),
-			window.Start,
-			window.End,
-			r.URL.Query().Get("group_by"),
-			r.URL.Query().Get("sort_by"),
-			r.URL.Query().Get("sort_order"),
-			window.PageSize,
-			window.Offset,
-			window.IncludeTotal,
-		)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error", err)
-			return
-		}
-		writePagedData(w, source, entries, totalRows, window.Page, window.PageSize, window.IncludeTotal)
-		return
-	}
-	entries, totalRows, err := s.store.QueryTopProcesses(
-		r.Context(),
-		window.Start,
-		window.End,
-		window.Source,
-		r.URL.Query().Get("group_by"),
-		r.URL.Query().Get("sort_by"),
-		r.URL.Query().Get("sort_order"),
-		window.PageSize,
-		window.Offset,
-		window.IncludeTotal,
-	)
+	groupBy := r.URL.Query().Get("group_by")
+	sortBy := r.URL.Query().Get("sort_by")
+	sortOrder := r.URL.Query().Get("sort_order")
+	useSummary := summaryRequested(r)
+	rangeKey := normalizedRangeKey(r)
+	startBucket, endBucket, archived := quantizeWindow(rangeKey, window.Start.Unix(), window.End.Unix())
+	cacheKey := topProcessesCacheKey(useSummary, window.Source, rangeKey, startBucket, endBucket, groupBy)
+	entries, source, err := s.lookupOrLoadTopProcesses(r.Context(), cacheKey, archived, useSummary, window, groupBy)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writePagedData(w, window.Source, entries, totalRows, window.Page, window.PageSize, window.IncludeTotal)
+	sorted := sortProcessSummaries(entries, sortBy, sortOrder)
+	page := pageSlice(sorted, window.Page, window.PageSize)
+	writePagedData(w, source, page, len(sorted), window.Page, window.PageSize, true)
+}
+
+func (s *Server) lookupOrLoadTopProcesses(ctx context.Context, key string, archived bool, useSummary bool, window resolvedPagedUsageWindow, groupBy string) ([]model.ProcessSummary, string, error) {
+	if cached, ok := s.resultCache.Get(key); ok {
+		return cached.processes, cached.source, nil
+	}
+	var (
+		rows   []model.ProcessSummary
+		source string
+		err    error
+	)
+	if useSummary {
+		rows, source, err = s.store.QueryTopProcessesSummaryAll(ctx, window.Start, window.End, groupBy)
+	} else {
+		rows, err = s.store.QueryTopProcessesAll(ctx, window.Start, window.End, window.Source, groupBy)
+		source = window.Source
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	s.resultCache.SetWithTTL(key, cachedResult{processes: rows, source: source}, s.cacheTTL(archived))
+	return rows, source, nil
+}
+
+func topProcessesCacheKey(summary bool, source string, rangeKey string, startBucket int64, endBucket int64, groupBy string) string {
+	return fmt.Sprintf("top_processes|sum=%v|src=%s|rng=%s|t=%d-%d|gb=%s",
+		summary, source, rangeKey, startBucket, endBucket, strings.ToLower(strings.TrimSpace(groupBy)))
 }
 
 func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
@@ -318,44 +356,48 @@ func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
 	if parseBoolFlag(r.URL.Query().Get("exclude_loopback")) {
 		includeLoopback = false
 	}
-	if summaryRequested(r) {
-		entries, totalRows, source, err := s.store.QueryTopRemotesSummary(
-			r.Context(),
-			window.Start,
-			window.End,
-			model.Direction(r.URL.Query().Get("direction")),
-			includeLoopback,
-			r.URL.Query().Get("sort_by"),
-			r.URL.Query().Get("sort_order"),
-			window.PageSize,
-			window.Offset,
-			window.IncludeTotal,
-		)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error", err)
-			return
-		}
-		writePagedData(w, source, entries, totalRows, window.Page, window.PageSize, window.IncludeTotal)
-		return
-	}
-	entries, totalRows, err := s.store.QueryTopRemotes(
-		r.Context(),
-		window.Start,
-		window.End,
-		window.Source,
-		model.Direction(r.URL.Query().Get("direction")),
-		includeLoopback,
-		r.URL.Query().Get("sort_by"),
-		r.URL.Query().Get("sort_order"),
-		window.PageSize,
-		window.Offset,
-		window.IncludeTotal,
-	)
+	direction := model.Direction(r.URL.Query().Get("direction"))
+	sortBy := r.URL.Query().Get("sort_by")
+	sortOrder := r.URL.Query().Get("sort_order")
+	useSummary := summaryRequested(r)
+	rangeKey := normalizedRangeKey(r)
+	startBucket, endBucket, archived := quantizeWindow(rangeKey, window.Start.Unix(), window.End.Unix())
+	cacheKey := topRemotesCacheKey(useSummary, window.Source, rangeKey, startBucket, endBucket, direction, includeLoopback)
+	entries, source, err := s.lookupOrLoadTopRemotes(r.Context(), cacheKey, archived, useSummary, window, direction, includeLoopback)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writePagedData(w, window.Source, entries, totalRows, window.Page, window.PageSize, window.IncludeTotal)
+	sorted := sortRemoteSummaries(entries, sortBy, sortOrder)
+	page := pageSlice(sorted, window.Page, window.PageSize)
+	writePagedData(w, source, page, len(sorted), window.Page, window.PageSize, true)
+}
+
+func (s *Server) lookupOrLoadTopRemotes(ctx context.Context, key string, archived bool, useSummary bool, window resolvedPagedUsageWindow, direction model.Direction, includeLoopback bool) ([]model.RemoteSummary, string, error) {
+	if cached, ok := s.resultCache.Get(key); ok {
+		return cached.remotes, cached.source, nil
+	}
+	var (
+		rows   []model.RemoteSummary
+		source string
+		err    error
+	)
+	if useSummary {
+		rows, source, err = s.store.QueryTopRemotesSummaryAll(ctx, window.Start, window.End, direction, includeLoopback)
+	} else {
+		rows, err = s.store.QueryTopRemotesAll(ctx, window.Start, window.End, window.Source, direction, includeLoopback)
+		source = window.Source
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	s.resultCache.SetWithTTL(key, cachedResult{remotes: rows, source: source}, s.cacheTTL(archived))
+	return rows, source, nil
+}
+
+func topRemotesCacheKey(summary bool, source string, rangeKey string, startBucket int64, endBucket int64, direction model.Direction, includeLoopback bool) string {
+	return fmt.Sprintf("top_remotes|sum=%v|src=%s|rng=%s|t=%d-%d|dir=%s|loop=%v",
+		summary, source, rangeKey, startBucket, endBucket, string(direction), includeLoopback)
 }
 
 func (s *Server) handleTopPorts(w http.ResponseWriter, r *http.Request) {
@@ -398,7 +440,18 @@ func (s *Server) handleForwardUsage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	records, nextCursor, totalRows, err := s.store.QueryForwardUsage(r.Context(), query, source)
+	totalRowsExact := query.IncludeTotal
+	totalRows := 0
+	fetchQuery := query
+	if query.UsePage && query.IncludeTotal {
+		totalRows, err = s.lookupForwardUsageCount(r.Context(), query, source, normalizedRangeKey(r))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err)
+			return
+		}
+		fetchQuery.IncludeTotal = false
+	}
+	records, nextCursor, pageTotalRows, err := s.store.QueryForwardUsage(r.Context(), fetchQuery, source)
 	if err != nil {
 		if errors.Is(err, store.ErrCursorSortUnsupported) {
 			writeError(w, http.StatusBadRequest, "invalid_forward_query", err)
@@ -407,16 +460,33 @@ func (s *Server) handleForwardUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
+	if !totalRowsExact {
+		totalRows = pageTotalRows
+	}
 	writeJSON(w, http.StatusOK, envelope{
 		"data_source":      store.ForwardDataSource(source),
 		"data":             records,
 		"next_cursor":      nextCursor,
 		"total_rows":       totalRows,
-		"total_rows_exact": query.IncludeTotal,
+		"total_rows_exact": totalRowsExact,
 		"has_more":         pagedHasMore(query.UsePage, totalRows, query.Page, query.PageSize, nextCursor),
 		"page":             query.Page,
 		"page_size":        query.PageSize,
 	})
+}
+
+func (s *Server) lookupForwardUsageCount(ctx context.Context, query model.ForwardQuery, source string, rangeKey string) (int, error) {
+	startBucket, endBucket, archived := quantizeWindow(rangeKey, query.Start.Unix(), query.End.Unix())
+	key := forwardCountCacheKey(source, rangeKey, startBucket, endBucket, query)
+	if value, ok := s.countCache.Get(key); ok {
+		return value, nil
+	}
+	totalRows, err := s.store.QueryForwardUsageCount(ctx, query, source)
+	if err != nil {
+		return 0, err
+	}
+	s.countCache.SetWithTTL(key, totalRows, s.cacheTTL(archived))
+	return totalRows, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

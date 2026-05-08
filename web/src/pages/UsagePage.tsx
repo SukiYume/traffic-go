@@ -566,7 +566,7 @@ export function UsagePage() {
         pageSize,
         sortBy: normalizeUsageSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? "desc" : "asc",
-        includeTotal: false,
+        includeTotal: true,
       }, { signal }),
     placeholderData: keepPreviousData,
   });
