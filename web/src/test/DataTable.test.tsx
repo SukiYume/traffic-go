@@ -135,4 +135,46 @@ describe('DataTable row expansion', () => {
 
     expect(onPageChange).toHaveBeenCalledWith(6);
   });
+
+  it('renders lower-bound pagination without a moving total page count', () => {
+    render(
+      <DataTable
+        columns={columns}
+        data={data}
+        pagination={{
+          page: 2,
+          pageSize: 25,
+          totalRows: 51,
+          hasMore: true,
+          totalRowsExact: false,
+          onPageChange: vi.fn(),
+        }}
+      />,
+    );
+
+    expect(screen.getByText('第 2 页，至少 51 条，仍有更多')).toBeInTheDocument();
+    expect(screen.queryByText(/第 2 \/ 3 页/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '跳页' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '下一页' })).toBeEnabled();
+  });
+
+  it('disables next page when lower-bound pagination reaches the end', () => {
+    render(
+      <DataTable
+        columns={columns}
+        data={data}
+        pagination={{
+          page: 3,
+          pageSize: 25,
+          totalRows: 52,
+          hasMore: false,
+          totalRowsExact: false,
+          onPageChange: vi.fn(),
+        }}
+      />,
+    );
+
+    expect(screen.getByText('第 3 页，已加载 52 条')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '下一页' })).toBeDisabled();
+  });
 });

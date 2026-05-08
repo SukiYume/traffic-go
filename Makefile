@@ -44,6 +44,7 @@ sync-frontend: build-frontend
 	mkdir -p internal/embed/dist
 	rm -rf internal/embed/dist/*
 	cp -R $(WEB_DIR)/dist/. internal/embed/dist/
+	printf '%s\n' placeholder > internal/embed/dist/placeholder.txt
 
 release-linux:
 	APP_NAME=$(APP_NAME) GO=$(GO) NPM=$(NPM) WEB_DIR=$(WEB_DIR) RELEASE_ROOT=$(RELEASE_ROOT) bash deploy/package-release.sh

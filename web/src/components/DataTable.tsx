@@ -128,32 +128,39 @@ export function DataTable<TData>({
     getSortedRowModel: manualSorting ? undefined : getSortedRowModel(),
   });
 
-  const totalPages = pagination
-    ? pagination.totalRowsExact === false
-      ? pagination.hasMore
-        ? pagination.page + 1
-        : pagination.page
-      : Math.max(1, Math.ceil(pagination.totalRows / pagination.pageSize))
-    : 1;
-  const totalLabel = pagination
-    ? pagination.totalRowsExact === false
-      ? pagination.hasMore
-        ? `至少 ${formatNumber(pagination.totalRows)} 条`
-        : `已加载 ${formatNumber(pagination.totalRows)} 条`
-      : `共 ${formatNumber(pagination.totalRows)} 条`
+  const hasExactTotal = pagination?.totalRowsExact !== false;
+  const totalPages =
+    pagination && hasExactTotal
+      ? Math.max(1, Math.ceil(pagination.totalRows / pagination.pageSize))
+      : 1;
+  const pageLabel = pagination
+    ? hasExactTotal
+      ? `第 ${pagination.page} / ${formatNumber(totalPages)} 页`
+      : `第 ${pagination.page} 页`
     : '';
+  const totalLabel = pagination
+    ? hasExactTotal
+      ? `共 ${formatNumber(pagination.totalRows)} 条`
+      : pagination.hasMore
+        ? `至少 ${formatNumber(pagination.totalRows)} 条，仍有更多`
+        : `已加载 ${formatNumber(pagination.totalRows)} 条`
+    : '';
+  const canGoNext = pagination
+    ? hasExactTotal
+      ? pagination.page < totalPages
+      : Boolean(pagination.hasMore)
+    : false;
+  const canUsePageJump = pagination != null && hasExactTotal;
   const [pageInput, setPageInput] = useState(String(pagination?.page ?? 1));
   useEffect(() => {
     setPageInput(String(pagination?.page ?? 1));
   }, [pagination?.page]);
   const parsedJumpPage = Number.parseInt(pageInput, 10);
   const jumpPage =
-    pagination && Number.isFinite(parsedJumpPage) && parsedJumpPage > 0
-      ? pagination.totalRowsExact === false && pagination.hasMore
-        ? parsedJumpPage
-        : Math.min(parsedJumpPage, totalPages)
+    canUsePageJump && Number.isFinite(parsedJumpPage) && parsedJumpPage > 0
+      ? Math.min(parsedJumpPage, totalPages)
       : null;
-  const canJump = pagination != null && jumpPage != null && jumpPage !== pagination.page;
+  const canJump = canUsePageJump && jumpPage != null && jumpPage !== pagination?.page;
   const submitPageJump = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!pagination || jumpPage == null || jumpPage === pagination.page) return;
@@ -271,24 +278,27 @@ export function DataTable<TData>({
         <footer className="table-footer">
           <span className="table-footer-summary">
             <span>
-              第 {pagination.page} / {formatNumber(totalPages)} 页，{totalLabel}
+              {pageLabel}，{totalLabel}
             </span>
             {busy ? <span className="table-refreshing">刷新中</span> : null}
           </span>
           <div className="table-footer-actions">
-            <form className="table-page-jump" onSubmit={submitPageJump}>
-              <input
-                aria-label="跳转页码"
-                inputMode="numeric"
-                min={1}
-                type="number"
-                value={pageInput}
-                onChange={(event) => setPageInput(event.target.value)}
-              />
-              <button type="submit" className="chip ghost" disabled={!canJump}>
-                跳页
-              </button>
-            </form>
+            {canUsePageJump ? (
+              <form className="table-page-jump" onSubmit={submitPageJump}>
+                <input
+                  aria-label="跳转页码"
+                  inputMode="numeric"
+                  min={1}
+                  max={totalPages}
+                  type="number"
+                  value={pageInput}
+                  onChange={(event) => setPageInput(event.target.value)}
+                />
+                <button type="submit" className="chip ghost" disabled={!canJump}>
+                  跳页
+                </button>
+              </form>
+            ) : null}
             <button type="button" className="chip ghost" onClick={() => pagination.onPageChange(1)} disabled={pagination.page <= 1}>
               首页
             </button>
@@ -304,7 +314,7 @@ export function DataTable<TData>({
               type="button"
               className="chip ghost"
               onClick={() => pagination.onPageChange(pagination.page + 1)}
-              disabled={pagination.totalRowsExact === false ? !pagination.hasMore : pagination.page >= totalPages}
+              disabled={!canGoNext}
             >
               下一页
             </button>

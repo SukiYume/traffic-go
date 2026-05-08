@@ -24,6 +24,7 @@ sync_frontend_assets() {
   mkdir -p "${ROOT_DIR}/internal/embed/dist"
   rm -rf "${ROOT_DIR}/internal/embed/dist"/*
   cp -R "${ROOT_DIR}/${WEB_DIR}/dist/." "${ROOT_DIR}/internal/embed/dist/"
+  printf '%s\n' placeholder > "${ROOT_DIR}/internal/embed/dist/placeholder.txt"
 }
 
 copy_release_assets() {
