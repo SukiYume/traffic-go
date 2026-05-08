@@ -560,6 +560,19 @@ button {
   margin-left: auto;
 }
 
+.panel-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.chart-busy {
+  color: var(--accent-primary);
+  font-weight: 700;
+  font-size: 13px;
+}
+
 .chart-panel h2 {
   font-size: 18px;
   margin: 0 0 4px 0;

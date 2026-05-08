@@ -10,6 +10,7 @@ import {
   YAxis,
 } from 'recharts';
 import type { GroupBy, RangeKey, TimeSeriesGroup, TimeSeriesPoint } from '../types';
+import { rangeWindow } from '../ranges';
 import { chartTickLabel, formatBytes, formatLongDateTime } from '../utils';
 
 const directionPalette = {
@@ -37,6 +38,7 @@ export function ChartPanel({
   upLabel = '上行',
   downLabel = '下行',
   actions,
+  busy = false,
 }: {
   points: TimeSeriesPoint[];
   groups?: TimeSeriesGroup[];
@@ -47,6 +49,7 @@ export function ChartPanel({
   upLabel?: string;
   downLabel?: string;
   actions?: ReactNode;
+  busy?: boolean;
 }) {
   const showDirectionGroups = groupBy === 'direction' && groups.length > 0;
   const groupedData = useMemo(() => {
@@ -64,14 +67,22 @@ export function ChartPanel({
     return [...merged.values()].sort((left, right) => Number(left.ts) - Number(right.ts));
   }, [groups, showDirectionGroups]);
 
+  const xDomain = useMemo<[number, number]>(() => {
+    const window = rangeWindow(range);
+    return [window.start, window.end];
+  }, [range]);
+
   return (
-    <section className="panel chart-panel">
+    <section className="panel chart-panel" aria-busy={busy || undefined}>
       <div className="panel-head">
         <div>
           <h2>{title}</h2>
           <span>{subtitle}</span>
         </div>
-        {actions}
+        <div className="panel-head-actions">
+          {busy ? <span className="chart-busy">刷新中</span> : null}
+          {actions}
+        </div>
       </div>
       <div className="chart-frame">
         <ResponsiveContainer width="100%" height={360}>
@@ -81,7 +92,8 @@ export function ChartPanel({
               dataKey="ts"
               type="number"
               scale="time"
-              domain={['dataMin', 'dataMax']}
+              domain={xDomain}
+              allowDataOverflow
               tickFormatter={(value) => chartTickLabel(Number(value), range)}
               tick={{ fill: '#91a0b8', fontSize: 12 }}
               minTickGap={range === '1h' ? 28 : range === '24h' ? 36 : 48}

@@ -137,23 +137,25 @@ export function DashboardPage() {
         <QueryErrorState error={series.error} title="连接方向趋势加载失败" />
       ) : trafficView === 'interface' && networkSeries.data ? (
         <ChartPanel
-          points={networkSeries.data.points}
+          points={networkSeries.isPlaceholderData ? [] : networkSeries.data.points}
           groupBy={undefined}
           range={range}
           title="网卡流量趋势"
           subtitle="按公网网卡聚合：接收 RX / 发送 TX"
           upLabel="发送 TX"
           downLabel="接收 RX"
+          busy={networkSeries.isFetching}
           actions={<TrafficViewSelect value={trafficView} onChange={setTrafficView} />}
         />
       ) : trafficView === 'direction' && series.data ? (
         <ChartPanel
-          points={series.data.points}
-          groups={series.data.groups}
+          points={series.isPlaceholderData ? [] : series.data.points}
+          groups={series.isPlaceholderData ? [] : series.data.groups}
           groupBy={series.data.groupBy}
           range={range}
           title="连接方向趋势"
           subtitle="按方向聚合：入站 / 出站总量"
+          busy={series.isFetching}
           actions={<TrafficViewSelect value={trafficView} onChange={setTrafficView} />}
         />
       ) : (
