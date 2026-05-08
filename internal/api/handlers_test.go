@@ -3387,15 +3387,15 @@ func TestHandleTopProcessesPaginatesFromCache(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	before := server.resultCache.Len()
+	before := server.processCache.Len()
 	rec = httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
 		"/api/v1/top/processes?range=24h&page=2&page_size=3&sort_by=bytes_up&sort_order=asc&group_by=pid", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("second status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if server.resultCache.Len() != before {
-		t.Fatalf("second call should hit cache (entries before=%d after=%d)", before, server.resultCache.Len())
+	if server.processCache.Len() != before {
+		t.Fatalf("second call should hit cache (entries before=%d after=%d)", before, server.processCache.Len())
 	}
 	var resp struct {
 		TotalRows      int  `json:"total_rows"`
@@ -3448,14 +3448,14 @@ func TestHandleTopRemotesPaginatesFromCache(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	before := server.resultCache.Len()
+	before := server.remoteCache.Len()
 	rec = httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
 		"/api/v1/top/remotes?range=24h&page=2&page_size=2&sort_by=remote_ip&sort_order=asc", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("second status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if server.resultCache.Len() != before {
+	if server.remoteCache.Len() != before {
 		t.Fatalf("second call should hit cache")
 	}
 	var resp struct {

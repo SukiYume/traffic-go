@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"traffic-go/internal/config"
 	"traffic-go/internal/model"
 	"traffic-go/internal/store"
@@ -37,7 +39,11 @@ type Server struct {
 	enableSSJournalFallback bool
 	readShadowsocksJournal  shadowsocksJournalReader
 	countCache              *lruCache[string, int]
-	resultCache             *lruCache[string, cachedResult]
+	processCache            *lruCache[string, cachedTop[model.ProcessSummary]]
+	remoteCache             *lruCache[string, cachedTop[model.RemoteSummary]]
+	countSF                 singleflight.Group
+	processSF               singleflight.Group
+	remoteSF                singleflight.Group
 	slidingCacheTTL         time.Duration
 	archivedCacheTTL        time.Duration
 }
@@ -61,8 +67,9 @@ func NewServer(
 		auth:                    auth,
 		enableSSJournalFallback: enableSSJournalFallback,
 		readShadowsocksJournal:  defaultShadowsocksJournalReader,
-		countCache:              newLRUCache[string, int](cacheCfg.CountCacheSize, cacheCfg.SlidingTTL),
-		resultCache:             newLRUCache[string, cachedResult](cacheCfg.ResultCacheSize, cacheCfg.SlidingTTL),
+		countCache:              newLRUCache[string, int](cacheCfg.CountCacheSize),
+		processCache:            newLRUCache[string, cachedTop[model.ProcessSummary]](cacheCfg.ResultCacheSize),
+		remoteCache:             newLRUCache[string, cachedTop[model.RemoteSummary]](cacheCfg.ResultCacheSize),
 		slidingCacheTTL:         cacheCfg.SlidingTTL,
 		archivedCacheTTL:        cacheCfg.ArchivedTTL,
 	}

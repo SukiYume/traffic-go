@@ -2,11 +2,14 @@ package api
 
 import (
 	"container/list"
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"traffic-go/internal/model"
 )
@@ -20,19 +23,17 @@ type lruEntry[K comparable, V any] struct {
 type lruCache[K comparable, V any] struct {
 	mu       sync.Mutex
 	capacity int
-	ttl      time.Duration
 	now      func() time.Time
 	items    map[K]*list.Element
 	order    *list.List
 }
 
-func newLRUCache[K comparable, V any](capacity int, ttl time.Duration) *lruCache[K, V] {
+func newLRUCache[K comparable, V any](capacity int) *lruCache[K, V] {
 	if capacity < 0 {
 		capacity = 0
 	}
 	return &lruCache[K, V]{
 		capacity: capacity,
-		ttl:      ttl,
 		now:      time.Now,
 		items:    make(map[K]*list.Element),
 		order:    list.New(),
@@ -59,11 +60,7 @@ func (c *lruCache[K, V]) Get(key K) (V, bool) {
 	return entry.value, true
 }
 
-func (c *lruCache[K, V]) Set(key K, value V) {
-	c.SetWithTTL(key, value, c.ttl)
-}
-
-func (c *lruCache[K, V]) SetWithTTL(key K, value V, ttl time.Duration) {
+func (c *lruCache[K, V]) Set(key K, value V, ttl time.Duration) {
 	if c == nil || c.capacity == 0 {
 		return
 	}
@@ -106,10 +103,61 @@ func (c *lruCache[K, V]) removeLocked(elem *list.Element) {
 	delete(c.items, entry.key)
 }
 
-type cachedResult struct {
-	processes []model.ProcessSummary
-	remotes   []model.RemoteSummary
-	source    string
+// cachedTop holds the full grouped result for a top-N endpoint (processes or
+// remotes) keyed by query window. The handler sorts and pages this slice in
+// memory so different sort_by/page combinations all reuse one cache entry.
+type cachedTop[T any] struct {
+	rows   []T
+	source string
+}
+
+// loadCachedCount returns the cached integer for key, or runs load (deduped
+// via singleflight) and stores the result. Concurrent misses for the same key
+// share one underlying store call so we never run two identical COUNT(*)
+// queries side-by-side on the single CPU we have.
+func loadCachedCount(ctx context.Context, cache *lruCache[string, int], group *singleflight.Group, key string, ttl time.Duration, load func(context.Context) (int, error)) (int, error) {
+	if v, ok := cache.Get(key); ok {
+		return v, nil
+	}
+	value, err, _ := group.Do(key, func() (any, error) {
+		if v, ok := cache.Get(key); ok {
+			return v, nil
+		}
+		v, err := load(ctx)
+		if err != nil {
+			return 0, err
+		}
+		cache.Set(key, v, ttl)
+		return v, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return value.(int), nil
+}
+
+// loadCachedTop returns the cached top-N entry for key, or runs load (deduped
+// via singleflight) and stores the result. See loadCachedCount for the
+// rationale.
+func loadCachedTop[T any](ctx context.Context, cache *lruCache[string, cachedTop[T]], group *singleflight.Group, key string, ttl time.Duration, load func(context.Context) (cachedTop[T], error)) (cachedTop[T], error) {
+	if v, ok := cache.Get(key); ok {
+		return v, nil
+	}
+	value, err, _ := group.Do(key, func() (any, error) {
+		if v, ok := cache.Get(key); ok {
+			return v, nil
+		}
+		v, err := load(ctx)
+		if err != nil {
+			return cachedTop[T]{}, err
+		}
+		cache.Set(key, v, ttl)
+		return v, nil
+	})
+	if err != nil {
+		return cachedTop[T]{}, err
+	}
+	return value.(cachedTop[T]), nil
 }
 
 func quantizeWindow(rangeKey string, startUnix int64, endUnix int64) (int64, int64, bool) {

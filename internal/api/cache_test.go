@@ -1,16 +1,23 @@
 package api
 
 import (
+	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"traffic-go/internal/model"
 )
 
+const testCacheTTL = 10 * time.Second
+
 func TestLRUCacheGetSet(t *testing.T) {
-	c := newLRUCache[string, int](2, 10*time.Second)
-	c.Set("a", 1)
-	c.Set("b", 2)
+	c := newLRUCache[string, int](2)
+	c.Set("a", 1, testCacheTTL)
+	c.Set("b", 2, testCacheTTL)
 	if v, ok := c.Get("a"); !ok || v != 1 {
 		t.Fatalf("get a = %v, %v", v, ok)
 	}
@@ -20,10 +27,10 @@ func TestLRUCacheGetSet(t *testing.T) {
 }
 
 func TestLRUCacheEvictsOldest(t *testing.T) {
-	c := newLRUCache[string, int](2, 10*time.Second)
-	c.Set("a", 1)
-	c.Set("b", 2)
-	c.Set("c", 3)
+	c := newLRUCache[string, int](2)
+	c.Set("a", 1, testCacheTTL)
+	c.Set("b", 2, testCacheTTL)
+	c.Set("c", 3, testCacheTTL)
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("a should have been evicted")
 	}
@@ -33,8 +40,8 @@ func TestLRUCacheEvictsOldest(t *testing.T) {
 }
 
 func TestLRUCacheTTLExpiry(t *testing.T) {
-	c := newLRUCache[string, int](4, 20*time.Millisecond)
-	c.Set("a", 1)
+	c := newLRUCache[string, int](4)
+	c.Set("a", 1, 20*time.Millisecond)
 	time.Sleep(50 * time.Millisecond)
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("a should have expired")
@@ -42,11 +49,11 @@ func TestLRUCacheTTLExpiry(t *testing.T) {
 }
 
 func TestLRUCacheGetPromotes(t *testing.T) {
-	c := newLRUCache[string, int](2, 10*time.Second)
-	c.Set("a", 1)
-	c.Set("b", 2)
+	c := newLRUCache[string, int](2)
+	c.Set("a", 1, testCacheTTL)
+	c.Set("b", 2, testCacheTTL)
 	_, _ = c.Get("a")
-	c.Set("c", 3)
+	c.Set("c", 3, testCacheTTL)
 	if _, ok := c.Get("b"); ok {
 		t.Fatal("b should have been evicted")
 	}
@@ -56,8 +63,8 @@ func TestLRUCacheGetPromotes(t *testing.T) {
 }
 
 func TestLRUCacheZeroCapacityIsNoop(t *testing.T) {
-	c := newLRUCache[string, int](0, 10*time.Second)
-	c.Set("a", 1)
+	c := newLRUCache[string, int](0)
+	c.Set("a", 1, testCacheTTL)
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("zero-capacity cache should not retain entries")
 	}
@@ -161,5 +168,53 @@ func TestForwardFilterFingerprintStable(t *testing.T) {
 	q2 := model.ForwardQuery{OrigDstIP: "1.1.1.1", OrigSrcIP: "10.0.0.1", Proto: "tcp"}
 	if forwardFilterFingerprint(q1) != forwardFilterFingerprint(q2) {
 		t.Fatal("forward fingerprint should be deterministic")
+	}
+}
+
+func TestLoadCachedCountDedupesConcurrentMisses(t *testing.T) {
+	cache := newLRUCache[string, int](4)
+	var group singleflight.Group
+	var calls atomic.Int32
+	gate := make(chan struct{})
+	load := func(ctx context.Context) (int, error) {
+		calls.Add(1)
+		<-gate
+		return 42, nil
+	}
+
+	const goroutines = 10
+	results := make([]int, goroutines)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			v, err := loadCachedCount(context.Background(), cache, &group, "key", testCacheTTL, load)
+			if err != nil {
+				t.Errorf("loadCachedCount: %v", err)
+				return
+			}
+			results[idx] = v
+		}(i)
+	}
+	// Give the goroutines a moment to enter singleflight before unblocking the loader.
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected exactly one underlying load, got %d", got)
+	}
+	for i, v := range results {
+		if v != 42 {
+			t.Fatalf("goroutine %d got value %d, want 42", i, v)
+		}
+	}
+	// Subsequent reads should hit the cache, not increment calls.
+	if v, err := loadCachedCount(context.Background(), cache, &group, "key", testCacheTTL, load); err != nil || v != 42 {
+		t.Fatalf("post-load fetch = (%d, %v), want (42, nil)", v, err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("cached read should not invoke load again, calls=%d", got)
 	}
 }
