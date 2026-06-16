@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -79,6 +80,8 @@ type PrefetchOptions struct {
 	ScanBudget          time.Duration
 	MaxScanFiles        int
 	MaxScanLinesPerFile int
+	CursorLookup        PrefetchCursorLookup
+	CursorCommit        PrefetchCursorCommit
 }
 
 type PrefetchResult struct {
@@ -87,6 +90,14 @@ type PrefetchResult struct {
 	Partial         bool
 	Note            string
 }
+
+type PrefetchCursor struct {
+	Identity string
+	Offset   int64
+}
+
+type PrefetchCursorLookup func(source string, path string) (PrefetchCursor, bool)
+type PrefetchCursorCommit func(source string, path string, cursor PrefetchCursor)
 
 type lineEvidenceCollector struct {
 	source        string
@@ -329,7 +340,7 @@ func PrefetchWindow(ctx context.Context, evidenceStore Store, options PrefetchOp
 	scanCtx, cancel := deriveScanContext(ctx, options.ScanBudget)
 	defer cancel()
 
-	rows, err := ScanFiles(
+	rows, err := ScanPrefetchFiles(
 		scanCtx,
 		options.Source,
 		files,
@@ -340,6 +351,8 @@ func PrefetchWindow(ctx context.Context, evidenceStore Store, options PrefetchOp
 		options.ReferenceTS,
 		0,
 		options.MaxScanLinesPerFile,
+		options.CursorLookup,
+		options.CursorCommit,
 	)
 	if isBudgetTimeout(ctx, scanCtx, err) {
 		result.Partial = true
@@ -391,6 +404,107 @@ func ScanLines(
 			return collector.Rows(), ctx.Err()
 		}
 		if collector.AddLine(line) {
+			break
+		}
+	}
+	return collector.Rows(), nil
+}
+
+func ScanPrefetchFiles(
+	ctx context.Context,
+	source string,
+	files []LogFileCandidate,
+	parser Parser,
+	matcher Matcher,
+	startTS int64,
+	endTS int64,
+	referenceTS int64,
+	limit int,
+	maxLinesPerFile int,
+	cursorLookup PrefetchCursorLookup,
+	cursorCommit PrefetchCursorCommit,
+) ([]model.LogEvidence, error) {
+	if cursorLookup == nil || cursorCommit == nil {
+		return ScanFiles(ctx, source, files, parser, matcher, startTS, endTS, referenceTS, limit, maxLinesPerFile)
+	}
+	if len(files) == 0 {
+		return nil, nil
+	}
+	collector := newLineEvidenceCollector(source, parser, matcher, startTS, endTS, referenceTS, limit, 0)
+
+	for _, candidate := range files {
+		if ctx.Err() != nil {
+			return collector.Rows(), ctx.Err()
+		}
+		file, err := os.Open(candidate.Path)
+		if err != nil {
+			continue
+		}
+		info, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			continue
+		}
+		cursor := PrefetchCursor{
+			Identity: fileCursorIdentity(candidate.Path, info),
+			Offset:   info.Size(),
+		}
+		previous, hasPrevious := cursorLookup(source, candidate.Path)
+		sameFile := hasPrevious && previous.Identity == cursor.Identity
+		if sameFile && previous.Offset == info.Size() {
+			cursorCommit(source, candidate.Path, cursor)
+			_ = file.Close()
+			continue
+		}
+
+		if shouldTailScanPlainFile(candidate.Path, maxLinesPerFile) {
+			if sameFile {
+				startOffset := previous.Offset
+				if startOffset < 0 || startOffset > info.Size() {
+					startOffset = 0
+				}
+				nextOffset, err := scanPlainFileForwardFromOffset(ctx, file, collector, startOffset, maxLinesPerFile)
+				_ = file.Close()
+				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						return collector.Rows(), err
+					}
+					return nil, fmt.Errorf("scan evidence file %s: %w", candidate.Path, err)
+				}
+				cursor.Offset = nextOffset
+				cursorCommit(source, candidate.Path, cursor)
+			} else {
+				err := scanPlainFileTail(ctx, file, collector, maxLinesPerFile)
+				_ = file.Close()
+				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						return collector.Rows(), err
+					}
+					return nil, fmt.Errorf("scan evidence file %s: %w", candidate.Path, err)
+				}
+				cursorCommit(source, candidate.Path, cursor)
+			}
+			if collector.Full() {
+				break
+			}
+			continue
+		}
+		_ = file.Close()
+
+		reader, err := openMaybeGzip(candidate.Path)
+		if err != nil {
+			continue
+		}
+		if err := scanReaderForward(ctx, reader, collector, maxLinesPerFile); err != nil {
+			_ = reader.Close()
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return collector.Rows(), err
+			}
+			return nil, fmt.Errorf("scan evidence file %s: %w", candidate.Path, err)
+		}
+		_ = reader.Close()
+		cursorCommit(source, candidate.Path, cursor)
+		if collector.Full() {
 			break
 		}
 	}
@@ -683,25 +797,7 @@ func ScanFiles(
 			continue
 		}
 
-		scanner := bufio.NewScanner(reader)
-		buffer := make([]byte, 0, 64*1024)
-		scanner.Buffer(buffer, 1024*1024)
-		linesRead := 0
-		collector.StartStream()
-		for scanner.Scan() {
-			if ctx.Err() != nil {
-				_ = reader.Close()
-				return collector.Rows(), ctx.Err()
-			}
-			linesRead++
-			if maxLinesPerFile > 0 && linesRead > maxLinesPerFile {
-				break
-			}
-			if collector.AddLine(scanner.Text()) {
-				break
-			}
-		}
-		if err := scanner.Err(); err != nil {
+		if err := scanReaderForward(ctx, reader, collector, maxLinesPerFile); err != nil {
 			_ = reader.Close()
 			return nil, fmt.Errorf("scan evidence file %s: %w", file.Path, err)
 		}
@@ -713,8 +809,68 @@ func ScanFiles(
 	return collector.Rows(), nil
 }
 
+func scanReaderForward(ctx context.Context, reader io.Reader, collector *lineEvidenceCollector, maxLinesPerFile int) error {
+	scanner := bufio.NewScanner(reader)
+	buffer := make([]byte, 0, 64*1024)
+	scanner.Buffer(buffer, 1024*1024)
+	linesRead := 0
+	collector.StartStream()
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		linesRead++
+		if maxLinesPerFile > 0 && linesRead > maxLinesPerFile {
+			break
+		}
+		if collector.AddLine(scanner.Text()) {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func shouldTailScanPlainFile(path string, maxLinesPerFile int) bool {
 	return maxLinesPerFile > 0 && !strings.HasSuffix(strings.ToLower(path), ".gz")
+}
+
+func scanPlainFileForwardFromOffset(ctx context.Context, file *os.File, collector *lineEvidenceCollector, offset int64, maxLinesPerFile int) (int64, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return offset, err
+	}
+	reader := bufio.NewReaderSize(file, 64*1024)
+	linesRead := 0
+	currentOffset := offset
+	collector.StartStream()
+	for {
+		if ctx.Err() != nil {
+			return currentOffset, ctx.Err()
+		}
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			currentOffset += int64(len(line))
+			linesRead++
+			trimmed := strings.TrimRight(line, "\r\n")
+			if strings.TrimSpace(trimmed) != "" && collector.AddLine(trimmed) {
+				return currentOffset, nil
+			}
+			if maxLinesPerFile > 0 && linesRead >= maxLinesPerFile {
+				return currentOffset, nil
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return currentOffset, nil
+			}
+			return currentOffset, err
+		}
+	}
 }
 
 func scanPlainFileTail(ctx context.Context, file *os.File, collector *lineEvidenceCollector, maxLinesPerFile int) error {
@@ -779,6 +935,56 @@ func scanPlainFileTail(ctx context.Context, file *os.File, collector *lineEviden
 	}
 
 	return nil
+}
+
+func fileCursorIdentity(path string, info os.FileInfo) string {
+	if info != nil {
+		if identity, ok := statDeviceInode(info.Sys()); ok {
+			return identity
+		}
+	}
+	return filepath.Clean(path)
+}
+
+func statDeviceInode(sys any) (string, bool) {
+	if sys == nil {
+		return "", false
+	}
+	value := reflect.ValueOf(sys)
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return "", false
+		}
+		value = value.Elem()
+	}
+	if value.Kind() != reflect.Struct {
+		return "", false
+	}
+	dev, okDev := numericStructField(value, "Dev")
+	ino, okIno := numericStructField(value, "Ino")
+	if !okDev || !okIno {
+		return "", false
+	}
+	return fmt.Sprintf("%d:%d", dev, ino), true
+}
+
+func numericStructField(value reflect.Value, name string) (uint64, bool) {
+	field := value.FieldByName(name)
+	if !field.IsValid() {
+		return 0, false
+	}
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		raw := field.Int()
+		if raw < 0 {
+			return 0, false
+		}
+		return uint64(raw), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return field.Uint(), true
+	default:
+		return 0, false
+	}
 }
 
 func deriveScanContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {

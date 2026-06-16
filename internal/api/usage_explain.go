@@ -78,7 +78,8 @@ type usageExplainResponse struct {
 }
 
 type usageExplainOptions struct {
-	allowFileScan bool
+	allowFileScan     bool
+	deferChainPersist bool
 }
 
 type usageExplainChain struct {
@@ -416,8 +417,10 @@ func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usage
 	response.Chains = assignCanonicalChainIDs(bucketTS, query, response.Chains)
 	response.SourceIPs = mergeTopIPs(response.SourceIPs, chainIPs(response.Chains, true), 6)
 	response.TargetIPs = mergeTopIPs(response.TargetIPs, chainIPs(response.Chains, false), 6)
-	if err := s.persistCanonicalChains(ctx, bucketTS, query, response.Chains); err != nil {
-		return usageExplainResponse{}, fmt.Errorf("persist canonical chains: %w", err)
+	if !options.deferChainPersist {
+		if err := s.persistCanonicalChains(ctx, bucketTS, query, response.Chains); err != nil {
+			return usageExplainResponse{}, fmt.Errorf("persist canonical chains: %w", err)
+		}
 	}
 
 	response.Confidence = inferConfidence(response)
@@ -2856,6 +2859,14 @@ func assignCanonicalChainIDs(bucketTS int64, query usageExplainQuery, chains []u
 }
 
 func (s *Server) persistCanonicalChains(ctx context.Context, bucketTS int64, query usageExplainQuery, chains []usageExplainChain) error {
+	records := canonicalChainRecords(bucketTS, query, chains)
+	if len(records) == 0 {
+		return nil
+	}
+	return s.store.UpsertUsageChains(ctx, records)
+}
+
+func canonicalChainRecords(bucketTS int64, query usageExplainQuery, chains []usageExplainChain) []model.UsageChainRecord {
 	if len(chains) == 0 {
 		return nil
 	}
@@ -2898,7 +2909,7 @@ func (s *Server) persistCanonicalChains(ctx context.Context, bucketTS int64, que
 	if len(records) == 0 {
 		return nil
 	}
-	return s.store.UpsertUsageChains(ctx, records)
+	return records
 }
 
 func shouldPersistCanonicalChain(chain usageExplainChain) bool {

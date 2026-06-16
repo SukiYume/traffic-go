@@ -7,11 +7,13 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 
 	"traffic-go/internal/config"
+	"traffic-go/internal/evidence"
 	"traffic-go/internal/model"
 	"traffic-go/internal/store"
 )
@@ -46,6 +48,8 @@ type Server struct {
 	remoteSF                singleflight.Group
 	slidingCacheTTL         time.Duration
 	archivedCacheTTL        time.Duration
+	prefetchCursorMu        sync.Mutex
+	prefetchCursors         map[string]evidence.PrefetchCursor
 }
 
 func NewServer(

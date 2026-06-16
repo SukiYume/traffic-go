@@ -22,6 +22,10 @@ const (
 	defaultResultCacheSize     = 16
 	defaultSlidingTTL          = 60 * time.Second
 	defaultArchivedTTL         = 3600 * time.Second
+	defaultPrefetchInterval    = 30 * time.Minute
+	defaultPrefetchScanBudget  = 500 * time.Millisecond
+	defaultPrefetchMaxFiles    = 2
+	defaultPrefetchMaxLines    = 10000
 )
 
 type Retention struct {
@@ -127,12 +131,12 @@ func Default() Config {
 		},
 		Prefetch: Prefetch{
 			Enabled:             true,
-			Interval:            5 * time.Minute,
+			Interval:            defaultPrefetchInterval,
 			EvidenceLookback:    20 * time.Minute,
 			ChainLookback:       20 * time.Minute,
-			ScanBudget:          2 * time.Second,
-			MaxScanFiles:        3,
-			MaxScanLinesPerFile: 80000,
+			ScanBudget:          defaultPrefetchScanBudget,
+			MaxScanFiles:        defaultPrefetchMaxFiles,
+			MaxScanLinesPerFile: defaultPrefetchMaxLines,
 		},
 		Cache: Cache{
 			CountCacheSize:  defaultCountCacheSize,
@@ -207,7 +211,7 @@ func Derive(cfg Config) Config {
 		cfg.Retention.ChainDays = 14
 	}
 	if cfg.Prefetch.Interval <= 0 {
-		cfg.Prefetch.Interval = 5 * time.Minute
+		cfg.Prefetch.Interval = defaultPrefetchInterval
 	}
 	if cfg.Prefetch.EvidenceLookback <= 0 {
 		cfg.Prefetch.EvidenceLookback = 20 * time.Minute
@@ -216,13 +220,13 @@ func Derive(cfg Config) Config {
 		cfg.Prefetch.ChainLookback = 20 * time.Minute
 	}
 	if cfg.Prefetch.ScanBudget <= 0 {
-		cfg.Prefetch.ScanBudget = 2 * time.Second
+		cfg.Prefetch.ScanBudget = defaultPrefetchScanBudget
 	}
 	if cfg.Prefetch.MaxScanFiles <= 0 {
-		cfg.Prefetch.MaxScanFiles = 3
+		cfg.Prefetch.MaxScanFiles = defaultPrefetchMaxFiles
 	}
 	if cfg.Prefetch.MaxScanLinesPerFile <= 0 {
-		cfg.Prefetch.MaxScanLinesPerFile = 80000
+		cfg.Prefetch.MaxScanLinesPerFile = defaultPrefetchMaxLines
 	}
 	if cfg.Cache.CountCacheSize == 0 && !cfg.Cache.countCacheSizeSet {
 		cfg.Cache.CountCacheSize = defaultCountCacheSize

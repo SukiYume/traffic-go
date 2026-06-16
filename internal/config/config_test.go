@@ -43,8 +43,8 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if !cfg.Prefetch.Enabled {
 		t.Fatalf("expected prefetch enabled by default")
 	}
-	if cfg.Prefetch.Interval != 5*time.Minute {
-		t.Fatalf("expected default prefetch interval 5m, got %s", cfg.Prefetch.Interval)
+	if cfg.Prefetch.Interval != 30*time.Minute {
+		t.Fatalf("expected default prefetch interval 30m, got %s", cfg.Prefetch.Interval)
 	}
 	if cfg.Prefetch.EvidenceLookback != 20*time.Minute {
 		t.Fatalf("expected default evidence lookback 20m, got %s", cfg.Prefetch.EvidenceLookback)
@@ -52,14 +52,14 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if cfg.Prefetch.ChainLookback != 20*time.Minute {
 		t.Fatalf("expected default chain lookback 20m, got %s", cfg.Prefetch.ChainLookback)
 	}
-	if cfg.Prefetch.ScanBudget != 2*time.Second {
-		t.Fatalf("expected default scan budget 2s, got %s", cfg.Prefetch.ScanBudget)
+	if cfg.Prefetch.ScanBudget != 500*time.Millisecond {
+		t.Fatalf("expected default scan budget 500ms, got %s", cfg.Prefetch.ScanBudget)
 	}
-	if cfg.Prefetch.MaxScanFiles != 3 {
-		t.Fatalf("expected default max scan files 3, got %d", cfg.Prefetch.MaxScanFiles)
+	if cfg.Prefetch.MaxScanFiles != 2 {
+		t.Fatalf("expected default max scan files 2, got %d", cfg.Prefetch.MaxScanFiles)
 	}
-	if cfg.Prefetch.MaxScanLinesPerFile != 80000 {
-		t.Fatalf("expected default max scan lines 80000, got %d", cfg.Prefetch.MaxScanLinesPerFile)
+	if cfg.Prefetch.MaxScanLinesPerFile != 10000 {
+		t.Fatalf("expected default max scan lines 10000, got %d", cfg.Prefetch.MaxScanLinesPerFile)
 	}
 	if cfg.SocketIndexInterval != 10*time.Second {
 		t.Fatalf("expected default socket index interval 10s, got %s", cfg.SocketIndexInterval)
@@ -266,8 +266,8 @@ func TestDeriveRestoresPrefetchDefaultsForZeroValues(t *testing.T) {
 
 	derived := Derive(cfg)
 
-	if derived.Prefetch.Interval != 5*time.Minute {
-		t.Fatalf("expected derived interval 5m, got %s", derived.Prefetch.Interval)
+	if derived.Prefetch.Interval != 30*time.Minute {
+		t.Fatalf("expected derived interval 30m, got %s", derived.Prefetch.Interval)
 	}
 	if derived.Prefetch.EvidenceLookback != 20*time.Minute {
 		t.Fatalf("expected derived evidence lookback 20m, got %s", derived.Prefetch.EvidenceLookback)
@@ -275,14 +275,14 @@ func TestDeriveRestoresPrefetchDefaultsForZeroValues(t *testing.T) {
 	if derived.Prefetch.ChainLookback != 20*time.Minute {
 		t.Fatalf("expected derived chain lookback 20m, got %s", derived.Prefetch.ChainLookback)
 	}
-	if derived.Prefetch.ScanBudget != 2*time.Second {
-		t.Fatalf("expected derived scan budget 2s, got %s", derived.Prefetch.ScanBudget)
+	if derived.Prefetch.ScanBudget != 500*time.Millisecond {
+		t.Fatalf("expected derived scan budget 500ms, got %s", derived.Prefetch.ScanBudget)
 	}
-	if derived.Prefetch.MaxScanFiles != 3 {
-		t.Fatalf("expected derived max scan files 3, got %d", derived.Prefetch.MaxScanFiles)
+	if derived.Prefetch.MaxScanFiles != 2 {
+		t.Fatalf("expected derived max scan files 2, got %d", derived.Prefetch.MaxScanFiles)
 	}
-	if derived.Prefetch.MaxScanLinesPerFile != 80000 {
-		t.Fatalf("expected derived max scan lines 80000, got %d", derived.Prefetch.MaxScanLinesPerFile)
+	if derived.Prefetch.MaxScanLinesPerFile != 10000 {
+		t.Fatalf("expected derived max scan lines 10000, got %d", derived.Prefetch.MaxScanLinesPerFile)
 	}
 	if derived.SocketIndexInterval != 10*time.Second {
 		t.Fatalf("expected derived socket index interval 10s, got %s", derived.SocketIndexInterval)

@@ -170,12 +170,12 @@ retention:
 
 prefetch:
   enabled: true
-  interval: 5m
+  interval: 30m
   evidence_lookback: 20m
   chain_lookback: 20m
-  scan_budget: 2s
-  max_scan_files: 3
-  max_scan_lines_per_file: 80000
+  scan_budget: 500ms
+  max_scan_files: 2
+  max_scan_lines_per_file: 10000
 
 cache:
   count_cache_size: 256
@@ -359,7 +359,7 @@ ls -l /proc/net/nf_conntrack
 modprobe nf_conntrack
 ```
 
-日志归因没有命中时，应确认配置中的进程名和实际 `comm` 或可执行文件 basename 一致，并确认日志目录可读。后台预热默认每 5 分钟执行一次。刚修改日志配置后可以等待下一轮预热，或在详情接口上追加 `scan=1`。
+日志归因没有命中时，应确认配置中的进程名和实际 `comm` 或可执行文件 basename 一致，并确认日志目录可读。后台预热默认每 30 分钟执行一次，并会对普通日志文件使用内存中的 inode/offset 游标增量读取。刚修改日志配置后可以等待下一轮预热，或在详情接口上追加 `scan=1`。
 
 ## 限制
 

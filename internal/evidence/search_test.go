@@ -191,6 +191,104 @@ func TestPrefetchWindowPersistsScannedRows(t *testing.T) {
 	}
 }
 
+func TestPrefetchWindowUsesCursorForAppendedPlainLogs(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ss-server.log")
+	initialContent := strings.Join([]string{
+		"2026-04-18T12:00:00Z connect to chatgpt.com:443",
+		"2026-04-18T12:01:00Z connect to openai.com:443",
+	}, "\n") + "\n"
+	if err := os.WriteFile(logPath, []byte(initialContent), 0o644); err != nil {
+		t.Fatalf("write test log: %v", err)
+	}
+
+	store := &fakeEvidenceStore{}
+	cursors := make(map[string]PrefetchCursor)
+	cursorKey := func(source string, path string) string {
+		return source + "|" + path
+	}
+	lookupCursor := func(source string, path string) (PrefetchCursor, bool) {
+		cursor, ok := cursors[cursorKey(source, path)]
+		return cursor, ok
+	}
+	commitCursor := func(source string, path string, cursor PrefetchCursor) {
+		cursors[cursorKey(source, path)] = cursor
+	}
+	parseLine := func(source string, line string, _ time.Time) (model.LogEvidence, bool) {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			return model.LogEvidence{}, false
+		}
+		ts, parseErr := time.Parse(time.RFC3339, fields[0])
+		if parseErr != nil {
+			return model.LogEvidence{}, false
+		}
+		hostPort := strings.TrimSpace(fields[len(fields)-1])
+		return Normalize(model.LogEvidence{
+			Source:  source,
+			EventTS: ts.Unix(),
+			Host:    strings.TrimSuffix(hostPort, ":443"),
+			Path:    "443",
+			Method:  "connect",
+			Message: strings.TrimSpace(line),
+		}), true
+	}
+	options := PrefetchOptions{
+		Source:              "ss",
+		LogDir:              logPath,
+		StartTS:             time.Date(2026, 4, 18, 11, 59, 0, 0, time.UTC).Unix(),
+		EndTS:               time.Date(2026, 4, 18, 12, 4, 0, 0, time.UTC).Unix(),
+		Parser:              parseLine,
+		MaxScanFiles:        1,
+		MaxScanLinesPerFile: 100,
+		CursorLookup:        lookupCursor,
+		CursorCommit:        commitCursor,
+	}
+
+	first, err := PrefetchWindow(context.Background(), store, options)
+	if err != nil {
+		t.Fatalf("first prefetch window: %v", err)
+	}
+	if first.RowsImported != 2 {
+		t.Fatalf("expected first prefetch to import 2 rows, got %+v", first)
+	}
+	if len(store.upserted) != 2 {
+		t.Fatalf("expected 2 upserted rows after first prefetch, got %+v", store.upserted)
+	}
+
+	appendContent := "2026-04-18T12:02:00Z connect to example.com:443\n"
+	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open test log for append: %v", err)
+	}
+	if _, err := file.WriteString(appendContent); err != nil {
+		_ = file.Close()
+		t.Fatalf("append test log: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close appended test log: %v", err)
+	}
+
+	second, err := PrefetchWindow(context.Background(), store, options)
+	if err != nil {
+		t.Fatalf("second prefetch window: %v", err)
+	}
+	if second.RowsImported != 1 {
+		t.Fatalf("expected second prefetch to import only appended row, got %+v", second)
+	}
+	if got := store.upserted[len(store.upserted)-1].Host; got != "example.com" {
+		t.Fatalf("expected appended host to be imported, got %q", got)
+	}
+
+	third, err := PrefetchWindow(context.Background(), store, options)
+	if err != nil {
+		t.Fatalf("third prefetch window: %v", err)
+	}
+	if third.RowsImported != 0 {
+		t.Fatalf("expected third prefetch to skip unchanged file, got %+v", third)
+	}
+}
+
 func TestListLogFilesKeepsActiveUndatedLogDespiteMtime(t *testing.T) {
 	dir := t.TempDir()
 	active := filepath.Join(dir, "ss-server.log")

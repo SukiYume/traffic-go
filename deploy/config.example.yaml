@@ -61,10 +61,10 @@ retention:
 
 prefetch:
   enabled: true
-  interval: 5m
+  interval: 30m
   evidence_lookback: 20m
   chain_lookback: 20m
-  scan_budget: 2s
-  max_scan_files: 3
-  max_scan_lines_per_file: 80000
+  scan_budget: 500ms
+  max_scan_files: 2
+  max_scan_lines_per_file: 10000
 # Hourly cleanup, WAL truncation, and weekly vacuum are built in and are not configurable here.

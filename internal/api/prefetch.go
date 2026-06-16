@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -75,6 +77,8 @@ func (s *Server) RunBackgroundPrefetch(ctx context.Context, options BackgroundPr
 			ScanBudget:          options.ScanBudget,
 			MaxScanFiles:        options.MaxScanFiles,
 			MaxScanLinesPerFile: options.MaxScanLinesPerFile,
+			CursorLookup:        s.lookupPrefetchCursor,
+			CursorCommit:        s.commitPrefetchCursor,
 		})
 		summary.Sources++
 		if err != nil {
@@ -125,12 +129,13 @@ func (s *Server) RunBackgroundPrefetch(ctx context.Context, options BackgroundPr
 		s.logPrefetchf("prefetch usage replay capped at %d rows within %s", backgroundPrefetchMaxUsageRows, options.ChainLookback)
 	}
 	queries := dedupePrefetchExplainQueries(usageRows)
+	chainRecords := make([]model.UsageChainRecord, 0, len(queries))
 	for _, query := range queries {
 		if _, _, ok := s.lookupConfiguredProcessLogDir(query.Comm, query.Exe); !ok {
 			continue
 		}
 		summary.UsageRows++
-		response, err := s.analyzeUsageExplainWithOptions(ctx, query, usageExplainOptions{allowFileScan: false})
+		response, err := s.analyzeUsageExplainWithOptions(ctx, query, usageExplainOptions{allowFileScan: false, deferChainPersist: true})
 		if err != nil {
 			summary.Errors++
 			s.logPrefetchf("precompute chain for %s/%s %s:%d -> %s:%d failed: %v",
@@ -145,6 +150,14 @@ func (s *Server) RunBackgroundPrefetch(ctx context.Context, options BackgroundPr
 			continue
 		}
 		summary.ChainRows += len(response.Chains)
+		chainRecords = append(chainRecords, canonicalChainRecords(query.TimeBucket, query, response.Chains)...)
+	}
+	chainRecords = dedupeUsageChainRecords(chainRecords)
+	if len(chainRecords) > 0 {
+		if err := s.store.UpsertUsageChains(ctx, chainRecords); err != nil {
+			summary.Errors++
+			s.logPrefetchf("persist prefetched chains failed: %v", err)
+		}
 	}
 	return summary
 }
@@ -176,14 +189,20 @@ func (s *Server) processLogDescriptors() []processLogDescriptor {
 	}
 	result := make([]processLogDescriptor, 0, len(s.processLogDirs))
 	seen := make(map[string]struct{}, len(s.processLogDirs))
-	for key, logDir := range s.processLogDirs {
+	keys := make([]string, 0, len(s.processLogDirs))
+	for key := range s.processLogDirs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		logDir := s.processLogDirs[key]
 		normalizedKey := strings.ToLower(strings.TrimSpace(key))
 		normalizedDir := strings.TrimSpace(logDir)
 		if normalizedKey == "" || normalizedDir == "" {
 			continue
 		}
 		descriptor := buildProcessLogDescriptor(normalizedKey, normalizedDir)
-		dedupeKey := fmt.Sprintf("%s|%s", descriptor.EvidenceSource, descriptor.LogDir)
+		dedupeKey := fmt.Sprintf("%s|%s", descriptor.EvidenceSource, canonicalLogPathSpec(descriptor.LogDir))
 		if _, ok := seen[dedupeKey]; ok {
 			continue
 		}
@@ -191,6 +210,20 @@ func (s *Server) processLogDescriptors() []processLogDescriptor {
 		result = append(result, descriptor)
 	}
 	return result
+}
+
+func canonicalLogPathSpec(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.ContainsAny(trimmed, "*?[") {
+		return filepath.Clean(trimmed)
+	}
+	if abs, err := filepath.Abs(trimmed); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(trimmed)
 }
 
 func buildProcessLogDescriptor(lookupKey string, logDir string) processLogDescriptor {
@@ -294,6 +327,52 @@ func usageExplainQueryKey(query usageExplainQuery) string {
 		strings.TrimSpace(query.RemoteIP),
 		nullablePortValue(query.RemotePort),
 	)
+}
+
+func dedupeUsageChainRecords(records []model.UsageChainRecord) []model.UsageChainRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	result := make([]model.UsageChainRecord, 0, len(records))
+	seen := make(map[string]int, len(records))
+	for _, record := range records {
+		key := strings.TrimSpace(record.ChainID)
+		if key == "" {
+			continue
+		}
+		if existingIdx, ok := seen[key]; ok {
+			if record.SampleTime >= result[existingIdx].SampleTime {
+				result[existingIdx] = record
+			}
+			continue
+		}
+		seen[key] = len(result)
+		result = append(result, record)
+	}
+	return result
+}
+
+func (s *Server) lookupPrefetchCursor(source string, path string) (evidence.PrefetchCursor, bool) {
+	s.prefetchCursorMu.Lock()
+	defer s.prefetchCursorMu.Unlock()
+	if len(s.prefetchCursors) == 0 {
+		return evidence.PrefetchCursor{}, false
+	}
+	cursor, ok := s.prefetchCursors[prefetchCursorKey(source, path)]
+	return cursor, ok
+}
+
+func (s *Server) commitPrefetchCursor(source string, path string, cursor evidence.PrefetchCursor) {
+	s.prefetchCursorMu.Lock()
+	defer s.prefetchCursorMu.Unlock()
+	if s.prefetchCursors == nil {
+		s.prefetchCursors = make(map[string]evidence.PrefetchCursor)
+	}
+	s.prefetchCursors[prefetchCursorKey(source, path)] = cursor
+}
+
+func prefetchCursorKey(source string, path string) string {
+	return strings.TrimSpace(source) + "|" + canonicalLogPathSpec(path)
 }
 
 func (s *Server) logPrefetchf(format string, args ...any) {
