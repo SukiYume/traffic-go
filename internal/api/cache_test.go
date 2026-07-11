@@ -70,6 +70,57 @@ func TestLRUCacheZeroCapacityIsNoop(t *testing.T) {
 	}
 }
 
+func TestWeightedCachesShareHardByteBudget(t *testing.T) {
+	budget := newCacheBudget(10)
+	left := newWeightedLRUCache[string, int](4, budget, func(value int) int64 { return int64(value) })
+	right := newWeightedLRUCache[string, int](4, budget, func(value int) int64 { return int64(value) })
+
+	left.Set("six", 6, testCacheTTL)
+	right.Set("five", 5, testCacheTTL)
+	if _, ok := right.Get("five"); ok {
+		t.Fatal("second cache must not exceed the shared budget")
+	}
+	if got := budget.usage(); got != 6 {
+		t.Fatalf("shared budget usage=%d, want 6", got)
+	}
+
+	left.Set("replacement", 5, testCacheTTL)
+	if _, ok := left.Get("six"); ok {
+		t.Fatal("oldest entry should be evicted to admit a replacement within budget")
+	}
+	if value, ok := left.Get("replacement"); !ok || value != 5 {
+		t.Fatalf("replacement cache entry=(%d,%v), want (5,true)", value, ok)
+	}
+	if got := budget.usage(); got != 5 {
+		t.Fatalf("shared budget usage after eviction=%d, want 5", got)
+	}
+}
+
+func TestWeightedCacheRejectsSingleOversizedEntry(t *testing.T) {
+	budget := newCacheBudget(8)
+	cache := newWeightedLRUCache[string, int](4, budget, func(value int) int64 { return int64(value) })
+	cache.Set("too-large", 9, testCacheTTL)
+	if cache.Len() != 0 || budget.usage() != 0 {
+		t.Fatalf("oversized entry must not be retained: len=%d usage=%d", cache.Len(), budget.usage())
+	}
+}
+
+func TestServerTopCachesUseIndependentProductionByteBudgets(t *testing.T) {
+	server := newTestServer(t)
+	if server.processCache.budget == nil || server.remoteCache.budget == nil || server.processCache.budget == server.remoteCache.budget {
+		t.Fatal("process and remote caches must have independent hard byte budgets")
+	}
+	weight := int64(maxCachedTopBytes)
+	server.processCache.Set("process", cachedTop[model.ProcessSummary]{weight: weight}, testCacheTTL)
+	server.remoteCache.Set("remote", cachedTop[model.RemoteSummary]{weight: weight}, testCacheTTL)
+	if server.processCache.Len() != 1 || server.remoteCache.Len() != 1 {
+		t.Fatalf("one top endpoint must not starve the other: process=%d remote=%d", server.processCache.Len(), server.remoteCache.Len())
+	}
+	if got := server.processCache.budget.usage() + server.remoteCache.budget.usage(); got != int64(maxCombinedTopCacheBytes) {
+		t.Fatalf("combined production cache usage=%d, want %d", got, maxCombinedTopCacheBytes)
+	}
+}
+
 func TestQuantizeWindow(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -81,21 +132,21 @@ func TestQuantizeWindow(t *testing.T) {
 		archived  bool
 	}{
 		{
-			name:      "1h is quantized to 60s",
+			name:      "1h follows persisted minute bounds",
 			rangeKey:  "1h",
 			startUnix: 1715140861,
 			endUnix:   1715144461,
 			wantStart: 1715140860,
-			wantEnd:   1715144460,
+			wantEnd:   1715144520,
 			archived:  false,
 		},
 		{
-			name:      "7d quantized to 5min",
+			name:      "7d follows persisted minute bounds",
 			rangeKey:  "7d",
 			startUnix: 1714540861,
 			endUnix:   1715145661,
-			wantStart: 1714540800,
-			wantEnd:   1715145600,
+			wantStart: 1714540860,
+			wantEnd:   1715145720,
 			archived:  false,
 		},
 		{

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"math"
 	"sort"
 	"strings"
 
@@ -23,7 +24,13 @@ func sortProcessSummaries(rows []model.ProcessSummary, sortBy string, sortOrder 
 		if tie != 0 {
 			return tie < 0
 		}
-		return cmpInt(derefPID(out[i].PID), derefPID(out[j].PID)) < 0
+		if tie = strings.Compare(out[i].Comm, out[j].Comm); tie != 0 {
+			return tie < 0
+		}
+		if tie = cmpInt(derefPID(out[i].PID), derefPID(out[j].PID)); tie != 0 {
+			return tie < 0
+		}
+		return strings.Compare(derefString(out[i].Exe), derefString(out[j].Exe)) < 0
 	})
 	return out
 }
@@ -93,9 +100,15 @@ func pageSlice[T any](rows []T, page int, pageSize int) []T {
 	if pageSize <= 0 || page <= 0 {
 		return nil
 	}
-	offset := (page - 1) * pageSize
-	if offset >= len(rows) {
+	if page-1 > math.MaxInt/pageSize {
 		return nil
+	}
+	offset := (page - 1) * pageSize
+	if offset < 0 || offset >= len(rows) {
+		return nil
+	}
+	if pageSize > math.MaxInt-offset {
+		return rows[offset:]
 	}
 	end := offset + pageSize
 	if end > len(rows) {
@@ -135,4 +148,11 @@ func derefPID(pid *int) int {
 		return 0
 	}
 	return *pid
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }

@@ -50,27 +50,31 @@ flowchart LR
 
 SQLite 中的运行表按粒度划分。`interface_1m` 保存网卡 RX/TX 分钟数据。`usage_1m` 保存普通入站和出站分钟明细。`usage_1m_forward` 保存转发分钟明细。`usage_1h`、`usage_1h_forward`、`usage_1d` 和 `usage_1d_forward` 保存聚合数据。`usage_monthly` 保存已结束自然月的摘要。`log_evidence` 保存日志证据缓存。`usage_chain_1m` 和 `usage_chain_1h` 保存物化后的归因链路。
 
-默认保留 7 天分钟明细、3 个 UTC 自然月小时聚合、12 个 UTC 自然月日聚合。`log_evidence` 和 `usage_chain_*` 默认各保留 14 天。已结束自然月会写入 `usage_monthly`，所以 History 页面继续展示月总量、转发总量、证据数和链路数。超出分钟窗口的查询会使用小时或日聚合表，聚合表保留的维度少于分钟表。PID、EXE、远端端口和归因精度过滤在这些数据源上不可用。
+默认保留 7 天分钟明细、3 个 UTC 自然月小时聚合、12 个 UTC 自然月日聚合。`log_evidence` 和 `usage_chain_*` 默认各保留 14 天。已结束自然月会写入 `usage_monthly`，所以 History 页面继续展示月总量、转发总量、证据数和链路数；迟到的分钟、转发、证据和链路数据也会刷新已有月摘要。跨越多个保留层的查询会拼接互不重叠的日、小时和分钟片段，因此当前尚未聚合的小时不会从长时间窗口尾部消失。若请求边界已超出分钟明细保留期，小时或日摘要会向外取整到完整 bucket；API 的 `coverage` 字段会明确返回 `approximate`、`effective_start` 和 `effective_end`，WebUI 也会提示实际覆盖窗口，避免把近似边界误认为精确区间。聚合表保留的维度少于分钟表，PID、EXE、远端端口和归因精度过滤在这些片段上不可用。
 
 ## 运行要求
 
-服务需要运行在 Linux 上，并且需要读取 conntrack 和 procfs。主机需要加载 `nf_conntrack` 模块。内核参数 `net.netfilter.nf_conntrack_acct` 需要设置为 `1`，这样 conntrack 行才会包含字节数和包数。systemd 模板会在启动前尝试加载模块并打开这个参数。
+服务需要运行在 Linux 上，并且需要读取 conntrack 和 procfs。主机需要加载 `nf_conntrack` 模块。内核参数 `net.netfilter.nf_conntrack_acct` 需要设置为 `1`，这样 conntrack 行才会包含字节数和包数。安装脚本会写入 `/etc/modules-load.d/traffic-go.conf` 和 `/etc/sysctl.d/99-traffic-go.conf`，立即验证配置并让它们在重启后继续生效。systemd 必须支持 `AmbientCapabilities`；安装脚本会用 `systemd-analyze verify` 检查，不能安全授权专用账号时直接停止，不会退化为以 root 运行 HTTP 服务。安装和卸载脚本还需要 GNU coreutils、`curl`、`find`、`flock`、`getfacl`、`modprobe`、`pgrep`、`readlink`、`runuser` 和 `stat` 等工具；CentOS 7 minimal 可先执行 `yum install -y acl coreutils curl findutils kmod procps-ng shadow-utils systemd util-linux`。
 
 服务默认监听 loopback 地址。绑定到非 loopback 地址时必须配置 HTTP Basic Auth。生产环境应通过 SSH 端口转发、内网地址或带认证的反向代理访问控制台。
 
+从源码构建前端需要 Node.js 20.19+ 或 22.12+；CI 和正式发布固定使用 `.node-version` 中的 Node.js 22.23.1 及该发行版自带的 npm 10.9.8。后端模块最低语言版本见 `go.mod`，正式发布工具链另要求 Go 1.26.5+，以避免用已知存在标准库安全修复缺口的旧 patch 版本生成产物。
+
 ## 快速开始
 
-后端可以使用示例配置运行。
+后端可以使用示例配置运行。配置加载器会拒绝未知字段、负的周期或保留值、非法监听地址和多文档 YAML；可以先用 `-check-config` 只做校验。
 
 ```bash
 go test ./...
-go run ./cmd/traffic-go -config deploy/config.example.yaml
+go run ./cmd/traffic-go -config deploy/config.example.yaml -check-config
+make build
+./bin/traffic-go -config deploy/config.example.yaml
 ```
 
 前端开发服务器会把 `/api` 代理到后端。
 
 ```bash
-npm --prefix web install
+npm --prefix web ci
 npm --prefix web run dev -- --host 127.0.0.1
 ```
 
@@ -106,7 +110,7 @@ make run
 make dev-web
 ```
 
-`make build` 会先构建前端并同步到 `internal/embed/dist/`，然后编译当前平台二进制。`make release-linux` 会运行前端测试、前端构建和 Go 测试，并生成 `linux/amd64` 发布目录和压缩包。
+`make build` 会先构建前端并同步到 `internal/embed/dist/`，然后使用 `-trimpath -s -w` 编译当前平台二进制。直接从只含占位文件的 clean clone 构建后端仍可用于测试，但服务启动会明确拒绝缺少 `index.html` 的不完整 WebUI；可运行产物应始终使用 `make build`。`make release-linux` 会运行前端测试、前端构建、Go 测试和 vet，并生成 `linux/amd64` 发布目录和压缩包。
 
 Windows Git Bash 可以调用发布脚本。
 
@@ -114,18 +118,41 @@ Windows Git Bash 可以调用发布脚本。
 bash deploy/build-linux-gitbash.sh
 ```
 
-发布产物写入 `release/linux-amd64/`。压缩包写入 `release/traffic-go-linux-amd64.tar.gz`。
+助手会优先使用仓库中被 Git 忽略的 `.tools/go/bin/go.exe`，并通过 `GOTOOLCHAIN=go1.26.5+auto` 请求正式发布所需的 patch 版本；显式设置 `GO`、`NPM` 或 `GOTOOLCHAIN` 可以覆盖这些选择。
 
-发布包包含二进制、配置示例、systemd 模板和 CentOS 7 安装脚本。安装脚本使用当前解压目录作为安装根目录。以下命令把项目安装到 `/opt/traffic-go`。
+正式发布要求固定的 Node/npm、Go 1.26.5 或更高的稳定工具链、干净工作树，并要求 HEAD 正好位于符合 SemVer 的 `v*` tag。脚本先在 `/tmp/traffic-go-release-source.*` 创建固定 commit 的 clean worktree，并把待发布输出写入 release root 内的临时 staging；只有后者必须与最终版本目录位于同一文件系统，从而在全部测试、审计、构建和校验成功后用一次目录 rename 发布到 `release/v<version>/`。已有版本目录不会被覆盖，旧成功产物不会因新构建失败而消失。二进制目录是 `release/v<version>/linux-amd64/`，压缩包是 `release/v<version>/traffic-go-v<version>-linux-amd64.tar.gz`。目录内包含 `release-manifest.json`、`BUILD-INFO.txt`、`SHA256SUMS`、Go SPDX 清单和前端生产依赖清单；manifest 和 BUILD-INFO 同时记录 Go、Node 与 npm 版本，压缩包旁另有 `.sha256`。二进制可用 `traffic-go -version` 显示版本和 commit。
+
+发布包包含二进制、配置示例、systemd 模板和安装脚本。首次安装可以直接解压到 `/opt/traffic-go`。升级时更推荐先解压到临时目录，再通过 `TRAFFIC_GO_INSTALL_ROOT` 指向正式目录；安装器会逐个原子替换受管文件，并在 readiness 失败时恢复旧二进制、配置、unit 和数据库位置（这是带回滚的事务式升级，不是整个目录的一次 rename）。
+
+发布包应先在普通账号下完成下载校验，再由 root 复制到只有 root 可写的 staging 目录。不要从 `/tmp`、普通用户 home 或 group/other 可写的祖先目录直接运行安装器；可信输入检查会有意拒绝这些路径。
 
 ```bash
-mkdir -p /opt/traffic-go
-tar -xzf traffic-go-linux-amd64.tar.gz -C /opt/traffic-go
-cd /opt/traffic-go
-bash install-centos7.sh
+# 普通账号：先验证下载得到的压缩包
+VERSION=0.6.0
+cd "release/v${VERSION}"
+sha256sum -c "traffic-go-v${VERSION}-linux-amd64.tar.gz.sha256"
+
+# root shell：复制并解压到 root-only staging，再执行安装
+sudo -i
+SOURCE_DIR=/path/to/traffic-go/release/v0.6.0
+VERSION=0.6.0
+STAGING_DIR="$(mktemp -d /root/traffic-go-release.XXXXXX)"
+install -o root -g root -m 0600 \
+  "${SOURCE_DIR}/traffic-go-v${VERSION}-linux-amd64.tar.gz" \
+  "${STAGING_DIR}/"
+tar --no-same-owner -xzf \
+  "${STAGING_DIR}/traffic-go-v${VERSION}-linux-amd64.tar.gz" \
+  -C "${STAGING_DIR}"
+chown -R root:root "${STAGING_DIR}"
+chmod -R go-w "${STAGING_DIR}"
+cd "${STAGING_DIR}"
+sha256sum --strict -c SHA256SUMS
+TRAFFIC_GO_INSTALL_ROOT=/opt/traffic-go bash install-centos7.sh
 ```
 
-安装脚本会创建运行账号，安装二进制和配置，改写 `db_path` 到安装目录内的 `traffic.db`，补充常见日志目录，加载 `nf_conntrack`，打开 `nf_conntrack_acct`，并启用 `traffic-go.service`。安装目录位于私有父目录下时，脚本会让服务以 root 身份运行，避免 systemd 无法进入工作目录。
+安装器在修改系统前强制验证同目录的 `SHA256SUMS`。源码树内没有 manifest 时，只有显式设置 `TRAFFIC_GO_ALLOW_UNVERIFIED_PACKAGE=1` 才能继续；参数传入的自定义 binary/config/unit 不属于发布包校验范围，还需独立核验并显式设置 `TRAFFIC_GO_ALLOW_UNVERIFIED_INPUTS=1`。checksum 能发现下载或复制损坏，但如果 archive 和 checksum 来自同一个不可信渠道，它本身不能证明发布者身份；需要抗篡改来源保证时应再通过可信 CI provenance 或独立签名验证。
+
+安装脚本会创建 `traffic-go` 专用账号、验证配置和 systemd unit、持久化 conntrack 前置条件、重启服务，并轮询 `/api/v1/readyz`。安装与卸载会在 `/run/traffic-go-install.lock` 上持有同一个 root-only 非阻塞事务锁，防止并发升级、回滚和卸载彼此覆盖。二进制和配置位于 root 所有的 `0750` 安装目录，运行数据库默认位于 service user 所有的 `0700` `/var/lib/traffic-go`，因此采集进程不能替换自己的可执行文件或配置。SQLite 主库必须是状态目录的直接子文件，WAL/SHM 也只允许位于同一目录；升级现有库前会在状态目录旁创建 root-only 的 `.traffic-go-db-rollback.*` 快照，安装成功或确认完整回滚后才清理，回滚不完整时会保留，所以升级前需为数据库副本预留磁盘空间。旧版安装在可执行目录中的 `traffic.db` 会在明确确认旧服务处于 inactive/failed 后迁移到状态目录；无法查询 systemd 状态时不会继续。失败时只有在数据库、受管文件、目录元数据、systemd reload 和 enable 状态全部恢复成功后才会重启旧服务，否则保持 stopped 并保留恢复材料供人工处理。已有 `config.yaml` 默认保留；只有显式设置 `TRAFFIC_GO_REPLACE_CONFIG=1` 才会用传入配置替换并创建备份。受管路径的叶目录必须命名为 `traffic-go` 或以 `traffic-go-`/`traffic-go_` 开头，用户 home、root、tmp、symlink 路径和其他系统树不会被接管；已有目录还必须为空、有可信管理标记或能识别为旧版布局；其整个父目录链必须由 root 持有且不能被 group/other 写入。父路径还必须允许专用账号遍历；私有路径会给出迁移或 ACL 提示并停止，不会把整个服务切换为 root。自定义状态目录可通过 `TRAFFIC_GO_STATE_DIR` 指定；规范化后的安装根、实际数据库路径和状态目录会同时记录在 root-only 本地布局文件与 `/etc/traffic-go-install-layout` 全局权威文件中。若全局权威文件已绑定到另一套布局，默认拒绝接管；只有审核迁移路径和旧服务状态后才可显式设置 `TRAFFIC_GO_ALLOW_LAYOUT_TAKEOVER=1`。
 
 已有二进制、配置和 systemd 模板可以通过参数传入。
 
@@ -133,11 +160,21 @@ bash install-centos7.sh
 bash install-centos7.sh ./traffic-go ./config.yaml ./traffic-go.service
 ```
 
+卸载器只有在本地管理标记、布局文件、全局权威文件以及当前 systemd unit 相互绑定时才会停服或删除任何内容；从旧安装目录或发布 staging 误运行会直接拒绝。默认移除 systemd unit、二进制以及 traffic-go 写入的 modules-load/sysctl 持久化配置；不会卸载已经加载的 `nf_conntrack` 模块，也不会立即改回当前 live sysctl 值。`config.yaml` 和备份收紧为 root-only，布局文件记录的实际 SQLite 主库及 WAL/SHM 继续保持 service user 所有且为 `0600`。默认卸载要求 `traffic-go` 账号、状态目录 owner 和 SQLite owner 仍互相匹配；异常所有权会被拒绝而不是自动纠正。nologin 专用账号也会保留，以免留下可能被 UID 重用的孤儿所有权；确认没有外部引用后可手动 `userdel traffic-go && groupdel traffic-go`。永久清除配置、已记录的实际数据库文件和管理标记必须显式请求，并在交互终端输入 `PURGE`（自动化环境还需 `--yes`）；输入不匹配会取消整个卸载，不会退化为默认删除。安装模板和卸载脚本本身会保留，便于审计和重新安装。
+
+```bash
+bash /opt/traffic-go/uninstall-centos7.sh
+bash /opt/traffic-go/uninstall-centos7.sh --purge-data
+# 非交互式永久清除：
+bash /opt/traffic-go/uninstall-centos7.sh --purge-data --yes
+```
+
 服务状态可以用 systemd 查看。
 
 ```bash
 systemctl status traffic-go.service --no-pager
 journalctl -u traffic-go.service -n 100 --no-pager
+curl --fail http://127.0.0.1:18080/api/v1/readyz
 ```
 
 ## 配置
@@ -219,11 +256,13 @@ cache:
 
 `process_log_dirs` 的 key 使用进程名或可执行文件 basename，大小写不敏感。value 可以是目录，也可以是 glob 文件模式。多个进程可以指向同一个目录。Shadowsocks 常见组合可以把 `ss-server`、`ss-manager` 和 `obfs-server` 都指向 `/var/log/shadowsocks`。FRPS 可以指向 `/var/log/frps` 或具体的 `*.log` 模式。
 
-分页接口默认使用内存缓存减少 SQLite 压力：`/api/v1/usage` 和 `/api/v1/forward/usage` 的 `include_total=1` 会命中 `count_cache_size` 大小的 COUNT LRU；`/api/v1/top/processes` 与 `/api/v1/top/remotes` 会命中 `result_cache_size` 大小的全量分组结果 LRU，同一时间窗下换排序键或翻页在内存完成。两个缓存都只占用进程内存，不写磁盘；任一 size 设为 0 即关闭对应缓存。
+分页接口默认使用内存缓存减少 SQLite 压力：`/api/v1/usage` 和 `/api/v1/forward/usage` 只有页码分页显式使用 `include_total=1` 时才计算并缓存精确 COUNT；cursor 不能与 `include_total` 混用。`/api/v1/top/processes` 与 `/api/v1/top/remotes` 会在结果不超过 5,000 行且估算不超过 8 MiB 时命中 `result_cache_size` 大小的分组结果 LRU，同一精确时间窗下换排序键或翻页可在内存完成；更大的高基数结果自动回退为 SQLite 排序分页，不进入全量缓存。两个端点各有独立的 8 MiB 硬预算，合计最多 16 MiB，避免一种查询长期占满缓存使另一种无法命中；缓存只占用进程内存，不写磁盘，任一 size 设为 0 即关闭对应缓存。
 
 `shadowsocks_journal_fallback` 默认关闭。大多数安装应读取 `/var/log/shadowsocks` 下的文件日志。只有 Shadowsocks 仍然只写 systemd journal 的主机才需要打开它。
 
-后台维护任务每小时执行清理、`PRAGMA optimize` 和 `wal_checkpoint(TRUNCATE)`；允许 vacuum 的维护轮次最多每 7 天执行一次 `VACUUM`。
+后台预取只把至少完整闭合一分钟的时间段推进为已处理，并在扫描命中行数或时间预算上限时保留 partial 状态供下一轮续扫。证据按小批次幂等写入，文件游标只有在全部批次成功后才发布，以免长事务阻塞采集器的分钟落盘。这个安全滞后意味着最新一分钟的日志证据和物化链路通常在下一轮预取才出现；实时流量明细本身不受影响。
+
+后台维护任务每小时执行清理、`PRAGMA optimize` 和不会主动等待 reader 的 `wal_checkpoint(PASSIVE)`。没有 `last_vacuum_at` 的旧库首次计划维护只记录时间基线，不会突然整理整库；后续允许 vacuum 的维护轮次最多每 7 天执行一次 `VACUUM`，只有实际或显式 `VACUUM` 完成后才运行 `wal_checkpoint(TRUNCATE)`。
 
 ## 反向代理和日志归因
 
@@ -237,7 +276,9 @@ location = /traffic {
 location /traffic/ {
     proxy_pass http://127.0.0.1:18080/;
     proxy_http_version 1.1;
-    proxy_set_header Host $host;
+    # Preserve a non-default public port so POST same-origin checks compare the
+    # browser Origin against the actual external authority.
+    proxy_set_header Host $http_host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
@@ -283,7 +324,8 @@ nginx -t && systemctl reload nginx
 
 | 接口 | 用途 |
 | --- | --- |
-| `GET /api/v1/healthz` | 健康检查 |
+| `GET /api/v1/healthz` | 进程存活检查和构建版本（liveness） |
+| `GET /api/v1/readyz` | SQLite 可查询、采集器已建立快照且最近采集仍新鲜（readiness） |
 | `GET /api/v1/diagnostics/collector` | 采集器状态 |
 | `GET /api/v1/diagnostics/store` | SQLite 连接池和表大小 |
 | `GET /api/v1/processes` | 当前和近期进程建议项 |
@@ -298,7 +340,7 @@ nginx -t && systemctl reload nginx
 | `GET /api/v1/top/ports` | 端口排行 |
 | `GET /api/v1/forward/usage` | NAT 转发明细 |
 
-时间范围可以使用 `range`，也可以使用 `start` 和 `end`。常用范围包括 `1h`、`24h`、`7d`、`this_month`、`last_month` 和 `two_months_ago`。显式时间使用 RFC3339。
+时间范围可以使用 `range`，也可以使用 `start` 和 `end`。常用范围包括 `1h`、`24h`、`7d`、`this_month`、`last_month` 和 `two_months_ago`。显式时间使用 RFC3339。服务会按各层真实保留边界自动选择分钟、小时或日数据；仍在分钟保留期内的排行保留 PID 等高基数维度，跨层窗口则自动拼接可用聚合。若整个请求窗口早于所有可用明细，API 返回 `422 range_unavailable`；若所选过滤维度需要分钟明细但窗口只能由聚合层覆盖，则返回 `422 dimension_unavailable`。
 
 ```bash
 LISTEN_ADDR=127.0.0.1:18080
@@ -319,7 +361,11 @@ curl "http://${LISTEN_ADDR}/api/v1/forward/usage?range=1h&limit=50"
 curl "http://${LISTEN_ADDR}/api/v1/usage/explain?ts=1710000000&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443"
 ```
 
-默认情况下，`usage/explain` 优先读取缓存证据。追加 `scan=1` 可以触发一次按需文件扫描，扫描结果会写回缓存。小时和日聚合数据只回放已经持久化的链路和缓存证据。
+默认情况下，`GET usage/explain` 只读取缓存证据，不产生写入。需要按需扫描文件时，必须对同一路径发送 `POST` 并追加 `scan=1`；扫描结果会写回缓存。服务对交互扫描做单并发和短时间限流，并拒绝跨 Origin 的浏览器写请求。小时和日聚合数据只回放已经持久化的链路和缓存证据。
+
+```bash
+curl -X POST "http://${LISTEN_ADDR}/api/v1/usage/explain?ts=1710000000&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443&scan=1"
+```
 
 ## 排障
 
@@ -359,17 +405,17 @@ ls -l /proc/net/nf_conntrack
 modprobe nf_conntrack
 ```
 
-日志归因没有命中时，应确认配置中的进程名和实际 `comm` 或可执行文件 basename 一致，并确认日志目录可读。后台预热默认每 30 分钟执行一次，并会对普通日志文件使用内存中的 inode/offset 游标增量读取。刚修改日志配置后可以等待下一轮预热，或在详情接口上追加 `scan=1`。
+日志归因没有命中时，应确认配置中的进程名和实际 `comm` 或可执行文件 basename 一致，并确认日志目录可读。后台预热默认每 30 分钟执行一次，并会对普通日志文件使用 inode/offset/文件签名游标增量读取；只有完整换行的记录才会推进 offset，copytruncate 和轮转会自动重新建立游标。刚修改日志配置后可以等待下一轮预热，或对详情接口发送带 `scan=1` 的 `POST`。
 
 ## 限制
 
-项目只支持 Linux。它依赖 conntrack 和 procfs 提供的信息。未进入 conntrack 的流量不会被采集。payload、TLS SNI、HTTP body 和完整应用协议字段不会被读取。UDP 归因只能尽力匹配。代理复用、混淆、relay、未 connect UDP 和极短连接会降低来源和目标的对应精度。
+项目只支持 Linux。它依赖 conntrack 和 procfs 提供的信息。未进入 conntrack 的流量不会被采集。payload、TLS SNI、HTTP body 和完整应用协议字段不会被读取。UDP 归因只能尽力匹配。代理复用、混淆、relay、未 connect UDP 和极短连接会降低来源和目标的对应精度。内核提供真实 conntrack ID 时，连接过期后的 tuple 复用会建立新一代归因；旧内核或样例中缺少 ID 时只能合成身份，同一 tuple 在短消失窗口内的复用仍存在无法从 procfs/conntrack 文本中消除的歧义。
 
 小时表和日表是聚合结果。长时间范围查询会减少高基数字段。`usage/explain` 的日志链路是候选证据，结果需要结合业务日志和部署拓扑判断。
 
 ## 安全和隐私
 
-数据库包含真实流量元数据，包括进程名、可执行文件路径、远端 IP、端口、方向、字节数、包数和部分日志证据。生产环境的 `traffic.db` 不应公开分发。控制台和 API 不应直接暴露到公网。仓库通过 `.gitignore` 忽略本地数据库、发布产物、工具目录和代理运行目录。
+数据库包含真实流量元数据，包括进程名、可执行文件路径、远端 IP、端口、方向、字节数、包数和部分日志证据。应用会用 `0700` 创建新的数据库目录，并把 SQLite 主文件和 sidecar 收紧为 `0600`。生产环境的 `traffic.db` 不应公开分发。控制台和 API 不应直接暴露到公网；非 loopback 监听必须配置 Basic Auth，并应放在提供 TLS 的可信反向代理或 SSH 隧道后。API 默认 `no-store`，页面设置 CSP、禁止 framing、禁用 MIME sniffing，并且访问日志不会复制完整 query string。仓库通过 `.gitignore` 忽略本地数据库、发布产物、工具目录和代理运行目录。
 
 README、测试和截图应使用 mock 或保留样例。提交问题和日志时需要清理真实 IP、域名、路径和用户标识。
 
@@ -380,7 +426,7 @@ README、测试和截图应使用 mock 或保留样例。提交问题和日志�
 ```bash
 go test ./...
 go vet ./...
-go build ./cmd/traffic-go
+make build
 ```
 
 前端验证使用 npm。
@@ -388,6 +434,7 @@ go build ./cmd/traffic-go
 ```bash
 npm --prefix web run test
 npm --prefix web run build
+npm --prefix web audit --omit=dev
 ```
 
 重新生成内嵌前端资源使用 Make。
@@ -395,6 +442,8 @@ npm --prefix web run build
 ```bash
 make sync-frontend
 ```
+
+仓库的 GitHub Actions 会在 Linux 上运行前端测试与审计、Go race 测试、vet、Staticcheck、govulncheck、CGO-free linux/amd64 构建和版本面验证，并通过 ShellCheck、actionlint 与临时 SemVer tag 完整演练不可变发布打包；Dependabot 每周检查 Go、npm 和 Actions 依赖。Web 控制台在页面可见时每 45 秒刷新，窗口重新获得焦点时补刷，并提供手动刷新和最后更新时间。
 
 ## 仓库结构
 

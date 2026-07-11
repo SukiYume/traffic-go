@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -24,7 +25,12 @@ import (
 
 var fileDatePattern = regexp.MustCompile(`(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)`)
 
-const tailScanChunkSize = 64 * 1024
+const (
+	tailScanChunkSize       = 64 * 1024
+	maxPlainLogLineBytes    = 1 << 20
+	defaultMaxLogCandidates = 256
+	maxLogDirectoryEntries  = 100_000
+)
 
 type LogFileCandidate struct {
 	Name    string
@@ -66,6 +72,11 @@ type SearchOptions struct {
 	MaxScanFilesFallback int
 	MaxScanLinesPerFile  int
 	CacheOnly            bool
+	// ScanContext may carry a shared deadline across multiple log directories.
+	// PersistContext remains the request context so partial rows can still be
+	// committed after the scan budget itself expires.
+	ScanContext    context.Context
+	PersistContext context.Context
 }
 
 type PrefetchOptions struct {
@@ -82,6 +93,8 @@ type PrefetchOptions struct {
 	MaxScanLinesPerFile int
 	CursorLookup        PrefetchCursorLookup
 	CursorCommit        PrefetchCursorCommit
+	ScanContext         context.Context
+	PersistContext      context.Context
 }
 
 type PrefetchResult struct {
@@ -94,10 +107,28 @@ type PrefetchResult struct {
 type PrefetchCursor struct {
 	Identity string
 	Offset   int64
+	// LineOffset is used only for compressed files, where a byte offset cannot
+	// be resumed safely. It records how many decompressed lines were completely
+	// processed before a max-lines or future-row boundary.
+	LineOffset int64
+	Incomplete bool
+	HeadHash   uint64
+	HeadBytes  int
+	TailHash   uint64
+	TailBytes  int
 }
 
 type PrefetchCursorLookup func(source string, path string) (PrefetchCursor, bool)
+
+// PrefetchCursorCommit receives a cursor progress proposal. It may point to a
+// max-lines boundary rather than EOF; callers must not publish the proposal
+// until all rows returned with that progress have persisted successfully.
 type PrefetchCursorCommit func(source string, path string, cursor PrefetchCursor)
+
+type prefetchCursorTarget struct {
+	source string
+	path   string
+}
 
 type lineEvidenceCollector struct {
 	source        string
@@ -143,31 +174,43 @@ func (c *lineEvidenceCollector) StartStream() {
 }
 
 func (c *lineEvidenceCollector) AddLine(line string) bool {
+	stop, _ := c.addLine(line, false)
+	return stop
+}
+
+func (c *lineEvidenceCollector) AddLineForPrefetch(line string) (stop bool, future bool) {
+	return c.addLine(line, true)
+}
+
+func (c *lineEvidenceCollector) addLine(line string, stopAtFuture bool) (stop bool, future bool) {
 	row, ok := c.parser(c.source, line, c.reference)
 	if !ok {
-		return false
+		return false, false
 	}
 	row = Normalize(row)
 	if row.EventTS > c.endTS {
+		if stopAtFuture {
+			return true, true
+		}
 		c.overEndStreak++
-		return c.overEndStreak >= 200
+		return c.overEndStreak >= 200, true
 	}
 	c.overEndStreak = 0
 	if row.EventTS < c.startTS || row.EventTS > c.endTS {
-		return false
+		return false, false
 	}
 	if c.matcher != nil && !c.matcher(row) {
-		return false
+		return false, false
 	}
 	if row.Fingerprint == "" {
 		row.Fingerprint = Fingerprint(row)
 	}
 	if _, exists := c.seen[row.Fingerprint]; exists {
-		return false
+		return false, false
 	}
 	c.seen[row.Fingerprint] = struct{}{}
 	c.collected = append(c.collected, row)
-	return c.limit > 0 && len(c.collected) >= c.limit
+	return c.limit > 0 && len(c.collected) >= c.limit, false
 }
 
 func (c *lineEvidenceCollector) AddLineReverse(line string) bool {
@@ -258,17 +301,28 @@ func LookupOrScan(ctx context.Context, evidenceStore Store, options SearchOption
 		return nil, "", nil
 	}
 
-	strictFiles, err := ListLogFiles(options.LogDir, options.FileNameMatcher, strictStart, strictEnd, options.MaxScanFilesStrict)
+	scanParent := options.ScanContext
+	if scanParent == nil {
+		scanParent = ctx
+	}
+	persistCtx := options.PersistContext
+	if persistCtx == nil {
+		persistCtx = ctx
+	}
+	scanCtx, cancel := deriveScanContext(scanParent, options.ScanBudget)
+	defer cancel()
+	strictFiles, err := ListLogFilesContext(scanCtx, options.LogDir, options.FileNameMatcher, strictStart, strictEnd, options.MaxScanFilesStrict)
 	if err != nil {
+		if isBudgetTimeout(ctx, scanCtx, err) {
+			return nil, formatScanBudgetNote(options.ScanBudget, false), nil
+		}
 		return nil, "", err
 	}
-	scanCtx, cancel := deriveScanContext(ctx, options.ScanBudget)
-	defer cancel()
 	if len(strictFiles) > 0 {
 		scannedStrict, err := ScanFiles(scanCtx, options.Source, strictFiles, options.Parser, options.Matcher, strictStart, strictEnd, options.BucketTS, options.Limit*3, options.MaxScanLinesPerFile)
 		if isBudgetTimeout(ctx, scanCtx, err) {
 			if len(scannedStrict) > 0 {
-				if persistErr := evidenceStore.UpsertLogEvidenceBatch(ctx, scannedStrict); persistErr != nil {
+				if persistErr := evidenceStore.UpsertLogEvidenceBatch(persistCtx, scannedStrict); persistErr != nil {
 					return nil, "", fmt.Errorf("persist partial strict evidence: %w", persistErr)
 				}
 				return SortAndTrim(scannedStrict, options.BucketTS, options.Limit), formatScanBudgetNote(options.ScanBudget, true), nil
@@ -279,15 +333,18 @@ func LookupOrScan(ctx context.Context, evidenceStore Store, options SearchOption
 			return nil, "", err
 		}
 		if len(scannedStrict) > 0 {
-			if err := evidenceStore.UpsertLogEvidenceBatch(ctx, scannedStrict); err != nil {
+			if err := evidenceStore.UpsertLogEvidenceBatch(persistCtx, scannedStrict); err != nil {
 				return nil, "", fmt.Errorf("persist strict evidence: %w", err)
 			}
 			return SortAndTrim(scannedStrict, options.BucketTS, options.Limit), "", nil
 		}
 	}
 
-	fallbackFiles, err := ListLogFiles(options.LogDir, options.FileNameMatcher, fallbackStart, fallbackEnd, options.MaxScanFilesFallback)
+	fallbackFiles, err := ListLogFilesContext(scanCtx, options.LogDir, options.FileNameMatcher, fallbackStart, fallbackEnd, options.MaxScanFilesFallback)
 	if err != nil {
+		if isBudgetTimeout(ctx, scanCtx, err) {
+			return nil, formatScanBudgetNote(options.ScanBudget, false), nil
+		}
 		return nil, "", err
 	}
 	if len(fallbackFiles) == 0 {
@@ -297,7 +354,7 @@ func LookupOrScan(ctx context.Context, evidenceStore Store, options SearchOption
 	scannedFallback, err := ScanFiles(scanCtx, options.Source, fallbackFiles, options.Parser, options.Matcher, fallbackStart, fallbackEnd, options.BucketTS, options.Limit*3, options.MaxScanLinesPerFile)
 	if isBudgetTimeout(ctx, scanCtx, err) {
 		if len(scannedFallback) > 0 {
-			if persistErr := evidenceStore.UpsertLogEvidenceBatch(ctx, scannedFallback); persistErr != nil {
+			if persistErr := evidenceStore.UpsertLogEvidenceBatch(persistCtx, scannedFallback); persistErr != nil {
 				return nil, "", fmt.Errorf("persist partial fallback evidence: %w", persistErr)
 			}
 			return SortAndTrim(scannedFallback, options.BucketTS, options.Limit), formatScanBudgetNote(options.ScanBudget, true), nil
@@ -308,7 +365,7 @@ func LookupOrScan(ctx context.Context, evidenceStore Store, options SearchOption
 		return nil, "", err
 	}
 	if len(scannedFallback) > 0 {
-		if err := evidenceStore.UpsertLogEvidenceBatch(ctx, scannedFallback); err != nil {
+		if err := evidenceStore.UpsertLogEvidenceBatch(persistCtx, scannedFallback); err != nil {
 			return nil, "", fmt.Errorf("persist fallback evidence: %w", err)
 		}
 		return SortAndTrim(scannedFallback, options.BucketTS, options.Limit), "在 ±2 分钟窗口未命中，已回退到 ±15 分钟窗口匹配日志。", nil
@@ -328,8 +385,21 @@ func PrefetchWindow(ctx context.Context, evidenceStore Store, options PrefetchOp
 		options.ReferenceTS = options.EndTS
 	}
 
-	files, err := ListLogFiles(options.LogDir, options.FileNameMatcher, options.StartTS, options.EndTS, options.MaxScanFiles)
+	scanParent := options.ScanContext
+	if scanParent == nil {
+		scanParent = ctx
+	}
+	persistCtx := options.PersistContext
+	if persistCtx == nil {
+		persistCtx = ctx
+	}
+	scanCtx, cancel := deriveScanContext(scanParent, options.ScanBudget)
+	defer cancel()
+	files, err := ListLogFilesContext(scanCtx, options.LogDir, options.FileNameMatcher, options.StartTS, options.EndTS, options.MaxScanFiles)
 	if err != nil {
+		if isBudgetTimeout(ctx, scanCtx, err) {
+			return PrefetchResult{Partial: true, Note: formatScanBudgetNote(options.ScanBudget, false)}, nil
+		}
 		return PrefetchResult{}, err
 	}
 	result := PrefetchResult{FilesConsidered: len(files)}
@@ -337,10 +407,28 @@ func PrefetchWindow(ctx context.Context, evidenceStore Store, options PrefetchOp
 		return result, nil
 	}
 
-	scanCtx, cancel := deriveScanContext(ctx, options.ScanBudget)
-	defer cancel()
+	var pendingOrder []prefetchCursorTarget
+	pendingCursors := make(map[prefetchCursorTarget]PrefetchCursor)
+	cursorCommit := options.CursorCommit
+	if options.CursorLookup != nil && options.CursorCommit != nil {
+		cursorCommit = func(source string, path string, cursor PrefetchCursor) {
+			target := prefetchCursorTarget{source: source, path: path}
+			if _, exists := pendingCursors[target]; !exists {
+				pendingOrder = append(pendingOrder, target)
+			}
+			pendingCursors[target] = cursor
+		}
+	}
+	commitPendingCursors := func() {
+		if options.CursorCommit == nil {
+			return
+		}
+		for _, target := range pendingOrder {
+			options.CursorCommit(target.source, target.path, pendingCursors[target])
+		}
+	}
 
-	rows, err := ScanPrefetchFiles(
+	rows, truncated, err := ScanPrefetchFiles(
 		scanCtx,
 		options.Source,
 		files,
@@ -352,7 +440,7 @@ func PrefetchWindow(ctx context.Context, evidenceStore Store, options PrefetchOp
 		0,
 		options.MaxScanLinesPerFile,
 		options.CursorLookup,
-		options.CursorCommit,
+		cursorCommit,
 	)
 	if isBudgetTimeout(ctx, scanCtx, err) {
 		result.Partial = true
@@ -360,23 +448,48 @@ func PrefetchWindow(ctx context.Context, evidenceStore Store, options PrefetchOp
 		if len(rows) == 0 {
 			return result, nil
 		}
-		if persistErr := evidenceStore.UpsertLogEvidenceBatch(ctx, rows); persistErr != nil {
+		if persistErr := PersistLogEvidenceBatches(persistCtx, evidenceStore, rows); persistErr != nil {
 			return PrefetchResult{}, fmt.Errorf("persist partial prefetch evidence: %w", persistErr)
 		}
+		commitPendingCursors()
 		result.RowsImported = len(rows)
 		return result, nil
 	}
 	if err != nil {
 		return PrefetchResult{}, err
 	}
+	if truncated {
+		result.Partial = true
+		result.Note = "日志文件仍有未扫描行，将在下一轮继续导入。"
+	}
 	if len(rows) == 0 {
+		commitPendingCursors()
 		return result, nil
 	}
-	if err := evidenceStore.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+	if err := PersistLogEvidenceBatches(persistCtx, evidenceStore, rows); err != nil {
 		return PrefetchResult{}, fmt.Errorf("persist prefetch evidence: %w", err)
 	}
+	commitPendingCursors()
 	result.RowsImported = len(rows)
 	return result, nil
+}
+
+const prefetchEvidencePersistBatchSize = 500
+
+// PersistLogEvidenceBatches bounds each SQLite write transaction while keeping
+// cursor publication under the caller's control. Callers may safely retry all
+// rows after an intermediate batch failure because fingerprints are upserted.
+func PersistLogEvidenceBatches(ctx context.Context, evidenceStore Store, rows []model.LogEvidence) error {
+	for start := 0; start < len(rows); start += prefetchEvidencePersistBatchSize {
+		end := start + prefetchEvidencePersistBatchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		if err := evidenceStore.UpsertLogEvidenceBatch(ctx, rows[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ScanLines(
@@ -423,20 +536,22 @@ func ScanPrefetchFiles(
 	maxLinesPerFile int,
 	cursorLookup PrefetchCursorLookup,
 	cursorCommit PrefetchCursorCommit,
-) ([]model.LogEvidence, error) {
+) ([]model.LogEvidence, bool, error) {
 	if cursorLookup == nil || cursorCommit == nil {
-		return ScanFiles(ctx, source, files, parser, matcher, startTS, endTS, referenceTS, limit, maxLinesPerFile)
+		rows, err := ScanFiles(ctx, source, files, parser, matcher, startTS, endTS, referenceTS, limit, maxLinesPerFile)
+		return rows, false, err
 	}
 	if len(files) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	collector := newLineEvidenceCollector(source, parser, matcher, startTS, endTS, referenceTS, limit, 0)
+	truncated := false
 
 	for _, candidate := range files {
 		if ctx.Err() != nil {
-			return collector.Rows(), ctx.Err()
+			return collector.Rows(), truncated, ctx.Err()
 		}
-		file, err := os.Open(candidate.Path)
+		file, err := openRegularNoFollow(candidate.Path)
 		if err != nil {
 			continue
 		}
@@ -445,49 +560,53 @@ func ScanPrefetchFiles(
 			_ = file.Close()
 			continue
 		}
-		cursor := PrefetchCursor{
-			Identity: fileCursorIdentity(candidate.Path, info),
-			Offset:   info.Size(),
-		}
+		identity := fileCursorIdentity(candidate.Path, info)
 		previous, hasPrevious := cursorLookup(source, candidate.Path)
-		sameFile := hasPrevious && previous.Identity == cursor.Identity
-		if sameFile && previous.Offset == info.Size() {
-			cursorCommit(source, candidate.Path, cursor)
-			_ = file.Close()
-			continue
-		}
+		sameFile := hasPrevious && previous.Identity == identity && !prefetchFileContentChanged(file, previous, info.Size())
 
 		if shouldTailScanPlainFile(candidate.Path, maxLinesPerFile) {
+			completeOffset, err := lastCompleteLineOffset(file, info.Size())
+			if err != nil {
+				_ = file.Close()
+				continue
+			}
+			if sameFile && previous.Offset == completeOffset {
+				cursorCommit(source, candidate.Path, buildPrefetchCursor(file, identity, completeOffset))
+				_ = file.Close()
+				continue
+			}
+			startOffset := int64(0)
 			if sameFile {
-				startOffset := previous.Offset
-				if startOffset < 0 || startOffset > info.Size() {
+				startOffset = previous.Offset
+				if startOffset < 0 || startOffset > completeOffset {
 					startOffset = 0
 				}
-				nextOffset, err := scanPlainFileForwardFromOffset(ctx, file, collector, startOffset, maxLinesPerFile)
-				_ = file.Close()
-				if err != nil {
-					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-						return collector.Rows(), err
-					}
-					return nil, fmt.Errorf("scan evidence file %s: %w", candidate.Path, err)
-				}
-				cursor.Offset = nextOffset
-				cursorCommit(source, candidate.Path, cursor)
-			} else {
-				err := scanPlainFileTail(ctx, file, collector, maxLinesPerFile)
-				_ = file.Close()
-				if err != nil {
-					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-						return collector.Rows(), err
-					}
-					return nil, fmt.Errorf("scan evidence file %s: %w", candidate.Path, err)
-				}
-				cursorCommit(source, candidate.Path, cursor)
 			}
+			nextOffset, hitLimit, err := scanPlainFileForwardFromOffset(ctx, file, collector, startOffset, maxLinesPerFile)
+			if err != nil {
+				_ = file.Close()
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					return collector.Rows(), truncated, err
+				}
+				return nil, truncated, fmt.Errorf("scan evidence file %s: %w", candidate.Path, err)
+			}
+			truncated = truncated || (hitLimit && nextOffset < completeOffset)
+			cursorCommit(source, candidate.Path, buildPrefetchCursor(file, identity, nextOffset))
+			_ = file.Close()
 			if collector.Full() {
 				break
 			}
 			continue
+		}
+		cursor := buildPrefetchCursor(file, identity, info.Size())
+		if sameFile && previous.Offset == info.Size() && !previous.Incomplete {
+			cursorCommit(source, candidate.Path, cursor)
+			_ = file.Close()
+			continue
+		}
+		startLine := int64(0)
+		if sameFile && previous.Incomplete {
+			startLine = previous.LineOffset
 		}
 		_ = file.Close()
 
@@ -495,20 +614,30 @@ func ScanPrefetchFiles(
 		if err != nil {
 			continue
 		}
-		if err := scanReaderForward(ctx, reader, collector, maxLinesPerFile); err != nil {
+		nextLine, fileTruncated, fileComplete, err := scanReaderForwardFromLine(ctx, reader, collector, startLine, maxLinesPerFile)
+		if err != nil {
 			_ = reader.Close()
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return collector.Rows(), err
+				return collector.Rows(), truncated, err
 			}
-			return nil, fmt.Errorf("scan evidence file %s: %w", candidate.Path, err)
+			return nil, truncated, fmt.Errorf("scan evidence file %s: %w", candidate.Path, err)
 		}
 		_ = reader.Close()
-		cursorCommit(source, candidate.Path, cursor)
+		if !fileComplete {
+			cursor.LineOffset = nextLine
+			cursor.Incomplete = true
+			cursorCommit(source, candidate.Path, cursor)
+		}
+		if fileTruncated {
+			truncated = true
+		} else if fileComplete {
+			cursorCommit(source, candidate.Path, cursor)
+		}
 		if collector.Full() {
 			break
 		}
 	}
-	return collector.Rows(), nil
+	return collector.Rows(), truncated, nil
 }
 
 func queryCachedEvidence(ctx context.Context, evidenceStore Store, source string, startTS int64, endTS int64, hints QueryHints, limit int) ([]model.LogEvidence, error) {
@@ -549,129 +678,342 @@ func ResolvedLogDir(value string, fallback string) string {
 }
 
 func ListLogFiles(logDir string, nameMatcher func(string) bool, startTS int64, endTS int64, maxCandidates int) ([]LogFileCandidate, error) {
+	return ListLogFilesContext(context.Background(), logDir, nameMatcher, startTS, endTS, maxCandidates)
+}
+
+func ListLogFilesContext(ctx context.Context, logDir string, nameMatcher func(string) bool, startTS int64, endTS int64, maxCandidates int) ([]LogFileCandidate, error) {
 	logPathSpec := ResolvedLogDir(logDir, "")
 	if logPathSpec == "" {
 		return nil, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	pathSpecHasGlob := hasGlobMeta(logPathSpec)
-	paths, err := resolveLogPaths(logPathSpec)
+	configuredRoot, err := configuredLogRoot(logPathSpec)
 	if err != nil {
 		return nil, err
 	}
-	if len(paths) == 0 {
-		return nil, nil
+	centerTS := (startTS + endTS) / 2
+	if maxCandidates <= 0 {
+		maxCandidates = defaultMaxLogCandidates
 	}
+	candidates := newLogFileCandidateTopK(centerTS, maxCandidates)
+	directoryEntriesVisited := 0
 
-	files := make([]LogFileCandidate, 0, len(paths)*4)
-	seen := make(map[string]struct{}, len(paths)*4)
-	for _, path := range paths {
-		info, err := os.Stat(path)
-		if err != nil {
-			return nil, fmt.Errorf("读取日志路径失败：%s（%w）", path, err)
-		}
-		if info.IsDir() {
-			entries, err := os.ReadDir(path)
-			if err != nil {
-				return nil, fmt.Errorf("读取日志目录失败：%s（%w）", path, err)
-			}
-			for _, entry := range entries {
-				if entry.IsDir() {
-					continue
-				}
-				lower := strings.ToLower(entry.Name())
-				if nameMatcher != nil && !nameMatcher(lower) {
-					continue
-				}
-				entryInfo, err := entry.Info()
-				if err != nil {
-					continue
-				}
-				if !IsLikelyFileInTimeRange(lower, entryInfo.ModTime(), startTS, endTS) {
-					continue
-				}
-				candidatePath := filepath.Join(path, entry.Name())
-				if _, ok := seen[candidatePath]; ok {
-					continue
-				}
-				seen[candidatePath] = struct{}{}
-				files = append(files, LogFileCandidate{
-					Name:    entry.Name(),
-					Path:    candidatePath,
-					ModTime: entryInfo.ModTime(),
-				})
-			}
-			continue
-		}
-
+	addCandidate := func(path string, info os.FileInfo, applyNameMatcher bool) {
 		name := filepath.Base(path)
 		lower := strings.ToLower(name)
-		// Keep explicit glob matches usable even when file names are custom.
-		if !pathSpecHasGlob && nameMatcher != nil && !nameMatcher(lower) {
-			continue
+		if applyNameMatcher && nameMatcher != nil && !nameMatcher(lower) {
+			return
 		}
 		if !IsLikelyFileInTimeRange(lower, info.ModTime(), startTS, endTS) {
-			continue
+			return
 		}
-		if _, ok := seen[path]; ok {
-			continue
+		if !pathWithinConfiguredRoot(configuredRoot, path) {
+			return
 		}
-		seen[path] = struct{}{}
-		files = append(files, LogFileCandidate{
-			Name:    name,
-			Path:    path,
-			ModTime: info.ModTime(),
-		})
+		candidates.Add(LogFileCandidate{Name: name, Path: path, ModTime: info.ModTime()})
 	}
 
-	if len(files) == 0 {
-		return nil, nil
+	processResolvedPath := func(path string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("读取日志路径失败：%s（%w）", path, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("拒绝符号链接日志路径：%s", path)
+		}
+		if info.IsDir() {
+			return enumerateLogDirectory(ctx, path, &directoryEntriesVisited, func(candidatePath string, candidateInfo os.FileInfo) {
+				addCandidate(candidatePath, candidateInfo, true)
+			})
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("拒绝非普通日志文件：%s", path)
+		}
+		if !pathWithinConfiguredRoot(configuredRoot, path) {
+			return fmt.Errorf("日志文件超出配置根目录：%s", path)
+		}
+		// Keep explicit glob matches usable even when file names are custom.
+		addCandidate(path, info, !pathSpecHasGlob)
+		return nil
 	}
 
-	centerTS := (startTS + endTS) / 2
-	sort.Slice(files, func(i, j int) bool {
-		di := AbsInt64(files[i].ModTime.Unix() - centerTS)
-		dj := AbsInt64(files[j].ModTime.Unix() - centerTS)
-		if di == dj {
-			if files[i].ModTime.Equal(files[j].ModTime) {
-				return files[i].Path > files[j].Path
-			}
-			return files[i].ModTime.After(files[j].ModTime)
-		}
-		return di < dj
-	})
-	if maxCandidates > 0 && len(files) > maxCandidates {
-		files = files[:maxCandidates]
+	if err := forEachResolvedLogPath(ctx, logPathSpec, processResolvedPath); err != nil {
+		return nil, err
 	}
-	return files, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return candidates.Sorted(), nil
 }
 
-func resolveLogPaths(logPathSpec string) ([]string, error) {
+type logFileCandidateHeap struct {
+	centerTS int64
+	items    []LogFileCandidate
+}
+
+func (h logFileCandidateHeap) Len() int { return len(h.items) }
+
+func (h logFileCandidateHeap) Less(i int, j int) bool {
+	// container/heap keeps the "least" element at the root. Define the least
+	// element as the worst candidate so replacement remains O(log K).
+	return logFileCandidateBetter(h.items[j], h.items[i], h.centerTS)
+}
+
+func (h logFileCandidateHeap) Swap(i int, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+
+func (h *logFileCandidateHeap) Push(value any) {
+	h.items = append(h.items, value.(LogFileCandidate))
+}
+
+func (h *logFileCandidateHeap) Pop() any {
+	last := len(h.items) - 1
+	value := h.items[last]
+	h.items = h.items[:last]
+	return value
+}
+
+type logFileCandidateTopK struct {
+	limit int
+	heap  logFileCandidateHeap
+}
+
+func newLogFileCandidateTopK(centerTS int64, limit int) *logFileCandidateTopK {
+	initialCapacity := limit
+	if initialCapacity > defaultMaxLogCandidates {
+		initialCapacity = defaultMaxLogCandidates
+	}
+	return &logFileCandidateTopK{
+		limit: limit,
+		heap:  logFileCandidateHeap{centerTS: centerTS, items: make([]LogFileCandidate, 0, initialCapacity)},
+	}
+}
+
+func (c *logFileCandidateTopK) Add(candidate LogFileCandidate) {
+	if c.limit <= 0 {
+		return
+	}
+	if c.heap.Len() < c.limit {
+		heap.Push(&c.heap, candidate)
+		return
+	}
+	if logFileCandidateBetter(candidate, c.heap.items[0], c.heap.centerTS) {
+		c.heap.items[0] = candidate
+		heap.Fix(&c.heap, 0)
+	}
+}
+
+func (c *logFileCandidateTopK) Sorted() []LogFileCandidate {
+	if c.heap.Len() == 0 {
+		return nil
+	}
+	result := append([]LogFileCandidate(nil), c.heap.items...)
+	sort.Slice(result, func(i int, j int) bool {
+		return logFileCandidateBetter(result[i], result[j], c.heap.centerTS)
+	})
+	return result
+}
+
+func logFileCandidateBetter(left LogFileCandidate, right LogFileCandidate, centerTS int64) bool {
+	leftDistance := AbsInt64(left.ModTime.Unix() - centerTS)
+	rightDistance := AbsInt64(right.ModTime.Unix() - centerTS)
+	if leftDistance != rightDistance {
+		return leftDistance < rightDistance
+	}
+	if !left.ModTime.Equal(right.ModTime) {
+		return left.ModTime.After(right.ModTime)
+	}
+	return left.Path > right.Path
+}
+
+func enumerateLogDirectory(ctx context.Context, path string, entriesVisited *int, add func(string, os.FileInfo)) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("读取日志目录失败：%s（%w）", path, err)
+	}
+	defer directory.Close()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entries, readErr := directory.Readdir(128)
+		for _, entryInfo := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			(*entriesVisited)++
+			if *entriesVisited > maxLogDirectoryEntries {
+				return fmt.Errorf("日志目录枚举超过 %d 个目录项：%s", maxLogDirectoryEntries, path)
+			}
+			if entryInfo.IsDir() || entryInfo.Mode()&os.ModeSymlink != 0 || !entryInfo.Mode().IsRegular() {
+				continue
+			}
+			add(filepath.Join(path, entryInfo.Name()), entryInfo)
+		}
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		}
+		if readErr != nil {
+			return fmt.Errorf("读取日志目录失败：%s（%w）", path, readErr)
+		}
+	}
+}
+
+func configuredLogRoot(pathSpec string) (string, error) {
+	trimmed := filepath.Clean(strings.TrimSpace(pathSpec))
+	if trimmed == "" {
+		return "", errors.New("empty log path")
+	}
+	root := trimmed
+	if index := strings.IndexAny(trimmed, "*?["); index >= 0 {
+		root = filepath.Dir(trimmed[:index])
+	} else if info, err := os.Lstat(trimmed); err == nil && !info.IsDir() {
+		root = filepath.Dir(trimmed)
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("解析日志根目录失败：%w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("解析日志根目录失败：%s（%w）", abs, err)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func pathWithinConfiguredRoot(root string, candidate string) bool {
+	abs, err := filepath.Abs(candidate)
+	if err != nil {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(root, filepath.Clean(resolved))
+	if err != nil {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
+func forEachResolvedLogPath(ctx context.Context, logPathSpec string, visit func(string) error) error {
 	trimmed := strings.TrimSpace(logPathSpec)
 	if trimmed == "" {
-		return nil, nil
+		return nil
 	}
-	if !hasGlobMeta(trimmed) {
-		return []string{filepath.Clean(trimmed)}, nil
-	}
-	matches, err := filepath.Glob(trimmed)
-	if err != nil {
-		return nil, fmt.Errorf("解析日志通配路径失败：%s（%w）", trimmed, err)
-	}
-	if len(matches) == 0 {
-		return nil, nil
+	cleaned := filepath.Clean(trimmed)
+	if !hasGlobMeta(cleaned) {
+		return visit(cleaned)
 	}
 
-	result := make([]string, 0, len(matches))
-	seen := make(map[string]struct{}, len(matches))
-	for _, match := range matches {
-		cleaned := filepath.Clean(match)
-		if _, ok := seen[cleaned]; ok {
-			continue
-		}
-		seen[cleaned] = struct{}{}
-		result = append(result, cleaned)
+	firstMeta := strings.IndexAny(cleaned, "*?[")
+	base := filepath.Dir(cleaned[:firstMeta])
+	relativePattern, err := filepath.Rel(base, cleaned)
+	if err != nil {
+		return fmt.Errorf("解析日志通配路径失败：%s（%w）", cleaned, err)
 	}
-	return result, nil
+	components := strings.Split(relativePattern, string(filepath.Separator))
+	for _, component := range components {
+		if hasGlobMeta(component) {
+			if _, err := filepath.Match(component, ""); err != nil {
+				return fmt.Errorf("解析日志通配路径失败：%s（%w）", cleaned, err)
+			}
+		}
+	}
+
+	enumerator := globPathEnumerator{ctx: ctx, pattern: cleaned, visit: visit}
+	return enumerator.walk(base, components, 0)
+}
+
+type globPathEnumerator struct {
+	ctx            context.Context
+	pattern        string
+	entriesVisited int
+	visit          func(string) error
+}
+
+func (e *globPathEnumerator) walk(current string, components []string, index int) error {
+	if err := e.ctx.Err(); err != nil {
+		return err
+	}
+	if index >= len(components) {
+		if err := e.visit(filepath.Clean(current)); err != nil {
+			return err
+		}
+		return e.ctx.Err()
+	}
+
+	component := components[index]
+	if !hasGlobMeta(component) {
+		next := filepath.Join(current, component)
+		info, err := os.Lstat(next)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("读取日志通配路径失败：%s（%w）", next, err)
+		}
+		if index+1 < len(components) {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("拒绝符号链接日志路径：%s", next)
+			}
+			if !info.IsDir() {
+				return nil
+			}
+		}
+		return e.walk(next, components, index+1)
+	}
+
+	directory, err := os.Open(current)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("读取日志通配目录失败：%s（%w）", current, err)
+	}
+	defer directory.Close()
+	for {
+		if err := e.ctx.Err(); err != nil {
+			return err
+		}
+		entries, readErr := directory.Readdir(128)
+		for _, entryInfo := range entries {
+			if err := e.ctx.Err(); err != nil {
+				return err
+			}
+			e.entriesVisited++
+			if e.entriesVisited > maxLogDirectoryEntries {
+				return fmt.Errorf("日志通配路径枚举超过 %d 个目录项：%s", maxLogDirectoryEntries, e.pattern)
+			}
+			matched, matchErr := filepath.Match(component, entryInfo.Name())
+			if matchErr != nil {
+				return fmt.Errorf("解析日志通配路径失败：%s（%w）", e.pattern, matchErr)
+			}
+			if !matched {
+				continue
+			}
+			if index+1 < len(components) {
+				if entryInfo.Mode()&os.ModeSymlink != 0 || !entryInfo.IsDir() {
+					continue
+				}
+			}
+			if err := e.walk(filepath.Join(current, entryInfo.Name()), components, index+1); err != nil {
+				return err
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		}
+		if readErr != nil {
+			return fmt.Errorf("读取日志通配目录失败：%s（%w）", current, readErr)
+		}
+	}
 }
 
 func hasGlobMeta(path string) bool {
@@ -774,11 +1116,11 @@ func ScanFiles(
 			return collector.Rows(), ctx.Err()
 		}
 		if shouldTailScanPlainFile(file.Path, maxLinesPerFile) {
-			plainFile, err := os.Open(file.Path)
+			plainFile, err := openRegularNoFollow(file.Path)
 			if err != nil {
 				continue
 			}
-			err = scanPlainFileTail(ctx, plainFile, collector, maxLinesPerFile)
+			_, err = scanPlainFileTail(ctx, plainFile, collector, maxLinesPerFile)
 			_ = plainFile.Close()
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -797,7 +1139,8 @@ func ScanFiles(
 			continue
 		}
 
-		if err := scanReaderForward(ctx, reader, collector, maxLinesPerFile); err != nil {
+		_, err = scanReaderForward(ctx, reader, collector, maxLinesPerFile)
+		if err != nil {
 			_ = reader.Close()
 			return nil, fmt.Errorf("scan evidence file %s: %w", file.Path, err)
 		}
@@ -809,7 +1152,7 @@ func ScanFiles(
 	return collector.Rows(), nil
 }
 
-func scanReaderForward(ctx context.Context, reader io.Reader, collector *lineEvidenceCollector, maxLinesPerFile int) error {
+func scanReaderForward(ctx context.Context, reader io.Reader, collector *lineEvidenceCollector, maxLinesPerFile int) (bool, error) {
 	scanner := bufio.NewScanner(reader)
 	buffer := make([]byte, 0, 64*1024)
 	scanner.Buffer(buffer, 1024*1024)
@@ -817,78 +1160,151 @@ func scanReaderForward(ctx context.Context, reader io.Reader, collector *lineEvi
 	collector.StartStream()
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return false, ctx.Err()
 		}
 		linesRead++
 		if maxLinesPerFile > 0 && linesRead > maxLinesPerFile {
-			break
+			return true, nil
 		}
 		if collector.AddLine(scanner.Text()) {
-			break
+			return false, nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil
+}
+
+func scanReaderForwardFromLine(
+	ctx context.Context,
+	reader io.Reader,
+	collector *lineEvidenceCollector,
+	startLine int64,
+	maxLinesPerFile int,
+) (nextLine int64, truncated bool, complete bool, err error) {
+	if startLine < 0 {
+		startLine = 0
+	}
+	scanner := bufio.NewScanner(reader)
+	buffer := make([]byte, 0, 64*1024)
+	scanner.Buffer(buffer, 1024*1024)
+	lineNumber := int64(0)
+	linesRead := 0
+	collector.StartStream()
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return startLine + int64(linesRead), false, false, ctx.Err()
+		}
+		lineNumber++
+		if lineNumber <= startLine {
+			continue
+		}
+		if maxLinesPerFile > 0 && linesRead >= maxLinesPerFile {
+			return startLine + int64(linesRead), true, false, nil
+		}
+		stop, future := collector.AddLineForPrefetch(scanner.Text())
+		if future {
+			return startLine + int64(linesRead), false, false, nil
+		}
+		linesRead++
+		if stop {
+			return startLine + int64(linesRead), true, false, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return startLine + int64(linesRead), false, false, err
+	}
+	return startLine + int64(linesRead), false, true, nil
 }
 
 func shouldTailScanPlainFile(path string, maxLinesPerFile int) bool {
 	return maxLinesPerFile > 0 && !strings.HasSuffix(strings.ToLower(path), ".gz")
 }
 
-func scanPlainFileForwardFromOffset(ctx context.Context, file *os.File, collector *lineEvidenceCollector, offset int64, maxLinesPerFile int) (int64, error) {
+func scanPlainFileForwardFromOffset(ctx context.Context, file *os.File, collector *lineEvidenceCollector, offset int64, maxLinesPerFile int) (int64, bool, error) {
 	if offset < 0 {
 		offset = 0
 	}
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return offset, err
+		return offset, false, err
 	}
 	reader := bufio.NewReaderSize(file, 64*1024)
 	linesRead := 0
 	currentOffset := offset
+	lineStartOffset := offset
+	lineBuffer := make([]byte, 0, 64*1024)
+	lineOversized := false
 	collector.StartStream()
 	for {
 		if ctx.Err() != nil {
-			return currentOffset, ctx.Err()
+			return currentOffset, false, ctx.Err()
 		}
-		line, err := reader.ReadString('\n')
-		if len(line) > 0 {
-			currentOffset += int64(len(line))
+		fragment, err := reader.ReadSlice('\n')
+		currentOffset += int64(len(fragment))
+		if !lineOversized {
+			if len(lineBuffer)+len(fragment) > maxPlainLogLineBytes {
+				lineBuffer = lineBuffer[:0]
+				lineOversized = true
+			} else {
+				lineBuffer = append(lineBuffer, fragment...)
+			}
+		}
+		if err == nil {
+			if !lineOversized {
+				trimmed := strings.TrimRight(string(lineBuffer), "\r\n")
+				if strings.TrimSpace(trimmed) != "" {
+					stop, future := collector.AddLineForPrefetch(trimmed)
+					if future {
+						return lineStartOffset, false, nil
+					}
+					if stop {
+						return currentOffset, true, nil
+					}
+				}
+			}
 			linesRead++
-			trimmed := strings.TrimRight(line, "\r\n")
-			if strings.TrimSpace(trimmed) != "" && collector.AddLine(trimmed) {
-				return currentOffset, nil
-			}
 			if maxLinesPerFile > 0 && linesRead >= maxLinesPerFile {
-				return currentOffset, nil
+				return currentOffset, true, nil
 			}
+			lineBuffer = lineBuffer[:0]
+			lineOversized = false
+			lineStartOffset = currentOffset
+			continue
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return currentOffset, nil
-			}
-			return currentOffset, err
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
 		}
+		if errors.Is(err, io.EOF) {
+			// Keep the cursor at the beginning of an unterminated fragment.
+			// The next append will then present the complete line exactly once.
+			return lineStartOffset, false, nil
+		}
+		return lineStartOffset, false, err
 	}
 }
 
-func scanPlainFileTail(ctx context.Context, file *os.File, collector *lineEvidenceCollector, maxLinesPerFile int) error {
+func scanPlainFileTail(ctx context.Context, file *os.File, collector *lineEvidenceCollector, maxLinesPerFile int) (int64, error) {
 	info, err := file.Stat()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	remaining := info.Size()
+	completeOffset, err := lastCompleteLineOffset(file, info.Size())
+	if err != nil {
+		return 0, err
+	}
+	remaining := completeOffset
 	if remaining <= 0 {
-		return nil
+		return 0, nil
 	}
 
 	leftover := make([]byte, 0, tailScanChunkSize)
+	skippingOversizedLine := false
 	linesRead := 0
 
 	for remaining > 0 {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return completeOffset, ctx.Err()
 		}
 
 		chunkSize := int64(tailScanChunkSize)
@@ -898,27 +1314,45 @@ func scanPlainFileTail(ctx context.Context, file *os.File, collector *lineEviden
 		remaining -= chunkSize
 
 		if _, err := file.Seek(remaining, io.SeekStart); err != nil {
-			return err
+			return completeOffset, err
 		}
 
 		chunk := make([]byte, chunkSize)
 		if _, err := io.ReadFull(file, chunk); err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-			return err
+			return completeOffset, err
 		}
 
 		segment := append(append(make([]byte, 0, len(chunk)+len(leftover)), chunk...), leftover...)
 		parts := bytes.Split(segment, []byte{'\n'})
 		startIdx := 0
+		endIdx := len(parts) - 1
+		if skippingOversizedLine {
+			if len(parts) == 1 {
+				continue
+			}
+			// The rightmost fragment completes the oversized line whose suffix
+			// was deliberately discarded on the previous reverse chunk.
+			endIdx--
+			skippingOversizedLine = false
+		}
 		if remaining > 0 {
-			leftover = append(leftover[:0], parts[0]...)
+			if len(parts[0]) > maxPlainLogLineBytes {
+				leftover = leftover[:0]
+				skippingOversizedLine = true
+			} else {
+				leftover = append(leftover[:0], parts[0]...)
+			}
 			startIdx = 1
 		} else {
 			leftover = leftover[:0]
 		}
 
-		for i := len(parts) - 1; i >= startIdx; i-- {
+		for i := endIdx; i >= startIdx; i-- {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return completeOffset, ctx.Err()
+			}
+			if len(parts[i]) > maxPlainLogLineBytes {
+				continue
 			}
 			line := strings.TrimRight(string(parts[i]), "\r")
 			if strings.TrimSpace(line) == "" {
@@ -926,15 +1360,45 @@ func scanPlainFileTail(ctx context.Context, file *os.File, collector *lineEviden
 			}
 			linesRead++
 			if collector.AddLineReverse(line) {
-				return nil
+				return completeOffset, nil
 			}
 			if maxLinesPerFile > 0 && linesRead >= maxLinesPerFile {
-				return nil
+				return completeOffset, nil
 			}
 		}
 	}
 
-	return nil
+	return completeOffset, nil
+}
+
+func lastCompleteLineOffset(file *os.File, size int64) (int64, error) {
+	if size <= 0 {
+		return 0, nil
+	}
+	last := []byte{0}
+	if _, err := file.ReadAt(last, size-1); err != nil {
+		return 0, err
+	}
+	if last[0] == '\n' {
+		return size, nil
+	}
+	buffer := make([]byte, 4096)
+	position := size
+	for position > 0 {
+		chunk := int64(len(buffer))
+		if position < chunk {
+			chunk = position
+		}
+		position -= chunk
+		read, err := file.ReadAt(buffer[:chunk], position)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+		if index := bytes.LastIndexByte(buffer[:read], '\n'); index >= 0 {
+			return position + int64(index) + 1, nil
+		}
+	}
+	return 0, nil
 }
 
 func fileCursorIdentity(path string, info os.FileInfo) string {
@@ -944,6 +1408,73 @@ func fileCursorIdentity(path string, info os.FileInfo) string {
 		}
 	}
 	return filepath.Clean(path)
+}
+
+const prefetchSignatureBytes = 256
+
+func buildPrefetchCursor(file *os.File, identity string, offset int64) PrefetchCursor {
+	if offset < 0 {
+		offset = 0
+	}
+	cursor := PrefetchCursor{Identity: identity, Offset: offset}
+	cursor.HeadBytes = int(minInt64(offset, prefetchSignatureBytes))
+	if cursor.HeadBytes > 0 {
+		cursor.HeadHash, _ = hashFileRegion(file, 0, cursor.HeadBytes)
+	}
+	cursor.TailBytes = int(minInt64(offset, prefetchSignatureBytes))
+	if cursor.TailBytes > 0 {
+		cursor.TailHash, _ = hashFileRegion(file, offset-int64(cursor.TailBytes), cursor.TailBytes)
+	}
+	return cursor
+}
+
+func prefetchFileContentChanged(file *os.File, previous PrefetchCursor, currentSize int64) bool {
+	if previous.Offset < 0 || previous.Offset > currentSize {
+		return true
+	}
+	if previous.HeadBytes > 0 {
+		if int64(previous.HeadBytes) > currentSize {
+			return true
+		}
+		hash, err := hashFileRegion(file, 0, previous.HeadBytes)
+		if err != nil || hash != previous.HeadHash {
+			return true
+		}
+	}
+	if previous.TailBytes > 0 {
+		if int64(previous.TailBytes) > previous.Offset {
+			return true
+		}
+		hash, err := hashFileRegion(file, previous.Offset-int64(previous.TailBytes), previous.TailBytes)
+		if err != nil || hash != previous.TailHash {
+			return true
+		}
+	}
+	return false
+}
+
+func hashFileRegion(file *os.File, offset int64, length int) (uint64, error) {
+	if length <= 0 {
+		return 0, nil
+	}
+	buffer := make([]byte, length)
+	read, err := file.ReadAt(buffer, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return 0, err
+	}
+	if read != length {
+		return 0, io.ErrUnexpectedEOF
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write(buffer)
+	return hash.Sum64(), nil
+}
+
+func minInt64(left int64, right int64) int64 {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func statDeviceInode(sys any) (string, bool) {
@@ -1089,7 +1620,7 @@ func Fingerprint(row model.LogEvidence) string {
 }
 
 func openMaybeGzip(path string) (io.ReadCloser, error) {
-	file, err := os.Open(path)
+	file, err := openRegularNoFollow(path)
 	if err != nil {
 		return nil, err
 	}

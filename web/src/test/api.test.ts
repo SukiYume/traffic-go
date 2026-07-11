@@ -1,37 +1,47 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createHttpClient, normalizeUsageSortKey, shouldUseMockApi } from '../api';
-import { createMockApiClient } from '../data/mock';
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  ApiError,
+  createHttpClient,
+  normalizeUsageSortKey,
+  shouldUseMockApi,
+} from "../api";
+import { createMockApiClient } from "../data/mock";
 
 const fetchMock = vi.fn<typeof fetch>();
 
-describe('http api client', () => {
+describe("http api client", () => {
   afterEach(() => {
     fetchMock.mockReset();
     vi.unstubAllGlobals();
   });
 
-  it('maps usage filters to backend query params and decodes snake_case rows', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("maps usage filters to backend query params and decodes snake_case rows", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1m',
-          next_cursor: 'next-1',
+          data_source: "usage_1m",
+          coverage: {
+            approximate: true,
+            effective_start: 1709996400,
+            effective_end: 1710003600,
+          },
+          next_cursor: "next-1",
           page: 2,
           page_size: 10,
           total_rows: 21,
           data: [
             {
               time_bucket: 1710000000,
-              proto: 'tcp',
-              direction: 'out',
+              proto: "tcp",
+              direction: "out",
               pid: 42,
-              comm: 'ss-server',
-              exe: '/usr/bin/ss-server',
+              comm: "ss-server",
+              exe: "/usr/bin/ss-server",
               local_port: 8388,
-              remote_ip: '198.51.100.53',
+              remote_ip: "198.51.100.53",
               remote_port: 443,
-              attribution: 'exact',
+              attribution: "exact",
               bytes_up: 120,
               bytes_down: 360,
               pkts_up: 4,
@@ -45,37 +55,42 @@ describe('http api client', () => {
 
     const client = createHttpClient();
     const response = await client.getUsage({
-      range: '24h',
-      remoteIp: '198.51.100.53',
-      localPort: '8388',
+      range: "24h",
+      remoteIp: "198.51.100.53",
+      localPort: "8388",
       page: 2,
       pageSize: 10,
-      sortBy: 'bytesTotal',
-      sortOrder: 'desc',
+      sortBy: "bytesTotal",
+      sortOrder: "desc",
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage?range=24h&remote_ip=198.51.100.53&local_port=8388&page=2&page_size=10&sort_by=bytes_total&sort_order=desc',
+      "/api/v1/usage?range=24h&remote_ip=198.51.100.53&local_port=8388&page=2&page_size=10&sort_by=bytes_total&sort_order=desc",
       expect.any(Object),
     );
     expect(response.rows[0]).toMatchObject({
       minuteTs: 1710000000,
       localPort: 8388,
-      remoteIp: '198.51.100.53',
+      remoteIp: "198.51.100.53",
       bytesUp: 120,
       bytesDown: 360,
     });
-    expect(response.nextCursor).toBe('next-1');
+    expect(response.nextCursor).toBe("next-1");
     expect(response.page).toBe(2);
     expect(response.totalRows).toBe(21);
+    expect(response.coverage).toEqual({
+      approximate: true,
+      effectiveStart: 1709996400,
+      effectiveEnd: 1710003600,
+    });
   });
 
-  it('passes AbortSignal through to fetch so superseded queries can be cancelled', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("passes AbortSignal through to fetch so superseded queries can be cancelled", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1m',
+          data_source: "usage_1m",
           next_cursor: null,
           page: 1,
           page_size: 1,
@@ -87,22 +102,74 @@ describe('http api client', () => {
 
     const client = createHttpClient();
     const controller = new AbortController();
-    await client.getUsage({ range: '24h' }, { signal: controller.signal });
+    await client.getUsage({ range: "24h" }, { signal: controller.signal });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage?range=24h',
+      "/api/v1/usage?range=24h",
       expect.objectContaining({
         signal: controller.signal,
       }),
     );
   });
 
-  it('maps usage protocol sorting to the backend query param', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("preserves a safe request id on API errors for user-visible troubleshooting", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1m',
+          error: "internal_error",
+          message: "internal server error",
+          request_id: "req-abc123",
+        }),
+        { status: 500 },
+      ),
+    );
+
+    const client = createHttpClient();
+    const error = await client
+      .getUsage({ range: "24h" })
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({
+      status: 500,
+      code: "internal_error",
+      requestId: "req-abc123",
+    });
+    expect((error as ApiError).message).toContain("请求 ID：req-abc123");
+    expect((error as ApiError).message).not.toContain("database");
+  });
+
+  it("preserves Retry-After on rate-limited API errors", async () => {
+    vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: "scan_rate_limited", message: "scan busy" }),
+        {
+          status: 429,
+          headers: { "Retry-After": "2" },
+        },
+      ),
+    );
+
+    const client = createHttpClient();
+    const error = await client
+      .getUsage({ range: "24h" })
+      .catch((reason: unknown) => reason);
+
+    expect(error).toMatchObject({
+      status: 429,
+      code: "scan_rate_limited",
+      retryAfterSeconds: 2,
+    });
+  });
+
+  it("maps usage protocol sorting to the backend query param", async () => {
+    vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data_source: "usage_1m",
           next_cursor: null,
           page: 1,
           page_size: 25,
@@ -113,20 +180,26 @@ describe('http api client', () => {
     );
 
     const client = createHttpClient();
-    await client.getUsage({ range: '24h', page: 1, pageSize: 25, sortBy: 'proto', sortOrder: 'asc' });
+    await client.getUsage({
+      range: "24h",
+      page: 1,
+      pageSize: 25,
+      sortBy: "proto",
+      sortOrder: "asc",
+    });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage?range=24h&page=1&page_size=25&sort_by=proto&sort_order=asc',
+      "/api/v1/usage?range=24h&page=1&page_size=25&sort_by=proto&sort_order=asc",
       expect.any(Object),
     );
   });
 
-  it('uses explicit start and end for retained monthly detail links', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("uses explicit start and end for retained monthly detail links", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1d',
+          data_source: "usage_1d",
           next_cursor: null,
           page: 1,
           page_size: 25,
@@ -137,16 +210,21 @@ describe('http api client', () => {
     );
 
     const client = createHttpClient();
-    await client.getUsage({ start: 1767225600, end: 1769904000, page: 1, pageSize: 25 });
+    await client.getUsage({
+      start: 1767225600,
+      end: 1769904000,
+      page: 1,
+      pageSize: 25,
+    });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage?start=1767225600&end=1769904000&page=1&page_size=25',
+      "/api/v1/usage?start=1767225600&end=1769904000&page=1&page_size=25",
       expect.any(Object),
     );
   });
 
-  it('decodes monthly archive rows', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("decodes monthly archive rows", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -164,7 +242,7 @@ describe('http api client', () => {
               updated_at: 1772323200,
               archived: false,
               detail_available: true,
-              detail_range: 'last_month',
+              detail_range: "last_month",
             },
           ],
         }),
@@ -174,25 +252,28 @@ describe('http api client', () => {
     const client = createHttpClient();
     const response = await client.getMonthlyUsage();
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/stats/monthly', expect.any(Object));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/stats/monthly",
+      expect.any(Object),
+    );
     expect(response.rows[0]).toMatchObject({
       monthTs: 1769904000,
       totalBytes: 350,
       forwardTotalBytes: 100,
-      detailRange: 'last_month',
+      detailRange: "last_month",
       archived: false,
     });
   });
 
-  it('preserves grouped timeseries semantics while aggregating total buckets', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("preserves grouped timeseries semantics while aggregating total buckets", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
             data: {
-              range: '24h',
-              data_source: 'usage_1m',
+              range: "24h",
+              data_source: "usage_1m",
               bytes_up: 10,
               bytes_down: 20,
               flow_count: 1,
@@ -205,86 +286,137 @@ describe('http api client', () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            data_source: 'usage_1m',
+            data_source: "usage_1m",
             data: [
-              { bucket_ts: 1710000000, group: 'in', bytes_up: 10, bytes_down: 20, flow_count: 1 },
-              { bucket_ts: 1710000000, group: 'out', bytes_up: 30, bytes_down: 40, flow_count: 2 },
+              {
+                bucket_ts: 1710000000,
+                group: "in",
+                bytes_up: 10,
+                bytes_down: 20,
+                flow_count: 1,
+              },
+              {
+                bucket_ts: 1710000000,
+                group: "out",
+                bytes_up: 30,
+                bytes_down: 40,
+                flow_count: 2,
+              },
             ],
           }),
         ),
       );
 
     const client = createHttpClient();
-    const overview = await client.getOverview('24h');
-    const series = await client.getTimeSeries('24h', 'direction', { comm: 'ss-server' });
+    const overview = await client.getOverview("24h");
+    const series = await client.getTimeSeries("24h", "direction", {
+      comm: "ss-server",
+    });
 
     expect(overview).toMatchObject({
       bytesUp: 10,
       bytesDown: 20,
       activeConnections: 3,
       activeProcesses: 2,
-      dataSource: 'usage_1m',
+      dataSource: "usage_1m",
     });
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      '/api/v1/stats/overview?range=24h&summary=1',
+      "/api/v1/stats/overview?range=24h&summary=1",
       expect.any(Object),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      '/api/v1/stats/timeseries?range=24h&bucket=5m&group_by=direction&comm=ss-server',
+      "/api/v1/stats/timeseries?range=24h&bucket=5m&group_by=direction&comm=ss-server",
       expect.any(Object),
     );
-    expect(series.groupBy).toBe('direction');
+    expect(series.groupBy).toBe("direction");
     expect(series.points).toHaveLength(1);
-    expect(series.points[0]).toMatchObject({ ts: 1710000000, up: 40, down: 60, flowCount: 3 });
+    expect(series.points[0]).toMatchObject({
+      ts: 1710000000,
+      up: 40,
+      down: 60,
+      flowCount: 3,
+    });
     expect(series.groups).toHaveLength(2);
     expect(series.groups).toEqual([
       {
-        key: 'in',
-        points: [expect.objectContaining({ ts: 1710000000, up: 10, down: 20, flowCount: 1 })],
+        key: "in",
+        points: [
+          expect.objectContaining({
+            ts: 1710000000,
+            up: 10,
+            down: 20,
+            flowCount: 1,
+          }),
+        ],
       },
       {
-        key: 'out',
-        points: [expect.objectContaining({ ts: 1710000000, up: 30, down: 40, flowCount: 2 })],
+        key: "out",
+        points: [
+          expect.objectContaining({
+            ts: 1710000000,
+            up: 30,
+            down: 40,
+            flowCount: 2,
+          }),
+        ],
       },
     ]);
   });
 
-  it('fetches network interface timeseries as RX and TX points', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("fetches network interface timeseries as RX and TX points", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValueOnce(
       new Response(
         JSON.stringify({
-          data_source: 'interface_1m',
+          data_source: "interface_1m",
           data: [
-            { bucket_ts: 1710000000, interface: 'eth0', rx_bytes: 100, tx_bytes: 50 },
-            { bucket_ts: 1710000000, interface: 'ens3', rx_bytes: 25, tx_bytes: 10 },
+            {
+              bucket_ts: 1710000000,
+              interface: "eth0",
+              rx_bytes: 100,
+              tx_bytes: 50,
+            },
+            {
+              bucket_ts: 1710000000,
+              interface: "ens3",
+              rx_bytes: 25,
+              tx_bytes: 10,
+            },
           ],
         }),
       ),
     );
 
     const client = createHttpClient();
-    const series = await client.getNetworkTimeSeries('24h');
+    const series = await client.getNetworkTimeSeries("24h");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/stats/interfaces/timeseries?range=24h&bucket=5m',
+      "/api/v1/stats/interfaces/timeseries?range=24h&bucket=5m",
       expect.any(Object),
     );
     expect(series).toMatchObject({
-      dataSource: 'interface_1m',
-      bucket: '5m',
-      points: [expect.objectContaining({ ts: 1710000000, down: 125, up: 60, flowCount: 0, label: '03/09 16:00' })],
+      dataSource: "interface_1m",
+      bucket: "5m",
+      points: [
+        expect.objectContaining({
+          ts: 1710000000,
+          down: 125,
+          up: 60,
+          flowCount: 0,
+          label: "03/09 16:00",
+        }),
+      ],
     });
   });
 
-  it('preserves null-only hourly dimensions in usage responses', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("preserves null-only hourly dimensions in usage responses", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1h',
+          data_source: "usage_1h",
           next_cursor: null,
           page: 1,
           page_size: 25,
@@ -292,13 +424,13 @@ describe('http api client', () => {
           data: [
             {
               time_bucket: 1710000000,
-              proto: 'tcp',
-              direction: 'out',
+              proto: "tcp",
+              direction: "out",
               pid: null,
-              comm: 'ss-server',
+              comm: "ss-server",
               exe: null,
               local_port: 8388,
-              remote_ip: '198.51.100.53',
+              remote_ip: "198.51.100.53",
               remote_port: null,
               attribution: null,
               bytes_up: 120,
@@ -313,9 +445,9 @@ describe('http api client', () => {
     );
 
     const client = createHttpClient();
-    const response = await client.getUsage({ range: 'last_month' });
+    const response = await client.getUsage({ range: "last_month" });
 
-    expect(response.dataSource).toBe('usage_1h');
+    expect(response.dataSource).toBe("usage_1h");
     expect(response.rows[0]).toMatchObject({
       pid: null,
       exe: null,
@@ -324,18 +456,25 @@ describe('http api client', () => {
     });
   });
 
-  it('builds paged process and remote summary queries', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("builds paged process and remote summary queries", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            data_source: 'usage_1m',
+            data_source: "usage_1m",
             page: 1,
             page_size: 5,
             total_rows: 9,
             data: [
-              { pid: 1045, comm: 'nginx', exe: '/usr/sbin/nginx', bytes_up: 120, bytes_down: 360, flow_count: 3 },
+              {
+                pid: 1045,
+                comm: "nginx",
+                exe: "/usr/sbin/nginx",
+                bytes_up: 120,
+                bytes_down: 360,
+                flow_count: 3,
+              },
             ],
           }),
         ),
@@ -343,116 +482,160 @@ describe('http api client', () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            data_source: 'usage_1m',
+            data_source: "usage_1m",
             page: 2,
             page_size: 10,
             total_rows: 30,
             data: [
-              { direction: 'in', remote_ip: '203.0.113.24', bytes_up: 120, bytes_down: 360, flow_count: 3 },
+              {
+                direction: "in",
+                remote_ip: "203.0.113.24",
+                bytes_up: 120,
+                bytes_down: 360,
+                flow_count: 3,
+              },
             ],
           }),
         ),
       );
 
     const client = createHttpClient();
-    const processes = await client.getTopProcesses('24h', {
+    const processes = await client.getTopProcesses("24h", {
       page: 1,
       pageSize: 5,
-      sortBy: 'bytesTotal',
-      sortOrder: 'desc',
-      groupBy: 'comm',
+      sortBy: "bytesTotal",
+      sortOrder: "desc",
+      groupBy: "comm",
     });
-    const remotes = await client.getTopRemotes('24h', {
+    const remotes = await client.getTopRemotes("24h", {
       page: 2,
       pageSize: 10,
-      direction: 'in',
-      sortBy: 'bytesTotal',
-      sortOrder: 'desc',
+      direction: "in",
+      sortBy: "bytesTotal",
+      sortOrder: "desc",
     });
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      '/api/v1/top/processes?range=24h&page=1&page_size=5&sort_by=bytes_total&sort_order=desc&group_by=comm',
+      "/api/v1/top/processes?range=24h&page=1&page_size=5&sort_by=bytes_total&sort_order=desc&group_by=comm",
       expect.any(Object),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      '/api/v1/top/remotes?range=24h&page=2&page_size=10&sort_by=bytes_total&sort_order=desc&direction=in',
+      "/api/v1/top/remotes?range=24h&page=2&page_size=10&sort_by=bytes_total&sort_order=desc&direction=in",
       expect.any(Object),
     );
-    expect(processes.rows[0]).toMatchObject({ pid: 1045, comm: 'nginx', totalBytes: 480 });
-    expect(remotes.rows[0]).toMatchObject({ direction: 'in', remoteIp: '203.0.113.24', totalBytes: 480 });
+    expect(processes.rows[0]).toMatchObject({
+      pid: 1045,
+      comm: "nginx",
+      totalBytes: 480,
+    });
+    expect(remotes.rows[0]).toMatchObject({
+      direction: "in",
+      remoteIp: "203.0.113.24",
+      totalBytes: 480,
+    });
   });
 
-  it('builds dashboard summary queries', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("builds dashboard summary queries", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            data_source: 'usage_1h',
+            data_source: "usage_1h",
             page: 1,
             page_size: 5,
             total_rows: 6,
-            data: [{ pid: null, comm: 'nginx', exe: null, bytes_up: 120, bytes_down: 360, flow_count: 3 }],
+            data: [
+              {
+                pid: null,
+                comm: "nginx",
+                exe: null,
+                bytes_up: 120,
+                bytes_down: 360,
+                flow_count: 3,
+              },
+            ],
           }),
         ),
       )
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            data_source: 'usage_1h',
+            data_source: "usage_1h",
             page: 1,
             page_size: 5,
             total_rows: 6,
-            data: [{ direction: 'in', remote_ip: '203.0.113.24', bytes_up: 120, bytes_down: 360, flow_count: 3 }],
+            data: [
+              {
+                direction: "in",
+                remote_ip: "203.0.113.24",
+                bytes_up: 120,
+                bytes_down: 360,
+                flow_count: 3,
+              },
+            ],
           }),
         ),
       )
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            data_source: 'usage_1h',
-            data: [{ key: '443', bytes_up: 120, bytes_down: 360, flow_count: 3 }],
+            data_source: "usage_1h",
+            data: [
+              { key: "443", bytes_up: 120, bytes_down: 360, flow_count: 3 },
+            ],
           }),
         ),
       );
 
     const client = createHttpClient();
-    await client.getTopProcesses('24h', { page: 1, pageSize: 5, groupBy: 'pid', summary: true });
-    await client.getTopRemotes('24h', { page: 1, pageSize: 5, direction: 'in', includeLoopback: true, summary: true });
-    await client.getTopPorts('24h');
+    await client.getTopProcesses("24h", {
+      page: 1,
+      pageSize: 5,
+      groupBy: "pid",
+      summary: true,
+    });
+    await client.getTopRemotes("24h", {
+      page: 1,
+      pageSize: 5,
+      direction: "in",
+      includeLoopback: true,
+      summary: true,
+    });
+    await client.getTopPorts("24h");
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      '/api/v1/top/processes?range=24h&page=1&page_size=5&sort_by=bytes_total&group_by=pid&summary=1',
+      "/api/v1/top/processes?range=24h&page=1&page_size=5&sort_by=bytes_total&group_by=pid&summary=1",
       expect.any(Object),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      '/api/v1/top/remotes?range=24h&page=1&page_size=5&sort_by=bytes_total&direction=in&include_loopback=1&summary=1',
+      "/api/v1/top/remotes?range=24h&page=1&page_size=5&sort_by=bytes_total&direction=in&include_loopback=1&summary=1",
       expect.any(Object),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
-      '/api/v1/top/ports?range=24h&by=total&summary=1',
+      "/api/v1/top/ports?range=24h&by=total&summary=1",
       expect.any(Object),
     );
   });
 
-  it('preserves empty process names in hourly process summaries', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("preserves empty process names in hourly process summaries", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1h',
+          data_source: "usage_1h",
           page: 1,
           page_size: 25,
           total_rows: 1,
           data: [
             {
               pid: null,
-              comm: '',
+              comm: "",
               exe: null,
               bytes_up: 120,
               bytes_down: 360,
@@ -464,52 +647,60 @@ describe('http api client', () => {
     );
 
     const client = createHttpClient();
-    const response = await client.getTopProcesses('last_month', { groupBy: 'comm' });
+    const response = await client.getTopProcesses("last_month", {
+      groupBy: "comm",
+    });
 
-    expect(response.dataSource).toBe('usage_1h');
+    expect(response.dataSource).toBe("usage_1h");
     expect(response.rows[0]).toMatchObject({
       pid: null,
-      comm: '',
+      comm: "",
       exe: null,
       totalBytes: 480,
     });
   });
 
-  it('includes the loopback flag in remote summary queries when requested', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("includes the loopback flag in remote summary queries when requested", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1m',
+          data_source: "usage_1m",
           page: 1,
           page_size: 10,
           total_rows: 1,
           data: [
-            { direction: 'out', remote_ip: '127.0.0.1', bytes_up: 120, bytes_down: 360, flow_count: 3 },
+            {
+              direction: "out",
+              remote_ip: "127.0.0.1",
+              bytes_up: 120,
+              bytes_down: 360,
+              flow_count: 3,
+            },
           ],
         }),
       ),
     );
 
     const client = createHttpClient();
-    await client.getTopRemotes('24h', {
+    await client.getTopRemotes("24h", {
       page: 1,
       pageSize: 10,
       includeLoopback: true,
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/top/remotes?range=24h&page=1&page_size=10&sort_by=bytes_total&include_loopback=1',
+      "/api/v1/top/remotes?range=24h&page=1&page_size=10&sort_by=bytes_total&include_loopback=1",
       expect.any(Object),
     );
   });
 
-  it('sends an explicit exclude flag when remote summaries hide loopback', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("sends an explicit exclude flag when remote summaries hide loopback", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1m',
+          data_source: "usage_1m",
           page: 1,
           page_size: 10,
           total_rows: 0,
@@ -519,24 +710,24 @@ describe('http api client', () => {
     );
 
     const client = createHttpClient();
-    await client.getTopRemotes('24h', {
+    await client.getTopRemotes("24h", {
       page: 1,
       pageSize: 10,
       includeLoopback: false,
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/top/remotes?range=24h&page=1&page_size=10&sort_by=bytes_total&exclude_loopback=1',
+      "/api/v1/top/remotes?range=24h&page=1&page_size=10&sort_by=bytes_total&exclude_loopback=1",
       expect.any(Object),
     );
   });
 
-  it('maps forward filters to backend query params', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("maps forward filters to backend query params", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          data_source: 'usage_1m_forward',
+          data_source: "usage_1m_forward",
           next_cursor: null,
           page: 1,
           page_size: 10,
@@ -544,9 +735,9 @@ describe('http api client', () => {
           data: [
             {
               time_bucket: 1710000000,
-              proto: 'tcp',
-              orig_src_ip: '10.0.0.2',
-              orig_dst_ip: '203.0.113.53',
+              proto: "tcp",
+              orig_src_ip: "10.0.0.2",
+              orig_dst_ip: "203.0.113.53",
               orig_sport: 51122,
               orig_dport: 443,
               bytes_orig: 120,
@@ -562,62 +753,63 @@ describe('http api client', () => {
 
     const client = createHttpClient();
     const response = await client.getForwardUsage({
-      range: '24h',
-      proto: 'tcp',
-      origSrcIp: '10.0.0.2',
-      origDstIp: '203.0.113.53',
+      range: "24h",
+      proto: "tcp",
+      origSrcIp: "10.0.0.2",
+      origDstIp: "203.0.113.53",
       page: 1,
       pageSize: 10,
-      sortBy: 'bytesTotal',
-      sortOrder: 'desc',
+      sortBy: "bytesTotal",
+      sortOrder: "desc",
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/forward/usage?range=24h&proto=tcp&orig_src_ip=10.0.0.2&orig_dst_ip=203.0.113.53&page=1&page_size=10&sort_by=bytes_total&sort_order=desc',
+      "/api/v1/forward/usage?range=24h&proto=tcp&orig_src_ip=10.0.0.2&orig_dst_ip=203.0.113.53&page=1&page_size=10&sort_by=bytes_total&sort_order=desc",
       expect.any(Object),
     );
     expect(response.rows[0]).toMatchObject({
-      origSrc: '10.0.0.2',
-      origDst: '203.0.113.53',
+      origSrc: "10.0.0.2",
+      origDst: "203.0.113.53",
       bytesOrig: 120,
       bytesReply: 360,
     });
   });
 
-  it('requests usage explain endpoint and decodes nested fields', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("requests usage explain endpoint and decodes nested fields", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
           data: {
-            process: 'ss-server (/usr/bin/ss-server)',
-            confidence: 'medium',
-            source_ips: ['203.0.113.24'],
-            target_ips: ['198.51.100.44'],
+            process: "ss-server (/usr/bin/ss-server)",
+            confidence: "medium",
+            source_ips: ["203.0.113.24"],
+            target_ips: ["198.51.100.44"],
             chains: [
               {
-                chain_id: 'usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|198.51.100.44|api.example.test|443',
-                source_ip: '203.0.113.24',
-                target_ip: '198.51.100.44',
-                target_host: 'api.example.test',
-                target_host_normalized: 'api.example.test',
+                chain_id:
+                  "usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|198.51.100.44|api.example.test|443",
+                source_ip: "203.0.113.24",
+                target_ip: "198.51.100.44",
+                target_host: "api.example.test",
+                target_host_normalized: "api.example.test",
                 target_port: 443,
                 local_port: 47920,
                 bytes_total: 8062000,
                 flow_count: 4,
                 evidence_count: 3,
-                evidence: 'ss-log',
-                evidence_source: 'ss',
-                sample_fingerprint: 'fp-1',
-                sample_message: 'relay connect',
+                evidence: "ss-log",
+                evidence_source: "ss",
+                sample_fingerprint: "fp-1",
+                sample_message: "relay connect",
                 sample_time: 1710000012,
-                confidence: 'high',
+                confidence: "high",
               },
             ],
             related_peers: [
               {
-                direction: 'out',
-                remote_ip: '198.51.100.44',
+                direction: "out",
+                remote_ip: "198.51.100.44",
                 remote_port: 443,
                 local_port: 47920,
                 bytes_total: 8062000,
@@ -625,61 +817,66 @@ describe('http api client', () => {
               },
             ],
             nginx_requests: [],
-            notes: ['Shadowsocks 只能做同进程同时间窗关联。'],
+            notes: ["Shadowsocks 只能做同进程同时间窗关联。"],
           },
         }),
       ),
     );
 
     const client = createHttpClient();
-    const result = await client.getUsageExplain({
-      minuteTs: 1710000000,
-      proto: 'tcp',
-      direction: 'out',
-      pid: 1088,
-      comm: 'ss-server',
-      exe: '/usr/bin/ss-server',
-      localPort: 47920,
-      remoteIp: '198.51.100.44',
-      remotePort: 443,
-      attribution: 'exact',
-      bytesUp: 100,
-      bytesDown: 200,
-      pktsUp: 1,
-      pktsDown: 2,
-      flowCount: 1,
-    }, { dataSource: 'usage_1h' });
+    const result = await client.getUsageExplain(
+      {
+        minuteTs: 1710000000,
+        proto: "tcp",
+        direction: "out",
+        pid: 1088,
+        comm: "ss-server",
+        exe: "/usr/bin/ss-server",
+        localPort: 47920,
+        remoteIp: "198.51.100.44",
+        remotePort: 443,
+        attribution: "exact",
+        bytesUp: 100,
+        bytesDown: 200,
+        pktsUp: 1,
+        pktsDown: 2,
+        flowCount: 1,
+      },
+      { dataSource: "usage_1h" },
+    );
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage/explain?ts=1710000000&data_source=usage_1h&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443',
+      "/api/v1/usage/explain?ts=1710000000&data_source=usage_1h&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443",
       expect.any(Object),
     );
+    expect(fetchMock.mock.calls[0]?.[1]).not.toHaveProperty("method");
     expect(result).toMatchObject({
-      process: 'ss-server (/usr/bin/ss-server)',
-      confidence: 'medium',
-      sourceIps: ['203.0.113.24'],
-      targetIps: ['198.51.100.44'],
-      notes: ['Shadowsocks 只能做同进程同时间窗关联。'],
+      process: "ss-server (/usr/bin/ss-server)",
+      confidence: "medium",
+      sourceIps: ["203.0.113.24"],
+      targetIps: ["198.51.100.44"],
+      notes: ["Shadowsocks 只能做同进程同时间窗关联。"],
     });
     expect(result.chains[0]).toMatchObject({
-      chainId: 'usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|198.51.100.44|api.example.test|443',
-      sourceIp: '203.0.113.24',
-      targetIp: '198.51.100.44',
-      targetHost: 'api.example.test',
-      targetHostNormalized: 'api.example.test',
+      chainId:
+        "usage_chain_1m|1710000000|1088|ss-server|/usr/bin/ss-server|203.0.113.24|47920|198.51.100.44|api.example.test|443",
+      sourceIp: "203.0.113.24",
+      targetIp: "198.51.100.44",
+      targetHost: "api.example.test",
+      targetHostNormalized: "api.example.test",
       targetPort: 443,
       localPort: 47920,
       evidenceCount: 3,
-      evidence: 'ss-log',
-      evidenceSource: 'ss',
-      sampleFingerprint: 'fp-1',
-      sampleMessage: 'relay connect',
+      evidence: "ss-log",
+      evidenceSource: "ss",
+      sampleFingerprint: "fp-1",
+      sampleMessage: "relay connect",
       sampleTime: 1710000012,
-      confidence: 'high',
+      confidence: "high",
     });
     expect(result.relatedPeers[0]).toMatchObject({
-      direction: 'out',
-      remoteIp: '198.51.100.44',
+      direction: "out",
+      remoteIp: "198.51.100.44",
       remotePort: 443,
       localPort: 47920,
       bytesTotal: 8062000,
@@ -690,28 +887,29 @@ describe('http api client', () => {
       new Response(
         JSON.stringify({
           data: {
-            process: 'nginx (/usr/sbin/nginx)',
-            confidence: 'high',
-            source_ips: ['198.51.100.42'],
-            target_ips: ['127.0.0.1'],
+            process: "nginx (/usr/sbin/nginx)",
+            confidence: "high",
+            source_ips: ["198.51.100.42"],
+            target_ips: ["127.0.0.1"],
             related_peers: [],
             nginx_requests: [
               {
                 time: 1710000000,
-                method: 'GET',
-                host: 'crawler.example.test',
-                host_normalized: 'crawler.example.test',
-                path: '/apod/2023/12/AstroPH-2023-12',
+                method: "GET",
+                host: "crawler.example.test",
+                host_normalized: "crawler.example.test",
+                path: "/apod/2023/12/AstroPH-2023-12",
                 status: 200,
                 count: 3,
-                client_ip: '127.0.0.1',
-                referer: 'https://crawler.example.test/sitemap.xml',
-                user_agent: 'Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)',
-                bot: 'GPTBot',
-                sample_fingerprint: 'nginx-fp-1',
+                client_ip: "127.0.0.1",
+                referer: "https://crawler.example.test/sitemap.xml",
+                user_agent:
+                  "Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)",
+                bot: "GPTBot",
+                sample_fingerprint: "nginx-fp-1",
               },
             ],
-            notes: ['访问端识别：GPTBot(3)'],
+            notes: ["访问端识别：GPTBot(3)"],
           },
         }),
       ),
@@ -719,15 +917,15 @@ describe('http api client', () => {
 
     const nginxExplain = await client.getUsageExplain({
       minuteTs: 1710000000,
-      proto: 'tcp',
-      direction: 'in',
+      proto: "tcp",
+      direction: "in",
       pid: 32161,
-      comm: 'nginx',
-      exe: '/usr/sbin/nginx',
+      comm: "nginx",
+      exe: "/usr/sbin/nginx",
       localPort: 443,
-      remoteIp: '198.51.100.42',
+      remoteIp: "198.51.100.42",
       remotePort: 36892,
-      attribution: 'exact',
+      attribution: "exact",
       bytesUp: 10,
       bytesDown: 20,
       pktsUp: 1,
@@ -736,24 +934,24 @@ describe('http api client', () => {
     });
 
     expect(nginxExplain.nginxRequests[0]).toMatchObject({
-      path: '/apod/2023/12/AstroPH-2023-12',
+      path: "/apod/2023/12/AstroPH-2023-12",
       count: 3,
-      bot: 'GPTBot',
-      clientIp: '127.0.0.1',
-      hostNormalized: 'crawler.example.test',
-      referer: 'https://crawler.example.test/sitemap.xml',
-      sampleFingerprint: 'nginx-fp-1',
+      bot: "GPTBot",
+      clientIp: "127.0.0.1",
+      hostNormalized: "crawler.example.test",
+      referer: "https://crawler.example.test/sitemap.xml",
+      sampleFingerprint: "nginx-fp-1",
     });
   });
 
-  it('includes the scan flag when on-demand explain scanning is requested', async () => {
-    vi.stubGlobal('fetch', fetchMock);
+  it("includes the scan flag when on-demand explain scanning is requested", async () => {
+    vi.stubGlobal("fetch", fetchMock);
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify({
           data: {
-            process: 'ss-server (/usr/bin/ss-server)',
-            confidence: 'low',
+            process: "ss-server (/usr/bin/ss-server)",
+            confidence: "low",
             source_ips: [],
             target_ips: [],
             chains: [],
@@ -769,60 +967,63 @@ describe('http api client', () => {
     await client.getUsageExplain(
       {
         minuteTs: 1710000000,
-        proto: 'tcp',
-        direction: 'out',
+        proto: "tcp",
+        direction: "out",
         pid: 1088,
-        comm: 'ss-server',
-        exe: '/usr/bin/ss-server',
+        comm: "ss-server",
+        exe: "/usr/bin/ss-server",
         localPort: 47920,
-        remoteIp: '198.51.100.44',
+        remoteIp: "198.51.100.44",
         remotePort: 443,
-        attribution: 'exact',
+        attribution: "exact",
         bytesUp: 100,
         bytesDown: 200,
         pktsUp: 1,
         pktsDown: 2,
         flowCount: 1,
       },
-      { dataSource: 'usage_1m', allowScan: true },
+      { dataSource: "usage_1m", allowScan: true },
     );
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/usage/explain?ts=1710000000&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443&scan=1',
-      expect.any(Object),
+      "/api/v1/usage/explain?ts=1710000000&data_source=usage_1m&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=%2Fusr%2Fbin%2Fss-server&local_port=47920&remote_ip=198.51.100.44&remote_port=443&scan=1",
+      expect.objectContaining({ method: "POST" }),
     );
+    expect(fetchMock.mock.calls[0]?.[1]).not.toHaveProperty("body");
   });
 
-  it('uses mock api only when explicitly enabled', () => {
+  it("uses mock api only when explicitly enabled", () => {
     expect(shouldUseMockApi(undefined)).toBe(false);
-    expect(shouldUseMockApi('0')).toBe(false);
-    expect(shouldUseMockApi('1')).toBe(true);
+    expect(shouldUseMockApi("0")).toBe(false);
+    expect(shouldUseMockApi("1")).toBe(true);
   });
 });
 
-describe('mock api client', () => {
-  it('matches basename exe filters and clamps page sizes like the backend', async () => {
+describe("mock api client", () => {
+  it("matches basename exe filters and clamps page sizes like the backend", async () => {
     const client = createMockApiClient();
     const usage = await client.getUsage({
-      range: '24h',
-      exe: 'ss-server',
+      range: "24h",
+      exe: "ss-server",
       page: 1,
       pageSize: 999,
     });
 
     expect(usage.rows.length).toBeGreaterThan(0);
     expect(usage.pageSize).toBe(200);
-    expect(usage.rows.every((row) => row.exe?.includes('ss-server') ?? false)).toBe(true);
+    expect(
+      usage.rows.every((row) => row.exe?.includes("ss-server") ?? false),
+    ).toBe(true);
   });
 });
 
-describe('normalizeUsageSortKey', () => {
-  it('falls back to minuteTs for unknown values', () => {
-    expect(normalizeUsageSortKey('bogus')).toBe('minuteTs');
+describe("normalizeUsageSortKey", () => {
+  it("falls back to minuteTs for unknown values", () => {
+    expect(normalizeUsageSortKey("bogus")).toBe("minuteTs");
   });
 
-  it('keeps supported sort keys unchanged', () => {
-    expect(normalizeUsageSortKey('bytesTotal')).toBe('bytesTotal');
-    expect(normalizeUsageSortKey('proto')).toBe('proto');
+  it("keeps supported sort keys unchanged", () => {
+    expect(normalizeUsageSortKey("bytesTotal")).toBe("bytesTotal");
+    expect(normalizeUsageSortKey("proto")).toBe("proto");
   });
 });

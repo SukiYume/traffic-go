@@ -2,7 +2,6 @@ package collector
 
 import (
 	"fmt"
-	"sort"
 
 	"traffic-go/internal/model"
 )
@@ -12,6 +11,7 @@ type flowIdentity string
 type observedFlow struct {
 	Identity   flowIdentity
 	Flow       model.ConntrackFlow
+	Zone       uint16
 	Classified classifiedFlow
 	RawIDs     map[uint64]struct{}
 }
@@ -20,18 +20,31 @@ func normalizeObservedFlows(flows []model.ConntrackFlow, localIPs map[string]str
 	if len(flows) == 0 {
 		return nil
 	}
+	observations := make([]conntrackObservation, 0, len(flows))
+	for _, flow := range flows {
+		observations = append(observations, conntrackObservation{Flow: flow})
+	}
+	return normalizeConntrackObservations(observations, localIPs, sockets)
+}
+
+func normalizeConntrackObservations(flows []conntrackObservation, localIPs map[string]struct{}, sockets socketIndex) []observedFlow {
+	if len(flows) == 0 {
+		return nil
+	}
 
 	grouped := make(map[flowIdentity]*observedFlow, len(flows))
-	for _, raw := range flows {
+	for _, observation := range flows {
+		raw := observation.Flow
 		classified := classifyFlow(raw, localIPs, sockets)
 		classified, _ = attachSocketMetadata(sockets, classified)
 
-		identity := buildFlowIdentity(raw, classified)
+		identity := buildFlowIdentity(raw, classified, observation.Zone)
 		current := grouped[identity]
 		if current == nil {
 			grouped[identity] = &observedFlow{
 				Identity:   identity,
 				Flow:       raw,
+				Zone:       observation.Zone,
 				Classified: classified,
 				RawIDs:     map[uint64]struct{}{raw.CTID: {}},
 			}
@@ -41,6 +54,7 @@ func normalizeObservedFlows(flows []model.ConntrackFlow, localIPs map[string]str
 		current.RawIDs[raw.CTID] = struct{}{}
 		if preferObservedCandidate(raw, classified, current.Flow, current.Classified) {
 			current.Flow.CTID = raw.CTID
+			current.Flow.SyntheticCTID = raw.SyntheticCTID
 			current.Classified = classified
 		}
 		current.Flow.HasAccounting = current.Flow.HasAccounting || raw.HasAccounting
@@ -54,16 +68,14 @@ func normalizeObservedFlows(flows []model.ConntrackFlow, localIPs map[string]str
 	for _, flow := range grouped {
 		result = append(result, *flow)
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Identity < result[j].Identity
-	})
 	return result
 }
 
-func buildFlowIdentity(raw model.ConntrackFlow, classified classifiedFlow) flowIdentity {
+func buildFlowIdentity(raw model.ConntrackFlow, classified classifiedFlow, zone uint16) flowIdentity {
 	if classified.Direction == model.DirectionForward {
 		return flowIdentity(fmt.Sprintf(
-			"forward|%s|%s|%d|%s|%d",
+			"forward|zone=%d|%s|%s|%d|%s|%d",
+			zone,
 			classified.Proto,
 			classified.OrigSrcIP,
 			classified.OrigSrcPort,
@@ -73,7 +85,8 @@ func buildFlowIdentity(raw model.ConntrackFlow, classified classifiedFlow) flowI
 	}
 
 	return flowIdentity(fmt.Sprintf(
-		"local|%s|%s|%s|%d|%s|%d|%s",
+		"local|zone=%d|%s|%s|%s|%d|%s|%d|%s",
+		zone,
 		raw.Family,
 		classified.Proto,
 		classified.Direction,

@@ -103,6 +103,70 @@ func TestProcessResolverReusesConfirmedCachedOwnershipWithoutFullScan(t *testing
 	}
 }
 
+func TestProcessResolverDoesNotRescanFDsWithinOwnershipLease(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	resolver := newProcessResolver("/proc")
+	resolver.now = func() time.Time { return now }
+	resolver.lastFullScan = now
+	resolver.cache[55] = processInfo(100, "ss-server")
+
+	fdScans := 0
+	resolver.pidSockets = func(pid int) (map[uint64]struct{}, bool) {
+		fdScans++
+		return map[uint64]struct{}{55: {}}, true
+	}
+	resolver.scan = func(context.Context) (map[uint64]model.ProcessInfo, bool) {
+		t.Fatalf("did not expect a full scan for a valid cache lease")
+		return nil, false
+	}
+
+	requested := map[uint64]struct{}{55: {}}
+	if got := resolver.Resolve(context.Background(), requested); got[55].PID != 100 {
+		t.Fatalf("unexpected initial resolution: %+v", got)
+	}
+	now = now.Add(time.Second)
+	if got := resolver.Resolve(context.Background(), requested); got[55].PID != 100 {
+		t.Fatalf("unexpected leased resolution: %+v", got)
+	}
+	if fdScans != 1 {
+		t.Fatalf("expected one FD scan across repeated ticks inside the lease, got %d", fdScans)
+	}
+}
+
+func TestProcessResolverRevalidatesOwnershipAfterLeaseExpires(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	resolver := newProcessResolver("/proc")
+	resolver.now = func() time.Time { return now }
+	resolver.lastFullScan = now
+	resolver.cache[55] = processInfo(100, "ss-server")
+
+	owned := true
+	resolver.pidSockets = func(pid int) (map[uint64]struct{}, bool) {
+		if owned {
+			return map[uint64]struct{}{55: {}}, true
+		}
+		return map[uint64]struct{}{77: {}}, true
+	}
+	scanCalls := 0
+	resolver.scan = func(context.Context) (map[uint64]model.ProcessInfo, bool) {
+		scanCalls++
+		return map[uint64]model.ProcessInfo{55: processInfo(200, "nginx")}, true
+	}
+
+	requested := map[uint64]struct{}{55: {}}
+	if got := resolver.Resolve(context.Background(), requested); got[55].PID != 100 {
+		t.Fatalf("unexpected initial owner: %+v", got)
+	}
+	owned = false
+	now = now.Add(resolver.ownershipTTL + time.Millisecond)
+	if got := resolver.Resolve(context.Background(), requested); got[55].PID != 200 {
+		t.Fatalf("expected reused inode to be reassigned after validation, got %+v", got)
+	}
+	if scanCalls != 1 {
+		t.Fatalf("expected one full rescan after ownership changed, got %d", scanCalls)
+	}
+}
+
 func TestProcessResolverRescansWhenCachedInodeOwnershipChanges(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	resolver := newProcessResolver("/proc")

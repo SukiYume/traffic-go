@@ -1,5 +1,6 @@
 import type {
   BucketKey,
+  DashboardResponse,
   ForwardUsageQuery,
   ForwardUsageResponse,
   ForwardUsageRow,
@@ -16,6 +17,7 @@ import type {
   RemoteSortKey,
   RemoteSummaryResponse,
   SortOrder,
+  SummaryCoverage,
   TimeSeriesFilters,
   TimeSeriesResponse,
   TopResponse,
@@ -26,18 +28,18 @@ import type {
   UsageResponse,
   UsageRow,
   UsageSortKey,
-} from './types';
-import { withAppBase } from './base-path';
-import { createMockApiClient } from './data/mock';
-import { RANGE_TO_BUCKET } from './ranges';
+} from "./types";
+import { withAppBase } from "./base-path";
+import { createMockApiClient } from "./data/mock";
+import { RANGE_TO_BUCKET } from "./ranges";
 import {
   forwardSortParam,
   normalizeUsageSortKey,
   processSortParam,
   remoteSortParam,
   usageSortParam,
-} from './sort-keys';
-import { formatBucketTimeLabel } from './utils';
+} from "./sort-keys";
+import { formatBucketTimeLabel } from "./utils";
 
 type QueryValue = string | number | boolean | undefined | null;
 type ListQueryOptions<SortKey extends string> = {
@@ -53,12 +55,28 @@ type ListQueryOptions<SortKey extends string> = {
 type RawErrorResponse = {
   error?: string;
   message?: string;
+  request_id?: string;
+};
+
+type RawSummaryCoverage = {
+  approximate: boolean;
+  effective_start: number;
+  effective_end: number;
+};
+
+type RawPagination = {
+  page?: number;
+  page_size?: number;
+  total_rows?: number;
+  has_more?: boolean;
+  total_rows_exact?: boolean;
 };
 
 type RawOverviewResponse = {
+  coverage?: RawSummaryCoverage;
   data: {
     range: RangeKey;
-    data_source: OverviewStats['dataSource'];
+    data_source: OverviewStats["dataSource"];
     bytes_up: number;
     bytes_down: number;
     flow_count: number;
@@ -81,12 +99,13 @@ type RawMonthlyUsageResponse = {
     updated_at: number;
     archived: boolean;
     detail_available: boolean;
-    detail_range?: RangeKey | '';
+    detail_range?: RangeKey | "";
   }>;
 };
 
 type RawTimeseriesResponse = {
-  data_source: TimeSeriesResponse['dataSource'];
+  coverage?: RawSummaryCoverage;
+  data_source: TimeSeriesResponse["dataSource"];
   data: Array<{
     bucket_ts: number;
     group: string;
@@ -97,7 +116,8 @@ type RawTimeseriesResponse = {
 };
 
 type RawNetworkTimeseriesResponse = {
-  data_source: NetworkTimeSeriesResponse['dataSource'];
+  coverage?: RawSummaryCoverage;
+  data_source: NetworkTimeSeriesResponse["dataSource"];
   data: Array<{
     bucket_ts: number;
     interface: string;
@@ -106,25 +126,21 @@ type RawNetworkTimeseriesResponse = {
   }>;
 };
 
-type RawUsageResponse = {
-  data_source: UsageResponse['dataSource'];
+type RawUsageResponse = RawPagination & {
+  coverage?: RawSummaryCoverage;
+  data_source: UsageResponse["dataSource"];
   next_cursor: string | null;
-  page?: number;
-  page_size?: number;
-  total_rows?: number;
-  has_more?: boolean;
-  total_rows_exact?: boolean;
   data: Array<{
     time_bucket: number;
-    proto: UsageRow['proto'];
-    direction: UsageRow['direction'];
+    proto: UsageRow["proto"];
+    direction: UsageRow["direction"];
     pid: number | null;
     comm: string;
     exe: string | null;
     local_port: number;
     remote_ip: string;
     remote_port: number | null;
-    attribution: UsageRow['attribution'] | '';
+    attribution: UsageRow["attribution"] | "";
     bytes_up: number;
     bytes_down: number;
     pkts_up: number;
@@ -136,7 +152,7 @@ type RawUsageResponse = {
 type RawUsageExplainResponse = {
   data: {
     process: string;
-    confidence: UsageExplain['confidence'];
+    confidence: UsageExplain["confidence"];
     source_ips: string[];
     target_ips: string[];
     chains?: Array<{
@@ -155,10 +171,10 @@ type RawUsageExplainResponse = {
       sample_fingerprint?: string;
       sample_message?: string;
       sample_time?: number;
-      confidence: UsageExplain['confidence'];
+      confidence: UsageExplain["confidence"];
     }>;
     related_peers: Array<{
-      direction: UsageRow['direction'];
+      direction: UsageRow["direction"];
       remote_ip: string;
       remote_port?: number | null;
       local_port?: number | null;
@@ -184,7 +200,8 @@ type RawUsageExplainResponse = {
 };
 
 type RawTopResponse = {
-  data_source: TopResponse['dataSource'];
+  coverage?: RawSummaryCoverage;
+  data_source: TopResponse["dataSource"];
   data: Array<{
     key: string;
     bytes_up: number;
@@ -200,13 +217,22 @@ type RawProcessesResponse = {
   }>;
 };
 
-type RawProcessSummaryResponse = {
-  data_source: ProcessSummaryResponse['dataSource'];
-  page?: number;
-  page_size?: number;
-  total_rows?: number;
-  has_more?: boolean;
-  total_rows_exact?: boolean;
+type RawDashboardResponse = {
+  coverage?: RawSummaryCoverage;
+  data_source: OverviewStats["dataSource"];
+  data: {
+    overview: RawOverviewResponse["data"];
+    timeseries: RawTimeseriesResponse["data"];
+    top_processes: RawProcessSummaryResponse["data"];
+    top_inbound_remotes: RawRemoteSummaryResponse["data"];
+    top_outbound_remotes: RawRemoteSummaryResponse["data"];
+    top_ports: RawTopResponse["data"];
+  };
+};
+
+type RawProcessSummaryResponse = RawPagination & {
+  coverage?: RawSummaryCoverage;
+  data_source: ProcessSummaryResponse["dataSource"];
   data: Array<{
     pid: number | null;
     comm: string;
@@ -217,15 +243,11 @@ type RawProcessSummaryResponse = {
   }>;
 };
 
-type RawRemoteSummaryResponse = {
-  data_source: RemoteSummaryResponse['dataSource'];
-  page?: number;
-  page_size?: number;
-  total_rows?: number;
-  has_more?: boolean;
-  total_rows_exact?: boolean;
+type RawRemoteSummaryResponse = RawPagination & {
+  coverage?: RawSummaryCoverage;
+  data_source: RemoteSummaryResponse["dataSource"];
   data: Array<{
-    direction: 'in' | 'out';
+    direction: "in" | "out";
     remote_ip: string;
     bytes_up: number;
     bytes_down: number;
@@ -233,17 +255,13 @@ type RawRemoteSummaryResponse = {
   }>;
 };
 
-type RawForwardResponse = {
-  data_source: ForwardUsageResponse['dataSource'];
+type RawForwardResponse = RawPagination & {
+  coverage?: RawSummaryCoverage;
+  data_source: ForwardUsageResponse["dataSource"];
   next_cursor: string | null;
-  page?: number;
-  page_size?: number;
-  total_rows?: number;
-  has_more?: boolean;
-  total_rows_exact?: boolean;
   data: Array<{
     time_bucket: number;
-    proto: ForwardUsageRow['proto'];
+    proto: ForwardUsageRow["proto"];
     orig_src_ip: string;
     orig_dst_ip: string;
     orig_sport: number;
@@ -259,11 +277,11 @@ type RawForwardResponse = {
 function buildQuery(entries: Array<[string, QueryValue]>) {
   const search = new URLSearchParams();
   for (const [key, value] of entries) {
-    if (value === undefined || value === null || value === '') continue;
+    if (value === undefined || value === null || value === "") continue;
     search.set(key, String(value));
   }
   const query = search.toString();
-  return query ? `?${query}` : '';
+  return query ? `?${query}` : "";
 }
 
 function appendListQuery<SortKey extends string>(
@@ -273,13 +291,13 @@ function appendListQuery<SortKey extends string>(
 ) {
   return [
     ...entries,
-    ['cursor', options.cursor],
-    ['limit', options.limit ?? undefined],
-    ['page', options.page ?? undefined],
-    ['page_size', options.pageSize ?? undefined],
-    ['sort_by', sortParam],
-    ['sort_order', options.sortOrder ?? undefined],
-    ['include_total', options.includeTotal ? 1 : undefined],
+    ["cursor", options.cursor],
+    ["limit", options.limit ?? undefined],
+    ["page", options.page ?? undefined],
+    ["page_size", options.pageSize ?? undefined],
+    ["sort_by", sortParam],
+    ["sort_order", options.sortOrder ?? undefined],
+    ["include_total", options.includeTotal ? 1 : undefined],
   ] as Array<[string, QueryValue]>;
 }
 
@@ -288,17 +306,17 @@ function buildUsageQuery(query: UsageQuery) {
   return buildQuery(
     appendListQuery(
       [
-        ['range', hasExplicitWindow ? undefined : query.range],
-        ['start', query.start],
-        ['end', query.end],
-        ['comm', query.comm],
-        ['pid', query.pid],
-        ['exe', query.exe],
-        ['remote_ip', query.remoteIp],
-        ['local_port', query.localPort],
-        ['direction', query.direction],
-        ['proto', query.proto],
-        ['attribution', query.attribution],
+        ["range", hasExplicitWindow ? undefined : query.range],
+        ["start", query.start],
+        ["end", query.end],
+        ["comm", query.comm],
+        ["pid", query.pid],
+        ["exe", query.exe],
+        ["remote_ip", query.remoteIp],
+        ["local_port", query.localPort],
+        ["direction", query.direction],
+        ["proto", query.proto],
+        ["attribution", query.attribution],
       ],
       query,
       usageSortParam(query.sortBy),
@@ -310,10 +328,10 @@ function buildForwardQuery(query: ForwardUsageQuery) {
   return buildQuery(
     appendListQuery(
       [
-        ['range', query.range],
-        ['proto', query.proto],
-        ['orig_src_ip', query.origSrcIp],
-        ['orig_dst_ip', query.origDstIp],
+        ["range", query.range],
+        ["proto", query.proto],
+        ["orig_src_ip", query.origSrcIp],
+        ["orig_dst_ip", query.origDstIp],
       ],
       query,
       forwardSortParam(query.sortBy),
@@ -321,89 +339,149 @@ function buildForwardQuery(query: ForwardUsageQuery) {
   );
 }
 
-function buildUsageExplainQuery(row: UsageRow, options?: { dataSource?: UsageResponse['dataSource']; allowScan?: boolean }) {
+function buildUsageExplainQuery(
+  row: UsageRow,
+  options?: { dataSource?: UsageResponse["dataSource"]; allowScan?: boolean },
+) {
   return buildQuery([
-    ['ts', row.minuteTs],
-    ['data_source', options?.dataSource],
-    ['proto', row.proto],
-    ['direction', row.direction],
-    ['pid', row.pid ?? undefined],
-    ['comm', row.comm],
-    ['exe', row.exe],
-    ['local_port', row.localPort],
-    ['remote_ip', row.remoteIp],
-    ['remote_port', row.remotePort],
-    ['scan', options?.allowScan ? 1 : undefined],
+    ["ts", row.minuteTs],
+    ["data_source", options?.dataSource],
+    ["proto", row.proto],
+    ["direction", row.direction],
+    ["pid", row.pid ?? undefined],
+    ["comm", row.comm],
+    ["exe", row.exe],
+    ["local_port", row.localPort],
+    ["remote_ip", row.remoteIp],
+    ["remote_port", row.remotePort],
+    ["scan", options?.allowScan ? 1 : undefined],
   ]);
 }
 
 function buildTopProcessesQuery(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean; summary?: boolean },
+  options?: {
+    page?: number;
+    pageSize?: number;
+    sortBy?: ProcessSortKey;
+    sortOrder?: SortOrder;
+    groupBy?: ProcessGroupBy;
+    includeTotal?: boolean;
+    summary?: boolean;
+  },
 ) {
   return buildQuery([
-    ['range', range],
-    ['page', options?.page ?? undefined],
-    ['page_size', options?.pageSize ?? undefined],
-    ['sort_by', processSortParam(options?.sortBy)],
-    ['sort_order', options?.sortOrder ?? undefined],
-    ['group_by', options?.groupBy],
-    ['include_total', options?.includeTotal ? 1 : undefined],
-    ['summary', options?.summary ? 1 : undefined],
+    ["range", range],
+    ["page", options?.page ?? undefined],
+    ["page_size", options?.pageSize ?? undefined],
+    ["sort_by", processSortParam(options?.sortBy)],
+    ["sort_order", options?.sortOrder ?? undefined],
+    ["group_by", options?.groupBy],
+    ["include_total", options?.includeTotal ? 1 : undefined],
+    ["summary", options?.summary ? 1 : undefined],
   ]);
 }
 
 function buildTopRemotesQuery(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: 'in' | 'out'; includeLoopback?: boolean; includeTotal?: boolean; summary?: boolean },
+  options?: {
+    page?: number;
+    pageSize?: number;
+    sortBy?: RemoteSortKey;
+    sortOrder?: SortOrder;
+    direction?: "in" | "out";
+    includeLoopback?: boolean;
+    includeTotal?: boolean;
+    summary?: boolean;
+  },
 ) {
   return buildQuery([
-    ['range', range],
-    ['page', options?.page ?? undefined],
-    ['page_size', options?.pageSize ?? undefined],
-    ['sort_by', remoteSortParam(options?.sortBy)],
-    ['sort_order', options?.sortOrder ?? undefined],
-    ['direction', options?.direction],
-    ['include_loopback', options?.includeLoopback === true ? 1 : undefined],
-    ['exclude_loopback', options?.includeLoopback === false ? 1 : undefined],
-    ['include_total', options?.includeTotal ? 1 : undefined],
-    ['summary', options?.summary ? 1 : undefined],
+    ["range", range],
+    ["page", options?.page ?? undefined],
+    ["page_size", options?.pageSize ?? undefined],
+    ["sort_by", remoteSortParam(options?.sortBy)],
+    ["sort_order", options?.sortOrder ?? undefined],
+    ["direction", options?.direction],
+    ["include_loopback", options?.includeLoopback === true ? 1 : undefined],
+    ["exclude_loopback", options?.includeLoopback === false ? 1 : undefined],
+    ["include_total", options?.includeTotal ? 1 : undefined],
+    ["summary", options?.summary ? 1 : undefined],
   ]);
 }
 
-function buildTimeSeriesQuery(range: RangeKey, bucket: BucketKey, groupBy: GroupBy, filters?: TimeSeriesFilters) {
+function buildTimeSeriesQuery(
+  range: RangeKey,
+  bucket: BucketKey,
+  groupBy: GroupBy,
+  filters?: TimeSeriesFilters,
+) {
   return buildQuery([
-    ['range', range],
-    ['bucket', bucket],
-    ['group_by', groupBy],
-    ['comm', filters?.comm],
-    ['pid', filters?.pid],
-    ['exe', filters?.exe],
-    ['remote_ip', filters?.remoteIp],
-    ['direction', filters?.direction],
-    ['proto', filters?.proto],
+    ["range", range],
+    ["bucket", bucket],
+    ["group_by", groupBy],
+    ["comm", filters?.comm],
+    ["pid", filters?.pid],
+    ["exe", filters?.exe],
+    ["remote_ip", filters?.remoteIp],
+    ["direction", filters?.direction],
+    ["proto", filters?.proto],
   ]);
 }
 
 export class ApiError extends Error {
   status: number;
   code?: string;
+  requestId?: string;
+  retryAfterSeconds?: number;
 
-  constructor(status: number, code: string | undefined, message: string) {
-    super(message);
-    this.name = 'ApiError';
+  constructor(
+    status: number,
+    code: string | undefined,
+    message: string,
+    requestId?: string,
+    retryAfterSeconds?: number,
+  ) {
+    const normalizedRequestId = normalizeRequestId(requestId);
+    super(
+      normalizedRequestId
+        ? `${message}（请求 ID：${normalizedRequestId}，可复制用于排障）`
+        : message,
+    );
+    this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.requestId = normalizedRequestId;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
-export function isDimensionUnavailableError(error: unknown) {
-  return error instanceof ApiError && error.code === 'dimension_unavailable';
+function normalizeRequestId(value: unknown) {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._-]{1,64}$/.test(trimmed) ? trimmed : undefined;
 }
 
-async function requestJson<T>(path: string, decode: (raw: unknown) => T, options?: ApiRequestOptions): Promise<T> {
+function normalizeRetryAfterSeconds(value: string | null) {
+  if (value == null || value.trim() === "") return undefined;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+}
+
+export function isDimensionUnavailableError(error: unknown) {
+  return error instanceof ApiError && error.code === "dimension_unavailable";
+}
+
+async function requestJson<T>(
+  path: string,
+  decode: (raw: unknown) => T,
+  options?: ApiRequestOptions,
+  method?: "POST",
+): Promise<T> {
   const response = await fetch(path, {
-    headers: { Accept: 'application/json' },
+    ...(method ? { method } : {}),
+    headers: { Accept: "application/json" },
     signal: options?.signal,
   });
   if (!response.ok) {
@@ -413,13 +491,39 @@ async function requestJson<T>(path: string, decode: (raw: unknown) => T, options
     } catch {
       payload = null;
     }
-    throw new ApiError(response.status, payload?.error, payload?.message ?? `Request failed: ${response.status}`);
+    const requestId = normalizeRequestId(
+      payload?.request_id ?? response.headers.get("X-Request-ID"),
+    );
+    throw new ApiError(
+      response.status,
+      payload?.error,
+      payload?.message ?? `Request failed: ${response.status}`,
+      requestId,
+      normalizeRetryAfterSeconds(response.headers.get("Retry-After")),
+    );
   }
   return decode(await response.json());
 }
 
 function formatPointLabel(ts: number, bucket: BucketKey) {
   return formatBucketTimeLabel(ts, bucket);
+}
+
+function decodeSummaryCoverage(
+  raw?: RawSummaryCoverage,
+): SummaryCoverage | undefined {
+  if (
+    !raw ||
+    !Number.isFinite(raw.effective_start) ||
+    !Number.isFinite(raw.effective_end)
+  ) {
+    return undefined;
+  }
+  return {
+    approximate: Boolean(raw.approximate),
+    effectiveStart: raw.effective_start,
+    effectiveEnd: raw.effective_end,
+  };
 }
 
 function decodeOverview(raw: unknown): OverviewStats {
@@ -432,6 +536,7 @@ function decodeOverview(raw: unknown): OverviewStats {
     activeProcesses: payload.data.active_processes,
     dataSource: payload.data.data_source,
     range: payload.data.range,
+    coverage: decodeSummaryCoverage(payload.coverage),
   };
 }
 
@@ -458,20 +563,40 @@ function decodeMonthlyUsage(raw: unknown): MonthlyUsageResponse {
   };
 }
 
-function decodeTimeSeries(raw: unknown, bucket: BucketKey, groupBy: GroupBy): TimeSeriesResponse {
+function decodeTimeSeries(
+  raw: unknown,
+  bucket: BucketKey,
+  groupBy: GroupBy,
+): TimeSeriesResponse {
   const payload = raw as RawTimeseriesResponse;
-  const byBucket = new Map<number, { up: number; down: number; flowCount: number }>();
-  const byGroup = new Map<string, Map<number, { up: number; down: number; flowCount: number }>>();
+  const byBucket = new Map<
+    number,
+    { up: number; down: number; flowCount: number }
+  >();
+  const byGroup = new Map<
+    string,
+    Map<number, { up: number; down: number; flowCount: number }>
+  >();
   for (const point of payload.data ?? []) {
-    const current = byBucket.get(point.bucket_ts) ?? { up: 0, down: 0, flowCount: 0 };
+    const current = byBucket.get(point.bucket_ts) ?? {
+      up: 0,
+      down: 0,
+      flowCount: 0,
+    };
     current.up += point.bytes_up;
     current.down += point.bytes_down;
     current.flowCount += point.flow_count;
     byBucket.set(point.bucket_ts, current);
 
-    const groupKey = point.group || 'unknown';
-    const groupBuckets = byGroup.get(groupKey) ?? new Map<number, { up: number; down: number; flowCount: number }>();
-    const groupCurrent = groupBuckets.get(point.bucket_ts) ?? { up: 0, down: 0, flowCount: 0 };
+    const groupKey = point.group || "unknown";
+    const groupBuckets =
+      byGroup.get(groupKey) ??
+      new Map<number, { up: number; down: number; flowCount: number }>();
+    const groupCurrent = groupBuckets.get(point.bucket_ts) ?? {
+      up: 0,
+      down: 0,
+      flowCount: 0,
+    };
     groupCurrent.up += point.bytes_up;
     groupCurrent.down += point.bytes_down;
     groupCurrent.flowCount += point.flow_count;
@@ -483,6 +608,7 @@ function decodeTimeSeries(raw: unknown, bucket: BucketKey, groupBy: GroupBy): Ti
     dataSource: payload.data_source,
     bucket,
     groupBy,
+    coverage: decodeSummaryCoverage(payload.coverage),
     points: [...byBucket.entries()]
       .sort((left, right) => left[0] - right[0])
       .map(([ts, value]) => ({
@@ -493,7 +619,7 @@ function decodeTimeSeries(raw: unknown, bucket: BucketKey, groupBy: GroupBy): Ti
         label: formatPointLabel(ts, bucket),
       })),
     groups: [...byGroup.entries()]
-      .sort((left, right) => left[0].localeCompare(right[0], 'zh-CN'))
+      .sort((left, right) => left[0].localeCompare(right[0], "zh-CN"))
       .map(([key, groupBuckets]) => ({
         key,
         points: [...groupBuckets.entries()]
@@ -509,7 +635,10 @@ function decodeTimeSeries(raw: unknown, bucket: BucketKey, groupBy: GroupBy): Ti
   };
 }
 
-function decodeNetworkTimeSeries(raw: unknown, bucket: BucketKey): NetworkTimeSeriesResponse {
+function decodeNetworkTimeSeries(
+  raw: unknown,
+  bucket: BucketKey,
+): NetworkTimeSeriesResponse {
   const payload = raw as RawNetworkTimeseriesResponse;
   const byBucket = new Map<number, { rx: number; tx: number }>();
   for (const point of payload.data ?? []) {
@@ -521,6 +650,7 @@ function decodeNetworkTimeSeries(raw: unknown, bucket: BucketKey): NetworkTimeSe
   return {
     dataSource: payload.data_source,
     bucket,
+    coverage: decodeSummaryCoverage(payload.coverage),
     points: [...byBucket.entries()]
       .sort((left, right) => left[0] - right[0])
       .map(([ts, value]) => ({
@@ -538,11 +668,8 @@ function decodeUsage(raw: unknown): UsageResponse {
   return {
     dataSource: payload.data_source,
     nextCursor: payload.next_cursor,
-    page: payload.page ?? 1,
-    pageSize: payload.page_size ?? (payload.data?.length ?? 0),
-    totalRows: payload.total_rows ?? payload.data?.length ?? 0,
-    hasMore: Boolean(payload.has_more),
-    totalRowsExact: Boolean(payload.total_rows_exact),
+    ...decodePagination(payload, payload.data?.length ?? 0),
+    coverage: decodeSummaryCoverage(payload.coverage),
     rows: (payload.data ?? []).map((row) => ({
       minuteTs: row.time_bucket,
       proto: row.proto,
@@ -618,6 +745,7 @@ function decodeTop(raw: unknown): TopResponse {
   const payload = raw as RawTopResponse;
   return {
     dataSource: payload.data_source,
+    coverage: decodeSummaryCoverage(payload.coverage),
     rows: (payload.data ?? []).map((row) => ({
       label: row.key,
       value: row.bytes_up + row.bytes_down,
@@ -642,11 +770,8 @@ function decodeProcessSummary(raw: unknown): ProcessSummaryResponse {
   const payload = raw as RawProcessSummaryResponse;
   return {
     dataSource: payload.data_source,
-    page: payload.page ?? 1,
-    pageSize: payload.page_size ?? (payload.data?.length ?? 0),
-    totalRows: payload.total_rows ?? payload.data?.length ?? 0,
-    hasMore: Boolean(payload.has_more),
-    totalRowsExact: Boolean(payload.total_rows_exact),
+    ...decodePagination(payload, payload.data?.length ?? 0),
+    coverage: decodeSummaryCoverage(payload.coverage),
     rows: (payload.data ?? []).map((row) => ({
       pid: row.pid ?? null,
       comm: row.comm ?? null,
@@ -663,11 +788,8 @@ function decodeRemoteSummary(raw: unknown): RemoteSummaryResponse {
   const payload = raw as RawRemoteSummaryResponse;
   return {
     dataSource: payload.data_source,
-    page: payload.page ?? 1,
-    pageSize: payload.page_size ?? (payload.data?.length ?? 0),
-    totalRows: payload.total_rows ?? payload.data?.length ?? 0,
-    hasMore: Boolean(payload.has_more),
-    totalRowsExact: Boolean(payload.total_rows_exact),
+    ...decodePagination(payload, payload.data?.length ?? 0),
+    coverage: decodeSummaryCoverage(payload.coverage),
     rows: (payload.data ?? []).map((row) => ({
       direction: row.direction,
       remoteIp: row.remote_ip || null,
@@ -684,11 +806,8 @@ function decodeForwardUsage(raw: unknown): ForwardUsageResponse {
   return {
     dataSource: payload.data_source,
     nextCursor: payload.next_cursor,
-    page: payload.page ?? 1,
-    pageSize: payload.page_size ?? (payload.data?.length ?? 0),
-    totalRows: payload.total_rows ?? payload.data?.length ?? 0,
-    hasMore: Boolean(payload.has_more),
-    totalRowsExact: Boolean(payload.total_rows_exact),
+    ...decodePagination(payload, payload.data?.length ?? 0),
+    coverage: decodeSummaryCoverage(payload.coverage),
     rows: (payload.data ?? []).map((row) => ({
       minuteTs: row.time_bucket,
       proto: row.proto,
@@ -705,18 +824,98 @@ function decodeForwardUsage(raw: unknown): ForwardUsageResponse {
   };
 }
 
+function decodePagination(payload: RawPagination, rowCount: number) {
+  return {
+    page: payload.page ?? 1,
+    pageSize: payload.page_size ?? rowCount,
+    totalRows: payload.total_rows ?? rowCount,
+    hasMore: Boolean(payload.has_more),
+    totalRowsExact: Boolean(payload.total_rows_exact),
+  };
+}
+
+function decodeDashboard(raw: unknown, bucket: BucketKey): DashboardResponse {
+  const payload = raw as RawDashboardResponse;
+  const coverage = payload.coverage;
+  return {
+    overview: decodeOverview({ data: payload.data.overview, coverage }),
+    timeseries: decodeTimeSeries(
+      {
+        data_source: payload.data_source,
+        data: payload.data.timeseries,
+        coverage,
+      },
+      bucket,
+      "direction",
+    ),
+    topProcesses: decodeProcessSummary({
+      data_source: payload.data_source,
+      data: payload.data.top_processes,
+      coverage,
+    }),
+    topInboundRemotes: decodeRemoteSummary({
+      data_source: payload.data_source,
+      data: payload.data.top_inbound_remotes,
+      coverage,
+    }),
+    topOutboundRemotes: decodeRemoteSummary({
+      data_source: payload.data_source,
+      data: payload.data.top_outbound_remotes,
+      coverage,
+    }),
+    topPorts: decodeTop({
+      data_source: payload.data_source,
+      data: payload.data.top_ports,
+      coverage,
+    }),
+  };
+}
+
 export function createHttpClient(): TrafficApiClient {
   return {
-    getOverview(range, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/stats/overview${buildQuery([['range', range], ['summary', 1]])}`), decodeOverview, requestOptions);
-    },
-    getMonthlyUsage(requestOptions) {
-      return requestJson(withAppBase('/api/v1/stats/monthly'), decodeMonthlyUsage, requestOptions);
-    },
-    getTimeSeries(range, groupBy: GroupBy = 'direction', filters, requestOptions) {
+    getDashboard(range, requestOptions) {
       const bucket = RANGE_TO_BUCKET[range];
       return requestJson(
-        withAppBase(`/api/v1/stats/timeseries${buildTimeSeriesQuery(range, bucket, groupBy, filters)}`),
+        withAppBase(
+          `/api/v1/dashboard${buildQuery([
+            ["range", range],
+            ["bucket", bucket],
+          ])}`,
+        ),
+        (raw) => decodeDashboard(raw, bucket),
+        requestOptions,
+      );
+    },
+    getOverview(range, requestOptions) {
+      return requestJson(
+        withAppBase(
+          `/api/v1/stats/overview${buildQuery([
+            ["range", range],
+            ["summary", 1],
+          ])}`,
+        ),
+        decodeOverview,
+        requestOptions,
+      );
+    },
+    getMonthlyUsage(requestOptions) {
+      return requestJson(
+        withAppBase("/api/v1/stats/monthly"),
+        decodeMonthlyUsage,
+        requestOptions,
+      );
+    },
+    getTimeSeries(
+      range,
+      groupBy: GroupBy = "direction",
+      filters,
+      requestOptions,
+    ) {
+      const bucket = RANGE_TO_BUCKET[range];
+      return requestJson(
+        withAppBase(
+          `/api/v1/stats/timeseries${buildTimeSeriesQuery(range, bucket, groupBy, filters)}`,
+        ),
         (raw) => decodeTimeSeries(raw, bucket, groupBy),
         requestOptions,
       );
@@ -724,37 +923,83 @@ export function createHttpClient(): TrafficApiClient {
     getNetworkTimeSeries(range, requestOptions) {
       const bucket = RANGE_TO_BUCKET[range];
       return requestJson(
-        withAppBase(`/api/v1/stats/interfaces/timeseries${buildQuery([['range', range], ['bucket', bucket]])}`),
+        withAppBase(
+          `/api/v1/stats/interfaces/timeseries${buildQuery([
+            ["range", range],
+            ["bucket", bucket],
+          ])}`,
+        ),
         (raw) => decodeNetworkTimeSeries(raw, bucket),
         requestOptions,
       );
     },
     getUsage(query: UsageQuery, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/usage${buildUsageQuery(query)}`), decodeUsage, requestOptions);
+      return requestJson(
+        withAppBase(`/api/v1/usage${buildUsageQuery(query)}`),
+        decodeUsage,
+        requestOptions,
+      );
     },
     getUsageExplain(row: UsageRow, options, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/usage/explain${buildUsageExplainQuery(row, options)}`), decodeUsageExplain, requestOptions);
+      return requestJson(
+        withAppBase(
+          `/api/v1/usage/explain${buildUsageExplainQuery(row, options)}`,
+        ),
+        decodeUsageExplain,
+        requestOptions,
+        options?.allowScan ? "POST" : undefined,
+      );
     },
     getTopProcesses(range, options, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/top/processes${buildTopProcessesQuery(range, options)}`), decodeProcessSummary, requestOptions);
+      return requestJson(
+        withAppBase(
+          `/api/v1/top/processes${buildTopProcessesQuery(range, options)}`,
+        ),
+        decodeProcessSummary,
+        requestOptions,
+      );
     },
     getTopRemotes(range, options, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/top/remotes${buildTopRemotesQuery(range, options)}`), decodeRemoteSummary, requestOptions);
+      return requestJson(
+        withAppBase(
+          `/api/v1/top/remotes${buildTopRemotesQuery(range, options)}`,
+        ),
+        decodeRemoteSummary,
+        requestOptions,
+      );
     },
     getTopPorts(range, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/top/ports${buildQuery([['range', range], ['by', 'total'], ['summary', 1]])}`), decodeTop, requestOptions);
+      return requestJson(
+        withAppBase(
+          `/api/v1/top/ports${buildQuery([
+            ["range", range],
+            ["by", "total"],
+            ["summary", 1],
+          ])}`,
+        ),
+        decodeTop,
+        requestOptions,
+      );
     },
     getProcesses(requestOptions) {
-      return requestJson(withAppBase('/api/v1/processes'), decodeProcesses, requestOptions);
+      return requestJson(
+        withAppBase("/api/v1/processes"),
+        decodeProcesses,
+        requestOptions,
+      );
     },
     getForwardUsage(query: ForwardUsageQuery, requestOptions) {
-      return requestJson(withAppBase(`/api/v1/forward/usage${buildForwardQuery(query)}`), decodeForwardUsage, requestOptions);
+      return requestJson(
+        withAppBase(`/api/v1/forward/usage${buildForwardQuery(query)}`),
+        decodeForwardUsage,
+        requestOptions,
+      );
     },
   };
 }
 
 export function shouldUseMockApi(envValue?: string) {
-  return envValue === '1';
+  return envValue === "1";
 }
 
 export function createAppApiClient(): TrafficApiClient {
@@ -764,5 +1009,4 @@ export function createAppApiClient(): TrafficApiClient {
   return createHttpClient();
 }
 
-export { RANGE_TO_BUCKET };
 export { normalizeUsageSortKey };

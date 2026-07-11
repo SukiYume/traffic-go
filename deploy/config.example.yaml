@@ -7,7 +7,9 @@
 
 # Change the port here if the default local listen address conflicts with another service.
 listen: "127.0.0.1:18080"
-# install-centos7.sh rewrites this to <script-dir>/traffic.db during install.
+# The packaged systemd service uses /var/lib/traffic-go (or the configured
+# TRAFFIC_GO_STATE_DIR) as WorkingDirectory, so this relative path keeps data
+# separate from the root-owned binary and config directory.
 db_path: ./traffic.db
 tick_interval: 2s
 # Controls how often the collector rebuilds the /proc socket index used for
@@ -67,4 +69,15 @@ prefetch:
   scan_budget: 500ms
   max_scan_files: 2
   max_scan_lines_per_file: 10000
-# Hourly cleanup, WAL truncation, and weekly vacuum are built in and are not configurable here.
+# Prefetch advances only through fully closed minutes. A truncated or timed-out
+# source remains partial and resumes from its durable cursor on the next pass.
+
+cache:
+  count_cache_size: 256
+  result_cache_size: 16
+  sliding_ttl: 60s
+  archived_ttl: 1h
+# Top-process and top-remote result caches each have an independent estimated
+# 8 MiB memory ceiling; high-cardinality queries fall back to SQLite paging.
+# Hourly cleanup, optimize, and PASSIVE WAL checkpoint are built in. VACUUM runs
+# at most weekly after an initial baseline; TRUNCATE follows an actual VACUUM.

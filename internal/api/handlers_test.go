@@ -50,6 +50,13 @@ func (s stubRuntime) ActiveStats() model.ActiveStats {
 	return s.stats
 }
 
+func (s stubRuntime) ReadyStatus() model.CollectorReadiness {
+	return model.CollectorReadiness{
+		SnapshotReady:   s.diag.SnapshotReady,
+		CollectionFresh: s.diag.CollectionFresh,
+	}
+}
+
 func (s stubRuntime) Diagnostics() model.CollectorDiagnostics {
 	return s.diag
 }
@@ -88,6 +95,7 @@ func newTestServerWithConfig(t *testing.T, configure func(*config.Config)) *Serv
 				string(model.AttributionUnknown): 1,
 			},
 			SnapshotReady:    true,
+			CollectionFresh:  true,
 			SocketIndexReady: true,
 			LocalIPCount:     2,
 		},
@@ -149,7 +157,8 @@ func TestParseWindowSupportsNaturalMonthRanges(t *testing.T) {
 
 func TestUsageDimensionUnavailable(t *testing.T) {
 	server := newTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?start=0&end=3600&pid=12", nil)
+	end := time.Now().UTC().Add(-120 * 24 * time.Hour)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/usage?start=%d&end=%d&pid=12", end.Add(-time.Hour).Unix(), end.Unix()), nil)
 	rec := httptest.NewRecorder()
 
 	server.Handler().ServeHTTP(rec, req)
@@ -160,6 +169,16 @@ func TestUsageDimensionUnavailable(t *testing.T) {
 	body, _ := io.ReadAll(rec.Body)
 	if !strings.Contains(string(body), "dimension_unavailable") {
 		t.Fatalf("unexpected body: %s", string(body))
+	}
+}
+
+func TestUsageRejectsWindowBeforeDailyRetention(t *testing.T) {
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?start=0&end=3600", nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), `"error":"range_unavailable"`) {
+		t.Fatalf("expected explicit retained-range error, got status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -258,7 +277,8 @@ func TestMonthlyUsageEndpoint(t *testing.T) {
 
 func TestTimeseriesDimensionUnavailable(t *testing.T) {
 	server := newTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats/timeseries?start=0&end=3600&pid=12", nil)
+	end := time.Now().UTC().Add(-120 * 24 * time.Hour)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/stats/timeseries?start=%d&end=%d&pid=12", end.Add(-time.Hour).Unix(), end.Unix()), nil)
 	rec := httptest.NewRecorder()
 
 	server.Handler().ServeHTTP(rec, req)
@@ -336,9 +356,21 @@ func TestUsageRejectsCursorSortOverrides(t *testing.T) {
 	}
 }
 
+func TestListQueryNormalizesValidatedSortParameters(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?range=24h&page=1&sort_by=%20Bytes_Up%20&sort_order=%20ASC%20", nil)
+	query, err := parseUsageQuery(req)
+	if err != nil {
+		t.Fatalf("parse normalized usage query: %v", err)
+	}
+	if query.SortBy != "bytes_up" || query.SortOrder != "asc" {
+		t.Fatalf("validated sort must use normalized execution values, got by=%q order=%q", query.SortBy, query.SortOrder)
+	}
+}
+
 func TestUsageRejectsRemotePortForHourlySource(t *testing.T) {
 	server := newTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?start=0&end=3600&remote_port=443", nil)
+	end := time.Now().UTC().Add(-120 * 24 * time.Hour)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/usage?start=%d&end=%d&remote_port=443", end.Add(-time.Hour).Unix(), end.Unix()), nil)
 	rec := httptest.NewRecorder()
 
 	server.Handler().ServeHTTP(rec, req)
@@ -459,7 +491,7 @@ func TestForwardUsageReturnsForwardDataSourceLabel(t *testing.T) {
 	}
 }
 
-func TestUsageResponseNormalizesPageMetadata(t *testing.T) {
+func TestUsageRejectsOutOfRangePageMetadata(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
@@ -494,13 +526,11 @@ func TestUsageResponseNormalizesPageMetadata(t *testing.T) {
 
 	server.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unexpected status: %d", rec.Code)
 	}
-	body, _ := io.ReadAll(rec.Body)
-	bodyText := string(body)
-	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
-		t.Fatalf("expected normalized page metadata, got %s", bodyText)
+	if !strings.Contains(rec.Body.String(), "page must be between") {
+		t.Fatalf("expected strict page validation, got %s", rec.Body.String())
 	}
 }
 
@@ -622,7 +652,7 @@ func TestUsageWindowOutsideMinuteRetentionUsesHourlySourceWithoutMinuteOnlyFilte
 	}
 }
 
-func TestSummaryTopProcessesUsesHourlySourceInsideMinuteRetention(t *testing.T) {
+func TestSummaryFlagDoesNotDiscardPIDInsideMinuteRetention(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Hour)
@@ -675,8 +705,36 @@ func TestSummaryTopProcessesUsesHourlySourceInsideMinuteRetention(t *testing.T) 
 		t.Fatalf("unexpected summary status: %d", summaryRec.Code)
 	}
 	summaryBody := summaryRec.Body.String()
-	if !strings.Contains(summaryBody, `"data_source":"usage_1h"`) || !strings.Contains(summaryBody, `"pid":null`) {
-		t.Fatalf("expected summary query to use hourly comm fallback: %s", summaryBody)
+	if !strings.Contains(summaryBody, `"data_source":"usage_1m"`) || !strings.Contains(summaryBody, `"pid":1088`) {
+		t.Fatalf("summary hint must not discard retained PID detail: %s", summaryBody)
+	}
+}
+
+func TestTopProcessesLongWindowAutomaticallyIncludesCurrentHourTail(t *testing.T) {
+	server := newTestServerWithConfig(t, nil)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Minute)
+	if err := server.store.FlushMinute(ctx, now.Unix(), map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS: now.Unix(), Proto: "tcp", Direction: model.DirectionOut,
+			PID: 77, Comm: "tail-worker", Exe: "/usr/bin/tail-worker",
+			LocalPort: 50000, RemoteIP: "198.51.100.77", RemotePort: 443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 777, FlowCount: 1},
+	}, nil); err != nil {
+		t.Fatalf("seed current-hour usage: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf(
+		"/api/v1/top/processes?start=%d&end=%d&page=1&page_size=10&group_by=comm",
+		now.Add(-30*24*time.Hour).Unix(), now.Add(time.Minute).Unix()), nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"comm":"tail-worker"`) || !strings.Contains(rec.Body.String(), `"bytes_up":777`) || !strings.Contains(rec.Body.String(), `"coverage":`) {
+		t.Fatalf("automatic mixed summary lost the current-hour tail: %s", rec.Body.String())
 	}
 }
 
@@ -729,7 +787,7 @@ func TestUsageLongWindowKeepsMinuteSourceForAttributionFilter(t *testing.T) {
 	}
 }
 
-func TestForwardUsageResponseNormalizesPageMetadata(t *testing.T) {
+func TestForwardUsageRejectsOutOfRangePageMetadata(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
@@ -760,13 +818,11 @@ func TestForwardUsageResponseNormalizesPageMetadata(t *testing.T) {
 
 	server.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unexpected status: %d", rec.Code)
 	}
-	body, _ := io.ReadAll(rec.Body)
-	bodyText := string(body)
-	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
-		t.Fatalf("expected normalized forward page metadata, got %s", bodyText)
+	if !strings.Contains(rec.Body.String(), "page must be between") {
+		t.Fatalf("expected strict page validation, got %s", rec.Body.String())
 	}
 }
 
@@ -840,7 +896,7 @@ func TestTopProcessesSupportsGroupByComm(t *testing.T) {
 	}
 }
 
-func TestTopProcessesResponseNormalizesPageMetadata(t *testing.T) {
+func TestTopProcessesRejectsOutOfRangePageMetadata(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
@@ -875,17 +931,15 @@ func TestTopProcessesResponseNormalizesPageMetadata(t *testing.T) {
 
 	server.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unexpected status: %d", rec.Code)
 	}
-	body, _ := io.ReadAll(rec.Body)
-	bodyText := string(body)
-	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
-		t.Fatalf("expected normalized top-process page metadata, got %s", bodyText)
+	if !strings.Contains(rec.Body.String(), "page must be between") {
+		t.Fatalf("expected strict page validation, got %s", rec.Body.String())
 	}
 }
 
-func TestTopRemotesResponseNormalizesPageMetadata(t *testing.T) {
+func TestTopRemotesRejectsOutOfRangePageMetadata(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	minute := time.Date(2026, 4, 16, 8, 30, 0, 0, time.UTC).Unix()
@@ -938,16 +992,11 @@ func TestTopRemotesResponseNormalizesPageMetadata(t *testing.T) {
 
 	server.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unexpected status: %d", rec.Code)
 	}
-	body, _ := io.ReadAll(rec.Body)
-	bodyText := string(body)
-	if !strings.Contains(bodyText, `"page":1`) || !strings.Contains(bodyText, `"page_size":200`) {
-		t.Fatalf("expected normalized top-remote page metadata, got %s", bodyText)
-	}
-	if !strings.Contains(bodyText, `"remote_ip":"127.0.0.1"`) {
-		t.Fatalf("expected top-remotes to include loopback by default, got %s", bodyText)
+	if !strings.Contains(rec.Body.String(), "page must be between") {
+		t.Fatalf("expected strict page validation, got %s", rec.Body.String())
 	}
 
 	excludeReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/top/remotes?start=%s&end=%s&exclude_loopback=1", start, end), nil)
@@ -1001,7 +1050,7 @@ func TestRunBackgroundPrefetchWarmsEvidenceAndChains(t *testing.T) {
 
 	summary := server.RunBackgroundPrefetch(ctx, BackgroundPrefetchOptions{
 		Enabled:             true,
-		Now:                 minuteTime.Add(30 * time.Second),
+		Now:                 minuteTime.Add(2*time.Minute + 30*time.Second),
 		EvidenceLookback:    20 * time.Minute,
 		ChainLookback:       20 * time.Minute,
 		ScanBudget:          2 * time.Second,
@@ -1106,7 +1155,7 @@ func TestRunBackgroundPrefetchDedupesEquivalentUsageQueries(t *testing.T) {
 
 	summary := server.RunBackgroundPrefetch(ctx, BackgroundPrefetchOptions{
 		Enabled:             true,
-		Now:                 minuteTime.Add(30 * time.Second),
+		Now:                 minuteTime.Add(2*time.Minute + 30*time.Second),
 		EvidenceLookback:    20 * time.Minute,
 		ChainLookback:       20 * time.Minute,
 		ScanBudget:          2 * time.Second,
@@ -1127,7 +1176,7 @@ func TestRunBackgroundPrefetchHonorsChainLookback(t *testing.T) {
 	now := time.Date(2026, 4, 18, 12, 10, 30, 0, time.UTC)
 	outsideMinute := now.Add(-21 * time.Minute).Truncate(time.Minute)
 	lookbackMinute := now.Add(-10 * time.Minute).Truncate(time.Minute)
-	recentMinute := now.Add(-time.Minute).Truncate(time.Minute)
+	recentMinute := now.Add(-2 * time.Minute).Truncate(time.Minute)
 	logLines := []string{
 		fmt.Sprintf("%s /usr/bin/ss-server[27896]: [12096] connect to outside.example.com:443", outsideMinute.Add(10*time.Second).Format(time.RFC3339)),
 		fmt.Sprintf("%s /usr/bin/ss-server[27896]: [12096] connect to lookback.example.com:443", lookbackMinute.Add(10*time.Second).Format(time.RFC3339)),
@@ -1282,7 +1331,7 @@ func TestRunBackgroundPrefetchFallsBackToShadowsocksJournal(t *testing.T) {
 
 	summary := server.RunBackgroundPrefetch(ctx, BackgroundPrefetchOptions{
 		Enabled:             true,
-		Now:                 minuteTime.Add(30 * time.Second),
+		Now:                 minuteTime.Add(2*time.Minute + 30*time.Second),
 		EvidenceLookback:    20 * time.Minute,
 		ChainLookback:       20 * time.Minute,
 		ScanBudget:          2 * time.Second,
@@ -1631,7 +1680,7 @@ func TestUsageExplainCorrelatesShadowsocksPeers(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443&scan=1", minute),
 		nil,
 	)
@@ -1712,7 +1761,7 @@ func TestUsageExplainReadsConfiguredNginxProcessLogDir(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=3312&comm=nginx&exe=/usr/sbin/nginx&local_port=80&remote_ip=74.7.227.153&remote_port=41220&scan=1", minute),
 		nil,
 	)
@@ -1773,7 +1822,7 @@ func TestUsageExplainReadsCompressedRotatedNginxLog(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=3312&comm=nginx&exe=/usr/sbin/nginx&local_port=443&remote_ip=74.7.227.153&remote_port=36892&scan=1", minute),
 		nil,
 	)
@@ -1834,7 +1883,7 @@ func TestUsageExplainSummarizesNginxBotRequests(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=3312&comm=nginx&exe=/usr/sbin/nginx&local_port=443&remote_ip=74.7.227.153&remote_port=36892&scan=1", minute),
 		nil,
 	)
@@ -1894,7 +1943,7 @@ func TestUsageExplainReadsShadowsocksLogEvidence(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=8388&remote_ip=74.7.227.153&remote_port=52144&scan=1", minute),
 		nil,
 	)
@@ -1917,6 +1966,14 @@ func TestUsageExplainReadsShadowsocksLogEvidence(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, `SS 日志命中`) {
 		t.Fatalf("expected ss hit note in body: %s", bodyText)
+	}
+	pid := 1088
+	persisted, err := server.store.QueryUsageChainsForProcess(context.Background(), minute, &pid, "ss-server", "/usr/bin/ss-server", store.DataSourceMinuteChain)
+	if err != nil {
+		t.Fatalf("query persisted deep-scan chains: %v", err)
+	}
+	if len(persisted) == 0 {
+		t.Fatal("explicit POST deep scan must persist its canonical chain")
 	}
 }
 
@@ -1959,7 +2016,7 @@ func TestUsageExplainFallsBackToShadowsocksJournal(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=104.26.8.78&remote_port=443&scan=1", minute),
 		nil,
 	)
@@ -2023,7 +2080,7 @@ func TestUsageExplainSkipsShadowsocksJournalWhenFallbackDisabled(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=104.26.8.78&remote_port=443&scan=1", minute),
 		nil,
 	)
@@ -2081,7 +2138,7 @@ func TestUsageExplainShadowsocksDoesNotFallbackToOtherDirs(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=8388&remote_ip=74.7.227.153&remote_port=52144&scan=1", minute),
 		nil,
 	)
@@ -2138,7 +2195,7 @@ func TestUsageExplainOpenrestyUsesGenericProcessLogs(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=2233&comm=openresty&exe=/usr/bin/openresty&local_port=443&remote_ip=104.26.8.78&remote_port=443&scan=1", minute),
 		nil,
 	)
@@ -2202,7 +2259,7 @@ func TestUsageExplainUnknownInboundDoesNotUseShadowsocksFallback(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=0&local_port=12096&remote_ip=159.226.171.226&remote_port=44598&scan=1", minute),
 		nil,
 	)
@@ -2263,7 +2320,7 @@ func TestUsageExplainUsesConfiguredProcessLogDirForFrps(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=936&comm=frps&exe=/usr/local/bin/frps&local_port=6010&remote_ip=213.209.159.228&remote_port=55352&scan=1", minute),
 		nil,
 	)
@@ -2323,7 +2380,7 @@ func TestUsageExplainBuildsFrpsChainFromUserConnectionLog(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=936&comm=frps&exe=/usr/local/bin/frps&local_port=6010&remote_ip=213.209.159.235&remote_port=47700&scan=1", minute),
 		nil,
 	)
@@ -2376,7 +2433,7 @@ func TestUsageExplainFallsBackToCachedEvidenceWhenProcessLogDirIsUnconfigured(t 
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=936&comm=frps&exe=/usr/local/bin/frps&local_port=6010&remote_ip=213.209.159.228&remote_port=55352&scan=1", minute),
 		nil,
 	)
@@ -2462,7 +2519,7 @@ func TestUsageExplainUnknownInboundSelectsCounterpartFromUsage(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=in&pid=0&local_port=12096&remote_ip=159.226.171.226&remote_port=44598&scan=1", minute),
 		nil,
 	)
@@ -2521,7 +2578,7 @@ func TestUsageExplainReadsShadowsocksConnectHostFromConfiguredGlobPath(t *testin
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443&scan=1", minute),
 		nil,
 	)
@@ -2585,7 +2642,7 @@ func TestUsageExplainBuildsShadowsocksChainFromSharedServerAndObfsLogs(t *testin
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443&scan=1", minute),
 		nil,
 	)
@@ -2610,6 +2667,7 @@ func TestUsageExplainBuildsShadowsocksChainFromSharedServerAndObfsLogs(t *testin
 
 func TestUsageExplainSkipsSynchronousFileScanByDefault(t *testing.T) {
 	server := newTestServer(t)
+	ctx := context.Background()
 	ssLogDir := t.TempDir()
 	setProcessLogDir(server, "ss-server", ssLogDir)
 
@@ -2621,7 +2679,7 @@ func TestUsageExplainSkipsSynchronousFileScanByDefault(t *testing.T) {
 		t.Fatalf("write ss connect log: %v", err)
 	}
 
-	err := server.store.FlushMinute(context.Background(), minute, map[model.UsageKey]model.UsageDelta{
+	err := server.store.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
 		{
 			MinuteTS:    minute,
 			Proto:       "tcp",
@@ -2700,7 +2758,7 @@ func TestUsageExplainReplaysHourlyPersistedChains(t *testing.T) {
 
 	url := fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1h&proto=tcp&direction=out&comm=ss-server&local_port=12096&remote_ip=142.250.72.14", hour.Unix())
 	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, url, nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2767,7 +2825,7 @@ func TestUsageExplainReplaysDailyPersistedChainsAcrossWholeDay(t *testing.T) {
 
 	url := fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1d&proto=tcp&direction=out&comm=ss-server&local_port=12096&remote_ip=142.250.72.14", day.Unix())
 	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, url, nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -3125,11 +3183,8 @@ func TestUsageExplainReusesCachedInboundShadowsocksEvidenceWithEphemeralRemotePo
 		t.Fatalf("seed obfs usage row: %v", err)
 	}
 
-	req := httptest.NewRequest(
-		http.MethodGet,
-		fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1m&proto=tcp&direction=in&pid=999&comm=obfs-server&exe=/usr/local/bin/obfs-server&local_port=12096&remote_ip=159.226.171.226&remote_port=17069", minute),
-		nil,
-	)
+	target := fmt.Sprintf("/api/v1/usage/explain?ts=%d&data_source=usage_1m&proto=tcp&direction=in&pid=999&comm=obfs-server&exe=/usr/local/bin/obfs-server&local_port=12096&remote_ip=159.226.171.226&remote_port=17069", minute)
+	req := httptest.NewRequest(http.MethodGet, target, nil)
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 
@@ -3146,6 +3201,20 @@ func TestUsageExplainReusesCachedInboundShadowsocksEvidenceWithEphemeralRemotePo
 	}
 	if strings.Contains(bodyText, `日志缓存未命中`) {
 		t.Fatalf("did not expect cache miss when cached inbound ss evidence exists: %s", bodyText)
+	}
+
+	headRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(headRecorder, httptest.NewRequest(http.MethodHead, target, nil))
+	if headRecorder.Code != http.StatusOK {
+		t.Fatalf("unexpected HEAD status: %d", headRecorder.Code)
+	}
+	pid := 999
+	persisted, err := server.store.QueryUsageChainsForProcess(ctx, minute, &pid, "obfs-server", "/usr/local/bin/obfs-server", store.DataSourceMinuteChain)
+	if err != nil {
+		t.Fatalf("query chains after safe explain methods: %v", err)
+	}
+	if len(persisted) != 0 {
+		t.Fatalf("GET/HEAD explain must be strictly read-only, persisted=%+v", persisted)
 	}
 }
 
@@ -3188,7 +3257,7 @@ func TestUsageExplainReusesCachedHostOnlyShadowsocksEvidence(t *testing.T) {
 
 	url := fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=tcp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=142.250.72.14&remote_port=443&scan=1", minute)
 	first := httptest.NewRecorder()
-	server.Handler().ServeHTTP(first, httptest.NewRequest(http.MethodGet, url, nil))
+	server.Handler().ServeHTTP(first, httptest.NewRequest(http.MethodPost, url, nil))
 	if first.Code != http.StatusOK {
 		t.Fatalf("unexpected first status: %d", first.Code)
 	}
@@ -3197,7 +3266,8 @@ func TestUsageExplainReusesCachedHostOnlyShadowsocksEvidence(t *testing.T) {
 	}
 
 	second := httptest.NewRecorder()
-	server.Handler().ServeHTTP(second, httptest.NewRequest(http.MethodGet, url, nil))
+	cacheURL := strings.Replace(url, "&scan=1", "&data_source=usage_1m", 1)
+	server.Handler().ServeHTTP(second, httptest.NewRequest(http.MethodGet, cacheURL, nil))
 	if second.Code != http.StatusOK {
 		t.Fatalf("unexpected second status: %d", second.Code)
 	}
@@ -3245,7 +3315,7 @@ func TestUsageExplainConfirmsShadowsocksSourceIPFromUDPCacheMiss(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodGet,
+		http.MethodPost,
 		fmt.Sprintf("/api/v1/usage/explain?ts=%d&proto=udp&direction=out&pid=1088&comm=ss-server&exe=/usr/bin/ss-server&local_port=47920&remote_ip=17.253.144.10&remote_port=123&scan=1", minute),
 		nil,
 	)

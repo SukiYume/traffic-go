@@ -50,32 +50,7 @@ func monthlyDetailAggregateCTE(window monthlyAggregateWindow) (string, []any) {
 	appendMonthlyCountPart(&parts, &args, monthlyCountChain, "usage_chain_1m", "minute_ts", maxMonthlyStart(window.start, window.chainBoundary), window.upper, nil)
 	appendMonthlyRetainedCountsPart(&parts, &args, "monthly_retained_counts", "month_ts", window.start, window.upper, nil)
 
-	if len(parts) == 0 {
-		parts = append(parts, `
-SELECT NULL AS month_ts, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count,
-       0 AS forward_bytes_orig, 0 AS forward_bytes_reply, 0 AS forward_flow_count,
-       0 AS evidence_count, 0 AS chain_count
-WHERE 0`)
-	}
-
-	return `
-WITH monthly_detail_raw AS (
-` + strings.Join(parts, "\n    UNION ALL\n") + `
-),
-monthly_detail AS (
-    SELECT month_ts,
-           COALESCE(SUM(bytes_up), 0) AS bytes_up,
-           COALESCE(SUM(bytes_down), 0) AS bytes_down,
-           COALESCE(SUM(flow_count), 0) AS flow_count,
-           COALESCE(SUM(forward_bytes_orig), 0) AS forward_bytes_orig,
-           COALESCE(SUM(forward_bytes_reply), 0) AS forward_bytes_reply,
-           COALESCE(SUM(forward_flow_count), 0) AS forward_flow_count,
-           COALESCE(SUM(evidence_count), 0) AS evidence_count,
-           COALESCE(SUM(chain_count), 0) AS chain_count
-    FROM monthly_detail_raw
-    WHERE month_ts IS NOT NULL
-    GROUP BY month_ts
-)`, args
+	return buildMonthlyDetailCTE(parts, args)
 }
 
 func monthlySingleMonthAggregateCTE(window monthlyAggregateWindow, monthTS int64) (string, []any) {
@@ -95,6 +70,10 @@ func monthlySingleMonthAggregateCTE(window monthlyAggregateWindow, monthTS int64
 	appendSingleMonthCountPart(&parts, &args, monthTS, monthlyCountChain, "usage_chain_1m", "minute_ts", maxMonthlyStart(window.start, window.chainBoundary), window.upper, nil)
 	appendSingleMonthRetainedCountsPart(&parts, &args, monthTS)
 
+	return buildMonthlyDetailCTE(parts, args)
+}
+
+func buildMonthlyDetailCTE(parts []string, args []any) (string, []any) {
 	if len(parts) == 0 {
 		parts = append(parts, `
 SELECT NULL AS month_ts, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count,
@@ -102,7 +81,6 @@ SELECT NULL AS month_ts, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count,
        0 AS evidence_count, 0 AS chain_count
 WHERE 0`)
 	}
-
 	return `
 WITH monthly_detail_raw AS (
 ` + strings.Join(parts, "\n    UNION ALL\n") + `

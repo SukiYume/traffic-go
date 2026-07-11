@@ -5,8 +5,10 @@ import { Link } from 'react-router-dom';
 import { DataTable } from '../components/DataTable';
 import { EmptyState } from '../components/EmptyState';
 import { QueryErrorState } from '../components/QueryErrorState';
+import { RefreshControl } from '../components/RefreshControl';
 import { StatCard } from '../components/StatCard';
 import { useApiClient } from '../api-context';
+import { liveQueryOptions } from '../query-refresh';
 import type { MonthlyUsageSummary } from '../types';
 import { buildRangedPath } from '../useRangeSearchParam';
 import { formatBytes, formatMonth, formatNumber, rangeLabel } from '../utils';
@@ -53,6 +55,7 @@ export function HistoryPage() {
   const query = useQuery({
     queryKey: ['monthly-usage'],
     queryFn: ({ signal }) => api.getMonthlyUsage({ signal }),
+    ...liveQueryOptions,
   });
 
   const rows = query.data?.rows ?? [];
@@ -158,10 +161,13 @@ export function HistoryPage() {
             </div>
           </section>
         </div>
+        <div className="page-head-actions">
+          <RefreshControl updatedAt={query.dataUpdatedAt} isFetching={query.isFetching} onRefresh={query.refetch} />
+        </div>
       </header>
 
       {query.isError ? (
-        <QueryErrorState error={query.error} title="月度归档加载失败" />
+        <QueryErrorState error={query.error} title="月度归档加载失败" onRetry={query.refetch} retrying={query.isFetching} />
       ) : rows.length ? (
         <>
           <section className="stat-grid">
@@ -171,7 +177,7 @@ export function HistoryPage() {
             <StatCard label="归档月份" value={summary.archivedMonths} suffix="count" />
           </section>
 
-          <DataTable columns={columns} data={rows} emptyText="暂无月度历史" />
+          <DataTable columns={columns} data={rows} emptyText="暂无月度历史" busy={query.isFetching} />
         </>
       ) : query.isPending ? (
         <EmptyState title="月度归档加载中" description="正在读取自然月历史汇总。" />

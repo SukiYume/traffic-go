@@ -16,4 +16,24 @@ describe('DataSourceBadge', () => {
     expect(screen.getByText('网卡日聚合')).toBeInTheDocument();
     expect(screen.getByText('interface_1d')).toBeInTheDocument();
   });
+
+  it('shows the effective bucket warning only for approximate summary coverage', () => {
+    const { rerender } = render(
+      <DataSourceBadge
+        dataSource="usage_1d"
+        coverage={{ approximate: true, effectiveStart: 1710000000, effectiveEnd: 1710086400 }}
+      />,
+    );
+
+    expect(screen.getByText('近似窗口')).toBeInTheDocument();
+    expect(screen.getByText('边界按完整聚合桶扩展')).toBeInTheDocument();
+
+    rerender(
+      <DataSourceBadge
+        dataSource="usage_1d"
+        coverage={{ approximate: false, effectiveStart: 1710000000, effectiveEnd: 1710086400 }}
+      />,
+    );
+    expect(screen.queryByText('近似窗口')).not.toBeInTheDocument();
+  });
 });

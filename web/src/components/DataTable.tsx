@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from "react";
 import {
   flexRender,
   getCoreRowModel,
@@ -7,9 +7,9 @@ import {
   type ColumnDef,
   type OnChangeFn,
   type SortingState,
-} from '@tanstack/react-table';
-import type { FormEvent, KeyboardEvent, ReactNode } from 'react';
-import { formatNumber } from '../utils';
+} from "@tanstack/react-table";
+import type { FormEvent, KeyboardEvent, MouseEvent, ReactNode } from "react";
+import { formatNumber } from "../utils";
 
 type PaginationState = {
   page: number;
@@ -18,18 +18,20 @@ type PaginationState = {
   hasMore?: boolean;
   totalRowsExact?: boolean;
   onPageChange: (page: number) => void;
+  onRequestExactTotal?: () => void;
+  exactTotalBusy?: boolean;
 };
 
 type TableColumnMeta = {
   className?: string;
   headerClassName?: string;
   cellClassName?: string;
-  align?: 'left' | 'center' | 'right';
+  align?: "left" | "center" | "right";
   nowrap?: boolean;
 };
 
-function SortIndicator({ state }: { state: false | 'asc' | 'desc' }) {
-  if (state === 'asc') {
+function SortIndicator({ state }: { state: false | "asc" | "desc" }) {
+  if (state === "asc") {
     return (
       <span className="table-sort-indicator" aria-hidden="true">
         <svg viewBox="0 0 12 12" focusable="false">
@@ -40,7 +42,7 @@ function SortIndicator({ state }: { state: false | 'asc' | 'desc' }) {
     );
   }
 
-  if (state === 'desc') {
+  if (state === "desc") {
     return (
       <span className="table-sort-indicator" aria-hidden="true">
         <svg viewBox="0 0 12 12" focusable="false">
@@ -63,20 +65,19 @@ function SortIndicator({ state }: { state: false | 'asc' | 'desc' }) {
   );
 }
 
-function columnMetaToClassName(meta: TableColumnMeta | undefined, target: 'header' | 'cell') {
+function columnMetaToClassName(
+  meta: TableColumnMeta | undefined,
+  target: "header" | "cell",
+) {
   if (!meta) return undefined;
   const classes = [meta.className];
-  if (target === 'header' && meta.headerClassName) classes.push(meta.headerClassName);
-  if (target === 'cell' && meta.cellClassName) classes.push(meta.cellClassName);
+  if (target === "header" && meta.headerClassName)
+    classes.push(meta.headerClassName);
+  if (target === "cell" && meta.cellClassName) classes.push(meta.cellClassName);
   if (meta.align) classes.push(`align-${meta.align}`);
-  if (meta.nowrap) classes.push('cell-nowrap');
+  if (meta.nowrap) classes.push("cell-nowrap");
   const filtered = classes.filter(Boolean);
-  return filtered.length ? filtered.join(' ') : undefined;
-}
-
-function isInteractiveTarget(target: EventTarget | null) {
-  if (!(target instanceof HTMLElement)) return false;
-  return Boolean(target.closest('button, a, input, select, textarea, summary, [role="button"]'));
+  return filtered.length ? filtered.join(" ") : undefined;
 }
 
 export function DataTable<TData>({
@@ -84,7 +85,7 @@ export function DataTable<TData>({
   data,
   cardClassName,
   tableClassName,
-  emptyText = '暂无数据',
+  emptyText = "暂无数据",
   sorting,
   onSortingChange,
   manualSorting = false,
@@ -98,6 +99,7 @@ export function DataTable<TData>({
   onExpandRowKeyChange,
   getExpandedRowKey,
   renderExpandedRow,
+  rowActionLabel,
 }: {
   columns: ColumnDef<TData, any>[];
   data: TData[];
@@ -117,6 +119,7 @@ export function DataTable<TData>({
   onExpandRowKeyChange?: (key: string | null) => void;
   getExpandedRowKey?: (row: TData) => string;
   renderExpandedRow?: (row: TData) => ReactNode;
+  rowActionLabel?: (row: TData, expanded: boolean) => string;
 }) {
   const table = useReactTable({
     columns,
@@ -137,14 +140,14 @@ export function DataTable<TData>({
     ? hasExactTotal
       ? `第 ${pagination.page} / ${formatNumber(totalPages)} 页`
       : `第 ${pagination.page} 页`
-    : '';
+    : "";
   const totalLabel = pagination
     ? hasExactTotal
       ? `共 ${formatNumber(pagination.totalRows)} 条`
       : pagination.hasMore
         ? `至少 ${formatNumber(pagination.totalRows)} 条，仍有更多`
         : `已加载 ${formatNumber(pagination.totalRows)} 条`
-    : '';
+    : "";
   const canGoNext = pagination
     ? hasExactTotal
       ? pagination.page < totalPages
@@ -160,7 +163,9 @@ export function DataTable<TData>({
     canUsePageJump && Number.isFinite(parsedJumpPage) && parsedJumpPage > 0
       ? Math.min(parsedJumpPage, totalPages)
       : null;
-  const canJump = canUsePageJump && jumpPage != null && jumpPage !== pagination?.page;
+  const canJump =
+    canUsePageJump && jumpPage != null && jumpPage !== pagination?.page;
+  const visibleColumnCount = columns.length;
   const submitPageJump = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!pagination || jumpPage == null || jumpPage === pagination.page) return;
@@ -168,29 +173,54 @@ export function DataTable<TData>({
   };
 
   return (
-    <div className={cardClassName ? `table-card ${cardClassName}` : 'table-card'} aria-busy={busy || undefined}>
+    <div
+      className={cardClassName ? `table-card ${cardClassName}` : "table-card"}
+      aria-busy={busy || undefined}
+    >
       <div className="table-wrap">
-        <table className={tableClassName ? `table ${tableClassName}` : 'table'}>
+        <table className={tableClassName ? `table ${tableClassName}` : "table"}>
           <thead>
             {table.getHeaderGroups().map((group) => (
               <tr key={group.id}>
                 {group.headers.map((header) => {
-                  const meta = (header.column.columnDef.meta as TableColumnMeta | undefined) ?? undefined;
+                  const meta =
+                    (header.column.columnDef.meta as
+                      TableColumnMeta | undefined) ?? undefined;
                   const canSort = header.column.getCanSort();
                   const sortState = header.column.getIsSorted();
                   return (
-                    <th key={header.id} className={columnMetaToClassName(meta, 'header')}>
+                    <th
+                      key={header.id}
+                      className={columnMetaToClassName(meta, "header")}
+                      aria-sort={
+                        canSort
+                          ? sortState === "asc"
+                            ? "ascending"
+                            : sortState === "desc"
+                              ? "descending"
+                              : "none"
+                          : undefined
+                      }
+                    >
                       {header.isPlaceholder ? null : canSort ? (
                         <button
                           type="button"
                           className="table-sort"
                           onClick={header.column.getToggleSortingHandler()}
                         >
-                          <span>{flexRender(header.column.columnDef.header, header.getContext())}</span>
+                          <span>
+                            {flexRender(
+                              header.column.columnDef.header,
+                              header.getContext(),
+                            )}
+                          </span>
                           <SortIndicator state={sortState} />
                         </button>
                       ) : (
-                        flexRender(header.column.columnDef.header, header.getContext())
+                        flexRender(
+                          header.column.columnDef.header,
+                          header.getContext(),
+                        )
                       )}
                     </th>
                   );
@@ -203,61 +233,104 @@ export function DataTable<TData>({
               table.getRowModel().rows.map((row) => {
                 const rowIndex = Number(row.id);
                 const rowExpansionKey = getExpandedRowKey?.(row.original);
-                const canExpandByKey = renderExpandedRow != null && onExpandRowKeyChange != null && rowExpansionKey != null;
-                const isExpanded = renderExpandedRow != null
-                  ? canExpandByKey
-                    ? expandedRowKey === rowExpansionKey
-                    : expandedRowIndex === rowIndex
-                  : false;
-                const handleClick = canExpandByKey
+                const canExpandByKey =
+                  renderExpandedRow != null &&
+                  onExpandRowKeyChange != null &&
+                  rowExpansionKey != null;
+                const isExpanded =
+                  renderExpandedRow != null
+                    ? canExpandByKey
+                      ? expandedRowKey === rowExpansionKey
+                      : expandedRowIndex === rowIndex
+                    : false;
+                const handleAction = canExpandByKey
                   ? () => {
-                      if (window.getSelection()?.toString()) return;
                       onExpandRowKeyChange(isExpanded ? null : rowExpansionKey);
                     }
                   : renderExpandedRow && onExpandRow
                     ? () => {
-                        if (window.getSelection()?.toString()) return;
                         onExpandRow(isExpanded ? null : rowIndex);
                       }
                     : onRowClick
-                      ? () => {
-                          if (window.getSelection()?.toString()) return;
-                          onRowClick(row.original);
-                        }
+                      ? () => onRowClick(row.original)
                       : undefined;
-                const handleKeyDown = handleClick
-                  ? (event: KeyboardEvent<HTMLTableRowElement>) => {
-                      if (event.defaultPrevented || isInteractiveTarget(event.target)) return;
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        handleClick();
-                      }
-                    }
-                  : undefined;
+                const actionLabel =
+                  rowActionLabel?.(row.original, isExpanded) ??
+                  (renderExpandedRow
+                    ? isExpanded
+                      ? "收起详情"
+                      : "展开详情"
+                    : "查看");
+                const activateFromClick = (
+                  event: MouseEvent<HTMLTableRowElement>,
+                ) => {
+                  if (
+                    !handleAction ||
+                    isInteractiveDescendant(event.currentTarget, event.target)
+                  )
+                    return;
+                  handleAction();
+                };
+                const activateFromKeyboard = (
+                  event: KeyboardEvent<HTMLTableRowElement>,
+                ) => {
+                  if (
+                    !handleAction ||
+                    event.currentTarget !== event.target ||
+                    (event.key !== "Enter" && event.key !== " ")
+                  )
+                    return;
+                  event.preventDefault();
+                  handleAction();
+                };
+                const rowClassName = [
+                  isRowSelected?.(row.original) || isExpanded
+                    ? "selected"
+                    : undefined,
+                  handleAction ? "table-row-interactive" : undefined,
+                ]
+                  .filter(Boolean)
+                  .join(" ");
 
                 return (
                   <Fragment key={row.id}>
                     <tr
-                      className={isRowSelected?.(row.original) ? 'selected' : isExpanded ? 'selected' : undefined}
-                      onClick={handleClick}
-                      onKeyDown={handleKeyDown}
-                      style={handleClick ? { cursor: 'pointer' } : undefined}
-                      tabIndex={handleClick ? 0 : undefined}
-                      aria-expanded={renderExpandedRow != null ? isExpanded : undefined}
+                      className={rowClassName || undefined}
+                      onClick={handleAction ? activateFromClick : undefined}
+                      onKeyDown={
+                        handleAction ? activateFromKeyboard : undefined
+                      }
+                      tabIndex={handleAction ? 0 : undefined}
+                      aria-label={handleAction ? actionLabel : undefined}
+                      aria-expanded={
+                        renderExpandedRow && handleAction
+                          ? isExpanded
+                          : undefined
+                      }
                     >
                       {row.getVisibleCells().map((cell) => {
-                        const meta = (cell.column.columnDef.meta as TableColumnMeta | undefined) ?? undefined;
+                        const meta =
+                          (cell.column.columnDef.meta as
+                            TableColumnMeta | undefined) ?? undefined;
                         return (
-                          <td key={cell.id} className={columnMetaToClassName(meta, 'cell')}>
-                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                          <td
+                            key={cell.id}
+                            className={columnMetaToClassName(meta, "cell")}
+                          >
+                            {flexRender(
+                              cell.column.columnDef.cell,
+                              cell.getContext(),
+                            )}
                           </td>
                         );
                       })}
                     </tr>
                     {isExpanded && (
                       <tr>
-                        <td colSpan={columns.length} onClick={(e) => e.stopPropagation()}>
-                          {renderExpandedRow ? renderExpandedRow(row.original) : null}
+                        <td colSpan={visibleColumnCount}>
+                          {renderExpandedRow
+                            ? renderExpandedRow(row.original)
+                            : null}
                         </td>
                       </tr>
                     )}
@@ -266,7 +339,7 @@ export function DataTable<TData>({
               })
             ) : (
               <tr>
-                <td colSpan={columns.length}>
+                <td colSpan={visibleColumnCount}>
                   <div className="empty-inline">{emptyText}</div>
                 </td>
               </tr>
@@ -283,6 +356,18 @@ export function DataTable<TData>({
             {busy ? <span className="table-refreshing">刷新中</span> : null}
           </span>
           <div className="table-footer-actions">
+            {!hasExactTotal &&
+            pagination.hasMore &&
+            pagination.onRequestExactTotal ? (
+              <button
+                type="button"
+                className="chip ghost"
+                onClick={pagination.onRequestExactTotal}
+                disabled={pagination.exactTotalBusy}
+              >
+                {pagination.exactTotalBusy ? "计算中" : "计算精确总数"}
+              </button>
+            ) : null}
             {canUsePageJump ? (
               <form className="table-page-jump" onSubmit={submitPageJump}>
                 <input
@@ -294,12 +379,21 @@ export function DataTable<TData>({
                   value={pageInput}
                   onChange={(event) => setPageInput(event.target.value)}
                 />
-                <button type="submit" className="chip ghost" disabled={!canJump}>
+                <button
+                  type="submit"
+                  className="chip ghost"
+                  disabled={!canJump}
+                >
                   跳页
                 </button>
               </form>
             ) : null}
-            <button type="button" className="chip ghost" onClick={() => pagination.onPageChange(1)} disabled={pagination.page <= 1}>
+            <button
+              type="button"
+              className="chip ghost"
+              onClick={() => pagination.onPageChange(1)}
+              disabled={pagination.page <= 1}
+            >
               首页
             </button>
             <button
@@ -322,5 +416,17 @@ export function DataTable<TData>({
         </footer>
       ) : null}
     </div>
+  );
+}
+
+function isInteractiveDescendant(
+  row: HTMLTableRowElement,
+  target: EventTarget | null,
+) {
+  return (
+    target instanceof Element &&
+    target !== row &&
+    target.closest('a, button, input, select, textarea, [role="button"]') !=
+      null
   );
 }

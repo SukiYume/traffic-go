@@ -1,11 +1,14 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,6 +62,21 @@ type Cache struct {
 }
 
 func (c *Cache) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("cache must be a mapping")
+	}
+	allowed := map[string]struct{}{
+		"count_cache_size":  {},
+		"result_cache_size": {},
+		"sliding_ttl":       {},
+		"archived_ttl":      {},
+	}
+	for index := 0; index+1 < len(value.Content); index += 2 {
+		key := value.Content[index]
+		if _, ok := allowed[key.Value]; !ok {
+			return fmt.Errorf("field %s not found in type config.Cache", key.Value)
+		}
+	}
 	type rawCache struct {
 		CountCacheSize  *int           `yaml:"count_cache_size"`
 		ResultCacheSize *int           `yaml:"result_cache_size"`
@@ -105,7 +123,7 @@ type Config struct {
 	// Keep systemd journal fallback disabled by default to avoid making
 	// persistent journald retention a hidden requirement. Set true only on
 	// hosts where shadowsocks still logs exclusively to journald.
-	ShadowsocksJournalFallback *bool     `yaml:"shadowsocks_journal_fallback"`
+	ShadowsocksJournalFallback bool      `yaml:"shadowsocks_journal_fallback"`
 	MockData                   bool      `yaml:"mock_data"`
 	Auth                       Auth      `yaml:"auth"`
 	Retention                  Retention `yaml:"retention"`
@@ -114,14 +132,12 @@ type Config struct {
 }
 
 func Default() Config {
-	enableShadowsocksJournalFallback := false
 	return Config{
-		Listen:                     defaultListen,
-		DBPath:                     defaultDBPath,
-		TickInterval:               defaultTickInterval,
-		SocketIndexInterval:        defaultSocketIndexInterval,
-		ProcFS:                     defaultProcFS,
-		ShadowsocksJournalFallback: &enableShadowsocksJournalFallback,
+		Listen:              defaultListen,
+		DBPath:              defaultDBPath,
+		TickInterval:        defaultTickInterval,
+		SocketIndexInterval: defaultSocketIndexInterval,
+		ProcFS:              defaultProcFS,
 		Retention: Retention{
 			MinuteDays:   7,
 			HourMonths:   3,
@@ -157,8 +173,20 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config %q: %w", path, err)
 	}
-	if err := yaml.Unmarshal(content, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple YAML documents are not supported")
+		}
+		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
+	}
+	if err := validateExplicitValues(cfg); err != nil {
+		return Config{}, fmt.Errorf("validate config %q: %w", path, err)
 	}
 
 	cfg = Derive(cfg)
@@ -168,19 +196,57 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+// validateExplicitValues runs before Derive so negative values supplied by a
+// configuration file cannot be silently replaced with runtime defaults. Zero
+// retains the existing documented meaning of "use the default" (except for
+// cache sizes and TTLs, where an explicit zero disables that cache).
+func validateExplicitValues(c Config) error {
+	switch {
+	case c.TickInterval < 0:
+		return errors.New("tick_interval must not be negative")
+	case c.SocketIndexInterval < 0:
+		return errors.New("socket_index_interval must not be negative")
+	case c.Retention.MinuteDays < 0:
+		return errors.New("retention.minute_days must not be negative")
+	case c.Retention.HourMonths < 0:
+		return errors.New("retention.hour_months must not be negative")
+	case c.Retention.DayMonths < 0:
+		return errors.New("retention.day_months must not be negative")
+	case c.Retention.EvidenceDays < 0:
+		return errors.New("retention.evidence_days must not be negative")
+	case c.Retention.ChainDays < 0:
+		return errors.New("retention.chain_days must not be negative")
+	case c.Prefetch.Interval < 0:
+		return errors.New("prefetch.interval must not be negative")
+	case c.Prefetch.EvidenceLookback < 0:
+		return errors.New("prefetch.evidence_lookback must not be negative")
+	case c.Prefetch.ChainLookback < 0:
+		return errors.New("prefetch.chain_lookback must not be negative")
+	case c.Prefetch.ScanBudget < 0:
+		return errors.New("prefetch.scan_budget must not be negative")
+	case c.Prefetch.MaxScanFiles < 0:
+		return errors.New("prefetch.max_scan_files must not be negative")
+	case c.Prefetch.MaxScanLinesPerFile < 0:
+		return errors.New("prefetch.max_scan_lines_per_file must not be negative")
+	default:
+		return nil
+	}
+}
+
 // Derive applies runtime defaults to a Config value.
 // Use this when a Config is constructed in-memory (without Load) before wiring services.
 func Derive(cfg Config) Config {
+	cfg.Listen = strings.TrimSpace(cfg.Listen)
 	if cfg.Listen == "" {
 		cfg.Listen = defaultListen
 	}
 	if cfg.DBPath == "" {
 		cfg.DBPath = defaultDBPath
 	}
-	if cfg.TickInterval <= 0 {
+	if cfg.TickInterval == 0 {
 		cfg.TickInterval = defaultTickInterval
 	}
-	if cfg.SocketIndexInterval <= 0 {
+	if cfg.SocketIndexInterval == 0 {
 		cfg.SocketIndexInterval = defaultSocketIndexInterval
 	}
 	if cfg.ProcFS == "" {
@@ -191,41 +257,37 @@ func Derive(cfg Config) Config {
 	}
 	cfg.NetworkInterfaces = normalizeStringList(cfg.NetworkInterfaces)
 	cfg.ProcessLogDirs = normalizeProcessLogDirs(cfg.ProcessLogDirs)
-	if cfg.ShadowsocksJournalFallback == nil {
-		enableShadowsocksJournalFallback := false
-		cfg.ShadowsocksJournalFallback = &enableShadowsocksJournalFallback
-	}
-	if cfg.Retention.MinuteDays <= 0 {
+	if cfg.Retention.MinuteDays == 0 {
 		cfg.Retention.MinuteDays = 7
 	}
-	if cfg.Retention.HourMonths <= 0 {
+	if cfg.Retention.HourMonths == 0 {
 		cfg.Retention.HourMonths = 3
 	}
-	if cfg.Retention.DayMonths <= 0 {
+	if cfg.Retention.DayMonths == 0 {
 		cfg.Retention.DayMonths = 12
 	}
-	if cfg.Retention.EvidenceDays <= 0 {
+	if cfg.Retention.EvidenceDays == 0 {
 		cfg.Retention.EvidenceDays = 14
 	}
-	if cfg.Retention.ChainDays <= 0 {
+	if cfg.Retention.ChainDays == 0 {
 		cfg.Retention.ChainDays = 14
 	}
-	if cfg.Prefetch.Interval <= 0 {
+	if cfg.Prefetch.Interval == 0 {
 		cfg.Prefetch.Interval = defaultPrefetchInterval
 	}
-	if cfg.Prefetch.EvidenceLookback <= 0 {
+	if cfg.Prefetch.EvidenceLookback == 0 {
 		cfg.Prefetch.EvidenceLookback = 20 * time.Minute
 	}
-	if cfg.Prefetch.ChainLookback <= 0 {
+	if cfg.Prefetch.ChainLookback == 0 {
 		cfg.Prefetch.ChainLookback = 20 * time.Minute
 	}
-	if cfg.Prefetch.ScanBudget <= 0 {
+	if cfg.Prefetch.ScanBudget == 0 {
 		cfg.Prefetch.ScanBudget = defaultPrefetchScanBudget
 	}
-	if cfg.Prefetch.MaxScanFiles <= 0 {
+	if cfg.Prefetch.MaxScanFiles == 0 {
 		cfg.Prefetch.MaxScanFiles = defaultPrefetchMaxFiles
 	}
-	if cfg.Prefetch.MaxScanLinesPerFile <= 0 {
+	if cfg.Prefetch.MaxScanLinesPerFile == 0 {
 		cfg.Prefetch.MaxScanLinesPerFile = defaultPrefetchMaxLines
 	}
 	if cfg.Cache.CountCacheSize == 0 && !cfg.Cache.countCacheSizeSet {
@@ -288,12 +350,18 @@ func normalizeStringList(values []string) []string {
 }
 
 func (c Config) Validate() error {
-	authConfigured := c.Auth.Username != "" || c.Auth.Password != ""
+	username := strings.TrimSpace(c.Auth.Username)
+	password := strings.TrimSpace(c.Auth.Password)
+	authProvided := c.Auth.Username != "" || c.Auth.Password != ""
+	authConfigured := username != "" && password != ""
+	if err := validateListenAddress(c.Listen); err != nil {
+		return err
+	}
 	switch {
-	case c.Listen == "":
-		return errors.New("listen must not be empty")
 	case c.DBPath == "":
 		return errors.New("db_path must not be empty")
+	case strings.ContainsAny(c.DBPath, "\x00\r\n"):
+		return errors.New("db_path must not contain NUL or line breaks")
 	case c.TickInterval <= 0:
 		return errors.New("tick_interval must be positive")
 	case c.SocketIndexInterval <= 0:
@@ -308,7 +376,7 @@ func (c Config) Validate() error {
 		return errors.New("retention.evidence_days must be positive")
 	case c.Retention.ChainDays <= 0:
 		return errors.New("retention.chain_days must be positive")
-	case authConfigured && (c.Auth.Username == "" || c.Auth.Password == ""):
+	case authProvided && !authConfigured:
 		return errors.New("auth.username and auth.password must both be set when auth is configured")
 	case !authConfigured && !isLoopbackListenAddress(c.Listen):
 		return errors.New("auth.username and auth.password are required when listen is not loopback")
@@ -337,12 +405,81 @@ func (c Config) Validate() error {
 	}
 }
 
+func validateListenAddress(listen string) error {
+	trimmed := strings.TrimSpace(listen)
+	if trimmed == "" {
+		return errors.New("listen must not be empty")
+	}
+	host, portText, err := net.SplitHostPort(trimmed)
+	if err != nil {
+		return fmt.Errorf("listen must be a valid host:port address: %w", err)
+	}
+	for _, char := range portText {
+		if char < '0' || char > '9' {
+			return errors.New("listen port must contain decimal digits only")
+		}
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("listen port must be an integer between 1 and 65535")
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil
+	}
+	addressHost := host
+	if zoneIndex := strings.LastIndexByte(addressHost, '%'); zoneIndex > 0 {
+		zone := addressHost[zoneIndex+1:]
+		if !strings.Contains(addressHost[:zoneIndex], ":") || !validZone(zone) {
+			return errors.New("listen IPv6 zone is invalid")
+		}
+		addressHost = addressHost[:zoneIndex]
+	}
+	if net.ParseIP(addressHost) == nil && !validHostname(host) {
+		return errors.New("listen host must be an IP address or valid DNS hostname")
+	}
+	return nil
+}
+
+func validZone(zone string) bool {
+	if zone == "" {
+		return false
+	}
+	for _, char := range zone {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '_' && char != '.' && char != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validHostname(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func isLoopbackListenAddress(listen string) bool {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(listen))
 	if err != nil {
-		host = strings.TrimSpace(listen)
+		return false
 	}
 	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if zoneIndex := strings.LastIndexByte(host, '%'); zoneIndex > 0 {
+		host = host[:zoneIndex]
+	}
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}

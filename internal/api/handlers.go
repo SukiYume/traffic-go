@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -12,16 +13,46 @@ import (
 	"strings"
 	"time"
 
+	"traffic-go/internal/buildinfo"
 	"traffic-go/internal/model"
 	"traffic-go/internal/store"
 )
 
 type envelope map[string]any
 
-const processSuggestionLimit = 200
+const (
+	processSuggestionLimit   = 200
+	maxCachedTopRows         = 5000
+	maxCachedTopBytes        = 8 << 20
+	maxCombinedTopCacheBytes = 16 << 20
+	maxPageNumber            = 1_000_000
+	maxPageSize              = 200
+	maxCursorLimit           = 500
+	maxQueryWindow           = 370 * 24 * time.Hour
+)
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, envelope{"ok": true})
+	writeJSON(w, http.StatusOK, envelope{"ok": true, "status": "alive", "build": buildinfo.Current()})
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	readiness := s.runtime.ReadyStatus()
+	storeReady := s.store.Readiness(ctx) == nil
+	collectorReady := readiness.SnapshotReady && readiness.CollectionFresh
+	status := http.StatusOK
+	if !storeReady || !collectorReady {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, envelope{
+		"ok":              status == http.StatusOK,
+		"status":          map[bool]string{true: "ready", false: "not_ready"}[status == http.StatusOK],
+		"store_ready":     storeReady,
+		"collector_ready": collectorReady,
+		"collector_fresh": readiness.CollectionFresh,
+		"build":           buildinfo.Current(),
+	})
 }
 
 func (s *Server) handleCollectorDiagnostics(w http.ResponseWriter, _ *http.Request) {
@@ -31,7 +62,7 @@ func (s *Server) handleCollectorDiagnostics(w http.ResponseWriter, _ *http.Reque
 func (s *Server) handleStoreDiagnostics(w http.ResponseWriter, r *http.Request) {
 	diagnostics, err := s.store.Diagnostics(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope{"data": diagnostics})
@@ -40,7 +71,7 @@ func (s *Server) handleStoreDiagnostics(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	processes, err := s.store.QueryKnownProcesses(r.Context(), processSuggestionLimit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
 	processes = mergeProcessListItems(s.runtime.ActiveProcesses(), processes)
@@ -60,6 +91,20 @@ type resolvedPagedUsageWindow struct {
 	PageSize     int
 	Offset       int
 	IncludeTotal bool
+}
+
+func (s *Server) summaryCoverage(start, end time.Time, useSummary bool) *store.SummaryCoverage {
+	if !useSummary {
+		return nil
+	}
+	coverage := s.store.SummaryCoverage(start, end)
+	return &coverage
+}
+
+func addSummaryCoverage(payload envelope, coverage *store.SummaryCoverage) {
+	if coverage != nil {
+		payload["coverage"] = *coverage
+	}
 }
 
 func (s *Server) resolveWindowSource(w http.ResponseWriter, r *http.Request, requiresMinute bool) (resolvedUsageWindow, bool) {
@@ -115,30 +160,38 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var stats model.OverviewStats
-	if summaryRequested(r) {
+	_, err = summaryRequested(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err)
+		return
+	}
+	source, ok := s.resolveSourceForWindow(w, start, end, false)
+	if !ok {
+		return
+	}
+	useSummary := source != store.DataSourceMinute
+	if useSummary {
 		stats, err = s.store.QueryOverviewSummary(r.Context(), start, end)
 	} else {
-		source, ok := s.resolveSourceForWindow(w, start, end, false)
-		if !ok {
-			return
-		}
 		stats, err = s.store.QueryOverview(r.Context(), start, end, source)
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
 	activeStats := s.runtime.ActiveStats()
 	stats.ActiveConnections = activeStats.Connections
 	stats.ActiveProcesses = activeStats.Processes
 	stats.Range = rangeLabel
-	writeJSON(w, http.StatusOK, envelope{"data": stats})
+	payload := envelope{"data": stats}
+	addSummaryCoverage(payload, s.summaryCoverage(start, end, useSummary))
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleMonthlyUsage(w http.ResponseWriter, r *http.Request) {
 	summaries, err := s.store.QueryMonthlyUsage(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope{"data": summaries})
@@ -153,45 +206,78 @@ func (s *Server) handleTimeseries(w http.ResponseWriter, r *http.Request) {
 	var pidFilter *int
 	if pidValue := r.URL.Query().Get("pid"); pidValue != "" {
 		pid, err := strconv.Atoi(pidValue)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_timeseries_query", fmt.Errorf("invalid pid: %w", err))
+		if err != nil || pid < 0 || pid > int(^uint32(0)>>1) {
+			writeError(w, http.StatusBadRequest, "invalid_timeseries_query", fmt.Errorf("invalid pid"))
 			return
 		}
 		pidFilter = &pid
 	}
-	exeFilter := r.URL.Query().Get("exe")
+	exeFilter := strings.TrimSpace(r.URL.Query().Get("exe"))
+	commFilter := strings.TrimSpace(r.URL.Query().Get("comm"))
+	if len(commFilter) > 128 || len(exeFilter) > 4096 {
+		writeError(w, http.StatusBadRequest, "invalid_timeseries_query", fmt.Errorf("process filter is too long"))
+		return
+	}
+	groupBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("group_by")))
+	if !oneOf(groupBy, "", "direction", "comm", "remote_ip") {
+		writeError(w, http.StatusBadRequest, "invalid_timeseries_query", fmt.Errorf("invalid group_by"))
+		return
+	}
+	direction := model.Direction(strings.TrimSpace(r.URL.Query().Get("direction")))
+	if !validDirection(direction) {
+		writeError(w, http.StatusBadRequest, "invalid_timeseries_query", fmt.Errorf("invalid direction"))
+		return
+	}
+	proto := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("proto")))
+	if !validProto(proto) {
+		writeError(w, http.StatusBadRequest, "invalid_timeseries_query", fmt.Errorf("invalid proto"))
+		return
+	}
+	remoteIP := strings.TrimSpace(r.URL.Query().Get("remote_ip"))
+	if err := validateOptionalIP(remoteIP, "remote_ip"); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_timeseries_query", err)
+		return
+	}
 	requiresMinute := pidFilter != nil || exeFilter != ""
 	source, ok := s.resolveSourceForWindow(w, start, end, requiresMinute)
 	if !ok {
 		return
 	}
-	bucket := parseBucket(r.URL.Query().Get("bucket"))
-	if r.URL.Query().Get("bucket") == "" {
-		bucket = defaultBucketForWindow(end.Sub(start), source)
+	bucket, err := resolveTimeseriesBucket(r.URL.Query().Get("bucket"), end.Sub(start), source)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_timeseries_query", err)
+		return
 	}
-	if source == store.DataSourceDay && bucket < 24*time.Hour {
-		bucket = 24 * time.Hour
-	}
-	if source == store.DataSourceHour && bucket < time.Hour {
-		bucket = time.Hour
-	}
-	points, err := s.store.QueryTimeseries(r.Context(), model.TimeseriesQuery{
+	timeseriesQuery := model.TimeseriesQuery{
 		Start:     start,
 		End:       end,
 		Bucket:    bucket,
-		GroupBy:   r.URL.Query().Get("group_by"),
-		Comm:      r.URL.Query().Get("comm"),
+		GroupBy:   groupBy,
+		Comm:      commFilter,
 		Exe:       exeFilter,
-		RemoteIP:  r.URL.Query().Get("remote_ip"),
-		Direction: model.Direction(r.URL.Query().Get("direction")),
-		Proto:     r.URL.Query().Get("proto"),
+		RemoteIP:  remoteIP,
+		Direction: direction,
+		Proto:     proto,
 		PID:       pidFilter,
-	}, source)
+	}
+	var points []model.TimeseriesPoint
+	dataSource := source
+	if source == store.DataSourceMinute {
+		points, err = s.store.QueryTimeseries(r.Context(), timeseriesQuery, source)
+	} else {
+		points, dataSource, err = s.store.QueryTimeseriesSummary(r.Context(), timeseriesQuery)
+	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		if errors.Is(err, store.ErrTimeseriesPointLimit) {
+			writeError(w, http.StatusUnprocessableEntity, "timeseries_too_large", err)
+			return
+		}
+		s.writeInternalError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope{"data_source": source, "data": points})
+	payload := envelope{"data_source": dataSource, "data": points}
+	addSummaryCoverage(payload, s.summaryCoverage(start, end, source != store.DataSourceMinute))
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleInterfaceTimeseries(w http.ResponseWriter, r *http.Request) {
@@ -204,15 +290,10 @@ func (s *Server) handleInterfaceTimeseries(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	bucket := parseBucket(r.URL.Query().Get("bucket"))
-	if r.URL.Query().Get("bucket") == "" {
-		bucket = defaultBucketForWindow(end.Sub(start), source)
-	}
-	if source == store.DataSourceDay && bucket < 24*time.Hour {
-		bucket = 24 * time.Hour
-	}
-	if source == store.DataSourceHour && bucket < time.Hour {
-		bucket = time.Hour
+	bucket, err := resolveTimeseriesBucket(r.URL.Query().Get("bucket"), end.Sub(start), source)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_timeseries_query", err)
+		return
 	}
 	var points []model.InterfaceTimeseriesPoint
 	dataSource := store.InterfaceDataSource(source)
@@ -222,10 +303,16 @@ func (s *Server) handleInterfaceTimeseries(w http.ResponseWriter, r *http.Reques
 		points, dataSource, err = s.store.QueryInterfaceTimeseriesSummary(r.Context(), start, end, bucket)
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		if errors.Is(err, store.ErrTimeseriesPointLimit) {
+			writeError(w, http.StatusUnprocessableEntity, "timeseries_too_large", err)
+			return
+		}
+		s.writeInternalError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope{"data_source": dataSource, "data": points})
+	payload := envelope{"data_source": dataSource, "data": points}
+	addSummaryCoverage(payload, s.summaryCoverage(start, end, source != store.DataSourceMinute))
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
@@ -241,19 +328,32 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	totalRowsExact := query.IncludeTotal
 	totalRows := 0
 	fetchQuery := query
+	useSummary := source != store.DataSourceMinute
 	if query.UsePage && query.IncludeTotal {
-		totalRows, err = s.lookupUsageCount(r.Context(), query, source, normalizedRangeKey(r))
+		if useSummary {
+			totalRows, err = s.lookupUsageSummaryCount(r.Context(), query, source, normalizedRangeKey(r))
+		} else {
+			totalRows, err = s.lookupUsageCount(r.Context(), query, source, normalizedRangeKey(r))
+		}
 		if err != nil {
 			if errors.Is(err, store.ErrDimensionUnavailable) {
 				writeDimensionError(w, err)
 				return
 			}
-			writeError(w, http.StatusInternalServerError, "internal_error", err)
+			s.writeInternalError(w, r, err)
 			return
 		}
 		fetchQuery.IncludeTotal = false
 	}
-	records, nextCursor, pageTotalRows, err := s.store.QueryUsage(r.Context(), fetchQuery, source)
+	var records []model.UsageRecord
+	var nextCursor string
+	var pageTotalRows int
+	dataSource := source
+	if useSummary {
+		records, nextCursor, pageTotalRows, dataSource, err = s.store.QueryUsageSummary(r.Context(), fetchQuery)
+	} else {
+		records, nextCursor, pageTotalRows, err = s.store.QueryUsage(r.Context(), fetchQuery, source)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrDimensionUnavailable) {
 			writeDimensionError(w, err)
@@ -263,22 +363,13 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_usage_query", err)
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
 	if !totalRowsExact {
 		totalRows = pageTotalRows
 	}
-	writeJSON(w, http.StatusOK, envelope{
-		"data_source":      source,
-		"data":             records,
-		"next_cursor":      nextCursor,
-		"total_rows":       totalRows,
-		"total_rows_exact": totalRowsExact,
-		"has_more":         pagedHasMore(query.UsePage, totalRows, query.Page, query.PageSize, nextCursor),
-		"page":             query.Page,
-		"page_size":        query.PageSize,
-	})
+	writePagedData(w, dataSource, records, nextCursor, totalRows, query.UsePage, query.Page, query.PageSize, totalRowsExact, s.summaryCoverage(query.Start, query.End, useSummary))
 }
 
 func (s *Server) lookupUsageCount(ctx context.Context, query model.UsageQuery, source string, rangeKey string) (int, error) {
@@ -294,33 +385,84 @@ func (s *Server) handleTopProcesses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	groupBy := r.URL.Query().Get("group_by")
-	sortBy := r.URL.Query().Get("sort_by")
-	sortOrder := r.URL.Query().Get("sort_order")
-	useSummary := summaryRequested(r)
+	groupBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("group_by")))
+	sortBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort_by")))
+	sortOrder := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort_order")))
+	if !oneOf(groupBy, "", "pid", "comm") ||
+		!oneOf(sortBy, "", "bytes_total", "total", "bytes_up", "bytes_down", "flow_count", "comm", "pid") ||
+		!validSortOrder(sortOrder) {
+		writeError(w, http.StatusBadRequest, "invalid_query", fmt.Errorf("invalid top-process query"))
+		return
+	}
+	_, err := summaryRequested(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err)
+		return
+	}
+	useSummary := window.Source != store.DataSourceMinute
 	rangeKey := normalizedRangeKey(r)
 	startBucket, endBucket, archived := quantizeWindow(rangeKey, window.Start.Unix(), window.End.Unix())
 	cacheKey := topProcessesCacheKey(useSummary, window.Source, rangeKey, startBucket, endBucket, groupBy)
-	entries, source, err := s.lookupOrLoadTopProcesses(r.Context(), cacheKey, archived, useSummary, window, groupBy)
+	entry, err := s.lookupOrLoadTopProcesses(r.Context(), cacheKey, archived, useSummary, window, groupBy)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
-	sorted := sortProcessSummaries(entries, sortBy, sortOrder)
+	if entry.tooLarge {
+		var rows []model.ProcessSummary
+		var total int
+		source := window.Source
+		if useSummary {
+			rows, total, source, err = s.store.QueryTopProcessesSummary(r.Context(), window.Start, window.End, groupBy, sortBy, sortOrder, window.PageSize, window.Offset, window.IncludeTotal)
+		} else {
+			rows, total, err = s.store.QueryTopProcesses(r.Context(), window.Start, window.End, window.Source, groupBy, sortBy, sortOrder, window.PageSize, window.Offset, window.IncludeTotal)
+		}
+		if err != nil {
+			s.writeInternalError(w, r, err)
+			return
+		}
+		writePagedData(w, source, rows, "", total, true, window.Page, window.PageSize, window.IncludeTotal, s.summaryCoverage(window.Start, window.End, useSummary))
+		return
+	}
+	sorted := sortProcessSummaries(entry.rows, sortBy, sortOrder)
 	page := pageSlice(sorted, window.Page, window.PageSize)
-	writePagedData(w, source, page, len(sorted), window.Page, window.PageSize, true)
+	writePagedData(w, entry.source, page, "", len(sorted), true, window.Page, window.PageSize, true, s.summaryCoverage(window.Start, window.End, useSummary))
 }
 
-func (s *Server) lookupOrLoadTopProcesses(ctx context.Context, key string, archived bool, useSummary bool, window resolvedPagedUsageWindow, groupBy string) ([]model.ProcessSummary, string, error) {
-	entry, err := loadCachedTop(ctx, s.processCache, &s.processSF, key, s.cacheTTL(archived), func(ctx context.Context) (cachedTop[model.ProcessSummary], error) {
-		if useSummary {
-			rows, source, err := s.store.QueryTopProcessesSummaryAll(ctx, window.Start, window.End, groupBy)
-			return cachedTop[model.ProcessSummary]{rows: rows, source: source}, err
-		}
-		rows, err := s.store.QueryTopProcessesAll(ctx, window.Start, window.End, window.Source, groupBy)
-		return cachedTop[model.ProcessSummary]{rows: rows, source: window.Source}, err
+func (s *Server) lookupUsageSummaryCount(ctx context.Context, query model.UsageQuery, source string, rangeKey string) (int, error) {
+	startBucket, endBucket, archived := quantizeWindow(rangeKey, query.Start.Unix(), query.End.Unix())
+	key := usageCountCacheKey("summary:"+source, rangeKey, startBucket, endBucket, query)
+	return loadCachedCount(ctx, s.countCache, &s.countSF, key, s.cacheTTL(archived), func(ctx context.Context) (int, error) {
+		total, _, err := s.store.QueryUsageSummaryCount(ctx, query)
+		return total, err
 	})
-	return entry.rows, entry.source, err
+}
+
+func (s *Server) lookupOrLoadTopProcesses(ctx context.Context, key string, archived bool, useSummary bool, window resolvedPagedUsageWindow, groupBy string) (cachedTop[model.ProcessSummary], error) {
+	entry, err := loadCachedTop(ctx, s.processCache, &s.processSF, key, s.cacheTTL(archived), func(ctx context.Context) (cachedTop[model.ProcessSummary], error) {
+		var result cachedTop[model.ProcessSummary]
+		if useSummary {
+			rows, source, err := s.store.QueryTopProcessesSummaryAllLimited(ctx, window.Start, window.End, groupBy, maxCachedTopRows+1)
+			result = cachedTop[model.ProcessSummary]{rows: rows, source: source}
+			if err != nil {
+				return result, err
+			}
+		} else {
+			rows, err := s.store.QueryTopProcessesAllLimited(ctx, window.Start, window.End, window.Source, groupBy, maxCachedTopRows+1)
+			result = cachedTop[model.ProcessSummary]{rows: rows, source: window.Source}
+			if err != nil {
+				return result, err
+			}
+		}
+		result.weight = topProcessesCacheBytes(result.rows)
+		if len(result.rows) > maxCachedTopRows || result.weight > maxCachedTopBytes {
+			result.rows = nil
+			result.tooLarge = true
+			result.weight = 64
+		}
+		return result, nil
+	})
+	return entry, err
 }
 
 func topProcessesCacheKey(summary bool, source string, rangeKey string, startBucket int64, endBucket int64, groupBy string) string {
@@ -334,39 +476,110 @@ func (s *Server) handleTopRemotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	includeLoopback := true
+	var err error
 	if r.URL.Query().Has("include_loopback") {
-		includeLoopback = parseBoolFlag(r.URL.Query().Get("include_loopback"))
+		includeLoopback, err = parseOptionalBool(r.URL.Query(), "include_loopback")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_query", err)
+			return
+		}
 	}
-	if parseBoolFlag(r.URL.Query().Get("exclude_loopback")) {
+	excludeLoopback, err := parseOptionalBool(r.URL.Query(), "exclude_loopback")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err)
+		return
+	}
+	if excludeLoopback {
 		includeLoopback = false
 	}
-	direction := model.Direction(r.URL.Query().Get("direction"))
-	sortBy := r.URL.Query().Get("sort_by")
-	sortOrder := r.URL.Query().Get("sort_order")
-	useSummary := summaryRequested(r)
+	direction := model.Direction(strings.ToLower(strings.TrimSpace(r.URL.Query().Get("direction"))))
+	sortBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort_by")))
+	sortOrder := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort_order")))
+	if !validDirection(direction) ||
+		!oneOf(sortBy, "", "bytes_total", "total", "bytes_up", "bytes_down", "flow_count", "remote_ip", "direction") ||
+		!validSortOrder(sortOrder) {
+		writeError(w, http.StatusBadRequest, "invalid_query", fmt.Errorf("invalid top-remote query"))
+		return
+	}
+	_, err = summaryRequested(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err)
+		return
+	}
+	useSummary := window.Source != store.DataSourceMinute
 	rangeKey := normalizedRangeKey(r)
 	startBucket, endBucket, archived := quantizeWindow(rangeKey, window.Start.Unix(), window.End.Unix())
 	cacheKey := topRemotesCacheKey(useSummary, window.Source, rangeKey, startBucket, endBucket, direction, includeLoopback)
-	entries, source, err := s.lookupOrLoadTopRemotes(r.Context(), cacheKey, archived, useSummary, window, direction, includeLoopback)
+	entry, err := s.lookupOrLoadTopRemotes(r.Context(), cacheKey, archived, useSummary, window, direction, includeLoopback)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
-	sorted := sortRemoteSummaries(entries, sortBy, sortOrder)
+	if entry.tooLarge {
+		var rows []model.RemoteSummary
+		var total int
+		source := window.Source
+		if useSummary {
+			rows, total, source, err = s.store.QueryTopRemotesSummary(r.Context(), window.Start, window.End, direction, includeLoopback, sortBy, sortOrder, window.PageSize, window.Offset, window.IncludeTotal)
+		} else {
+			rows, total, err = s.store.QueryTopRemotes(r.Context(), window.Start, window.End, window.Source, direction, includeLoopback, sortBy, sortOrder, window.PageSize, window.Offset, window.IncludeTotal)
+		}
+		if err != nil {
+			s.writeInternalError(w, r, err)
+			return
+		}
+		writePagedData(w, source, rows, "", total, true, window.Page, window.PageSize, window.IncludeTotal, s.summaryCoverage(window.Start, window.End, useSummary))
+		return
+	}
+	sorted := sortRemoteSummaries(entry.rows, sortBy, sortOrder)
 	page := pageSlice(sorted, window.Page, window.PageSize)
-	writePagedData(w, source, page, len(sorted), window.Page, window.PageSize, true)
+	writePagedData(w, entry.source, page, "", len(sorted), true, window.Page, window.PageSize, true, s.summaryCoverage(window.Start, window.End, useSummary))
 }
 
-func (s *Server) lookupOrLoadTopRemotes(ctx context.Context, key string, archived bool, useSummary bool, window resolvedPagedUsageWindow, direction model.Direction, includeLoopback bool) ([]model.RemoteSummary, string, error) {
+func (s *Server) lookupOrLoadTopRemotes(ctx context.Context, key string, archived bool, useSummary bool, window resolvedPagedUsageWindow, direction model.Direction, includeLoopback bool) (cachedTop[model.RemoteSummary], error) {
 	entry, err := loadCachedTop(ctx, s.remoteCache, &s.remoteSF, key, s.cacheTTL(archived), func(ctx context.Context) (cachedTop[model.RemoteSummary], error) {
+		var result cachedTop[model.RemoteSummary]
 		if useSummary {
-			rows, source, err := s.store.QueryTopRemotesSummaryAll(ctx, window.Start, window.End, direction, includeLoopback)
-			return cachedTop[model.RemoteSummary]{rows: rows, source: source}, err
+			rows, source, err := s.store.QueryTopRemotesSummaryAllLimited(ctx, window.Start, window.End, direction, includeLoopback, maxCachedTopRows+1)
+			result = cachedTop[model.RemoteSummary]{rows: rows, source: source}
+			if err != nil {
+				return result, err
+			}
+		} else {
+			rows, err := s.store.QueryTopRemotesAllLimited(ctx, window.Start, window.End, window.Source, direction, includeLoopback, maxCachedTopRows+1)
+			result = cachedTop[model.RemoteSummary]{rows: rows, source: window.Source}
+			if err != nil {
+				return result, err
+			}
 		}
-		rows, err := s.store.QueryTopRemotesAll(ctx, window.Start, window.End, window.Source, direction, includeLoopback)
-		return cachedTop[model.RemoteSummary]{rows: rows, source: window.Source}, err
+		result.weight = topRemotesCacheBytes(result.rows)
+		if len(result.rows) > maxCachedTopRows || result.weight > maxCachedTopBytes {
+			result.rows = nil
+			result.tooLarge = true
+			result.weight = 64
+		}
+		return result, nil
 	})
-	return entry.rows, entry.source, err
+	return entry, err
+}
+
+func topProcessesCacheBytes(rows []model.ProcessSummary) int64 {
+	bytes := int64(len(rows) * 96)
+	for _, row := range rows {
+		bytes += int64(len(row.Comm))
+		if row.Exe != nil {
+			bytes += int64(len(*row.Exe))
+		}
+	}
+	return bytes
+}
+
+func topRemotesCacheBytes(rows []model.RemoteSummary) int64 {
+	bytes := int64(len(rows) * 72)
+	for _, row := range rows {
+		bytes += int64(len(row.RemoteIP))
+	}
+	return bytes
 }
 
 func topRemotesCacheKey(summary bool, source string, rangeKey string, startBucket int64, endBucket int64, direction model.Direction, includeLoopback bool) string {
@@ -383,22 +596,35 @@ func (s *Server) handleTop(
 	r *http.Request,
 	queryFunc func(context.Context, time.Time, time.Time, string, string) ([]model.TopEntry, error),
 ) {
+	by := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("by")))
+	if !oneOf(by, "", "total", "bytes_up", "bytes_down") {
+		writeError(w, http.StatusBadRequest, "invalid_query", fmt.Errorf("invalid top-port query"))
+		return
+	}
 	window, ok := s.resolveWindowSource(w, r, false)
 	if !ok {
 		return
 	}
-	if summaryRequested(r) {
-		entries, source, err := s.store.QueryTopPortsSummary(r.Context(), window.Start, window.End, r.URL.Query().Get("by"))
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error", err)
-			return
-		}
-		writeJSON(w, http.StatusOK, envelope{"data_source": source, "data": entries})
+	_, err := summaryRequested(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err)
 		return
 	}
-	entries, err := queryFunc(r.Context(), window.Start, window.End, window.Source, r.URL.Query().Get("by"))
+	useSummary := window.Source != store.DataSourceMinute
+	if useSummary {
+		entries, source, err := s.store.QueryTopPortsSummary(r.Context(), window.Start, window.End, by)
+		if err != nil {
+			s.writeInternalError(w, r, err)
+			return
+		}
+		payload := envelope{"data_source": source, "data": entries}
+		addSummaryCoverage(payload, s.summaryCoverage(window.Start, window.End, true))
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+	entries, err := queryFunc(r.Context(), window.Start, window.End, window.Source, by)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope{"data_source": window.Source, "data": entries})
@@ -417,44 +643,59 @@ func (s *Server) handleForwardUsage(w http.ResponseWriter, r *http.Request) {
 	totalRowsExact := query.IncludeTotal
 	totalRows := 0
 	fetchQuery := query
+	useSummary := source != store.DataSourceMinute
 	if query.UsePage && query.IncludeTotal {
-		totalRows, err = s.lookupForwardUsageCount(r.Context(), query, source, normalizedRangeKey(r))
+		if useSummary {
+			totalRows, err = s.lookupForwardUsageSummaryCount(r.Context(), query, source, normalizedRangeKey(r))
+		} else {
+			totalRows, err = s.lookupForwardUsageCount(r.Context(), query, source, normalizedRangeKey(r))
+		}
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error", err)
+			s.writeInternalError(w, r, err)
 			return
 		}
 		fetchQuery.IncludeTotal = false
 	}
-	records, nextCursor, pageTotalRows, err := s.store.QueryForwardUsage(r.Context(), fetchQuery, source)
+	var records []model.ForwardUsageRecord
+	var nextCursor string
+	var pageTotalRows int
+	dataSource := store.ForwardDataSource(source)
+	if useSummary {
+		records, nextCursor, pageTotalRows, dataSource, err = s.store.QueryForwardUsageSummary(r.Context(), fetchQuery)
+	} else {
+		records, nextCursor, pageTotalRows, err = s.store.QueryForwardUsage(r.Context(), fetchQuery, source)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrCursorSortUnsupported) {
 			writeError(w, http.StatusBadRequest, "invalid_forward_query", err)
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
 	if !totalRowsExact {
 		totalRows = pageTotalRows
 	}
-	writeJSON(w, http.StatusOK, envelope{
-		"data_source":      store.ForwardDataSource(source),
-		"data":             records,
-		"next_cursor":      nextCursor,
-		"total_rows":       totalRows,
-		"total_rows_exact": totalRowsExact,
-		"has_more":         pagedHasMore(query.UsePage, totalRows, query.Page, query.PageSize, nextCursor),
-		"page":             query.Page,
-		"page_size":        query.PageSize,
+	writePagedData(w, dataSource, records, nextCursor, totalRows, query.UsePage, query.Page, query.PageSize, totalRowsExact, s.summaryCoverage(query.Start, query.End, useSummary))
+}
+
+func (s *Server) lookupForwardUsageSummaryCount(ctx context.Context, query model.ForwardQuery, source string, rangeKey string) (int, error) {
+	return s.lookupForwardUsageCountCached(ctx, query, "summary:"+source, rangeKey, func(ctx context.Context) (int, error) {
+		total, _, err := s.store.QueryForwardUsageSummaryCount(ctx, query)
+		return total, err
 	})
 }
 
 func (s *Server) lookupForwardUsageCount(ctx context.Context, query model.ForwardQuery, source string, rangeKey string) (int, error) {
-	startBucket, endBucket, archived := quantizeWindow(rangeKey, query.Start.Unix(), query.End.Unix())
-	key := forwardCountCacheKey(source, rangeKey, startBucket, endBucket, query)
-	return loadCachedCount(ctx, s.countCache, &s.countSF, key, s.cacheTTL(archived), func(ctx context.Context) (int, error) {
+	return s.lookupForwardUsageCountCached(ctx, query, source, rangeKey, func(ctx context.Context) (int, error) {
 		return s.store.QueryForwardUsageCount(ctx, query, source)
 	})
+}
+
+func (s *Server) lookupForwardUsageCountCached(ctx context.Context, query model.ForwardQuery, cacheSource string, rangeKey string, load func(context.Context) (int, error)) (int, error) {
+	startBucket, endBucket, archived := quantizeWindow(rangeKey, query.Start.Unix(), query.End.Unix())
+	key := forwardCountCacheKey(cacheSource, rangeKey, startBucket, endBucket, query)
+	return loadCachedCount(ctx, s.countCache, &s.countSF, key, s.cacheTTL(archived), load)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -463,16 +704,19 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func writePagedData(w http.ResponseWriter, source string, data any, totalRows int, page int, pageSize int, totalRowsExact bool) {
-	writeJSON(w, http.StatusOK, envelope{
+func writePagedData(w http.ResponseWriter, source string, data any, nextCursor string, totalRows int, usePage bool, page int, pageSize int, totalRowsExact bool, coverage *store.SummaryCoverage) {
+	payload := envelope{
 		"data_source":      source,
 		"data":             data,
+		"next_cursor":      nextCursor,
 		"total_rows":       totalRows,
 		"total_rows_exact": totalRowsExact,
-		"has_more":         pagedHasMore(true, totalRows, page, pageSize, ""),
+		"has_more":         pagedHasMore(usePage, totalRows, page, pageSize, nextCursor),
 		"page":             page,
 		"page_size":        pageSize,
-	})
+	}
+	addSummaryCoverage(payload, coverage)
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func pagedHasMore(usePage bool, totalRows int, page int, pageSize int, nextCursor string) bool {
@@ -485,14 +729,62 @@ func pagedHasMore(usePage bool, totalRows int, page int, pageSize int, nextCurso
 	return totalRows > page*pageSize
 }
 
+func (s *Server) writeInternalError(w http.ResponseWriter, r *http.Request, err error) {
+	requestID := strings.TrimSpace(w.Header().Get("X-Request-ID"))
+	if s.logger != nil {
+		method := "unknown"
+		path := "unknown"
+		if r != nil {
+			method = r.Method
+			path = r.URL.EscapedPath()
+			if len(path) > 256 {
+				path = path[:256]
+			}
+		}
+		errorText := "<nil>"
+		if err != nil {
+			errorText = strings.NewReplacer("\r", `\r`, "\n", `\n`).Replace(err.Error())
+			if len(errorText) > 2048 {
+				errorText = errorText[:2048]
+			}
+		}
+		s.logger.Printf(
+			"request failed method=%s path=%s status=%d code=internal_error request_id=%s error=%s",
+			method,
+			path,
+			http.StatusInternalServerError,
+			requestID,
+			errorText,
+		)
+	}
+	writeError(w, http.StatusInternalServerError, "internal_error", err)
+}
+
 func writeError(w http.ResponseWriter, status int, code string, err error) {
-	writeJSON(w, status, envelope{
+	message := "internal server error"
+	if status < http.StatusInternalServerError {
+		message = err.Error()
+	}
+	payload := envelope{
 		"error":   code,
-		"message": err.Error(),
-	})
+		"message": message,
+	}
+	if status >= http.StatusInternalServerError {
+		if requestID := strings.TrimSpace(w.Header().Get("X-Request-ID")); requestID != "" {
+			payload["request_id"] = requestID
+		}
+	}
+	writeJSON(w, status, payload)
 }
 
 func writeDimensionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrRangeUnavailable) {
+		writeJSON(w, http.StatusUnprocessableEntity, envelope{
+			"error":   "range_unavailable",
+			"message": "the requested start time is older than the retained daily traffic data",
+		})
+		return
+	}
 	if errors.Is(err, store.ErrDimensionUnavailable) {
 		writeJSON(w, http.StatusBadRequest, envelope{
 			"error":   "dimension_unavailable",
@@ -524,7 +816,11 @@ func parseWindowAt(r *http.Request, now time.Time) (time.Time, time.Time, string
 	if err != nil {
 		return time.Time{}, time.Time{}, "", err
 	}
-	end := now.UTC()
+	// Relative windows are defined on minute buckets, matching the finest
+	// persisted resolution. Ceil to the current minute boundary so identical
+	// requests share exact cache keys while still including the in-progress
+	// minute bucket.
+	end := now.UTC().Truncate(time.Minute).Add(time.Minute)
 	start := end.Add(-duration)
 	return normalizeWindow(start, end, rangeLabel)
 }
@@ -563,12 +859,12 @@ func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {
 	query := model.UsageQuery{
 		Start:        start,
 		End:          end,
-		Comm:         r.URL.Query().Get("comm"),
-		Exe:          r.URL.Query().Get("exe"),
-		RemoteIP:     r.URL.Query().Get("remote_ip"),
-		Direction:    model.Direction(r.URL.Query().Get("direction")),
-		Proto:        r.URL.Query().Get("proto"),
-		Attribution:  model.Attribution(r.URL.Query().Get("attribution")),
+		Comm:         strings.TrimSpace(r.URL.Query().Get("comm")),
+		Exe:          strings.TrimSpace(r.URL.Query().Get("exe")),
+		RemoteIP:     strings.TrimSpace(r.URL.Query().Get("remote_ip")),
+		Direction:    model.Direction(strings.TrimSpace(r.URL.Query().Get("direction"))),
+		Proto:        strings.ToLower(strings.TrimSpace(r.URL.Query().Get("proto"))),
+		Attribution:  model.Attribution(strings.TrimSpace(r.URL.Query().Get("attribution"))),
 		Limit:        listParams.Limit,
 		Page:         listParams.Page,
 		PageSize:     listParams.PageSize,
@@ -579,24 +875,36 @@ func parseUsageQuery(r *http.Request) (model.UsageQuery, error) {
 		UsePage:      listParams.UsePage,
 		IncludeTotal: listParams.IncludeTotal,
 	}
+	if len(query.Comm) > 128 || len(query.Exe) > 4096 {
+		return query, fmt.Errorf("process filter is too long")
+	}
+	if err := validateOptionalIP(query.RemoteIP, "remote_ip"); err != nil {
+		return query, err
+	}
+	if !validDirection(query.Direction) || !validProto(query.Proto) || !validAttribution(query.Attribution) {
+		return query, fmt.Errorf("invalid direction, proto, or attribution")
+	}
+	if !oneOf(strings.ToLower(strings.TrimSpace(query.SortBy)), "", "time", "minute_ts", "hour_ts", "bytes_up", "bytes_down", "bytes_total", "flow_count", "remote_ip", "direction", "proto", "local_port", "comm", "pid") || !validSortOrder(query.SortOrder) {
+		return query, fmt.Errorf("invalid sort")
+	}
 	if pidValue := r.URL.Query().Get("pid"); pidValue != "" {
 		pid, err := strconv.Atoi(pidValue)
-		if err != nil {
-			return query, fmt.Errorf("invalid pid: %w", err)
+		if err != nil || pid < 0 || pid > int(^uint32(0)>>1) {
+			return query, fmt.Errorf("invalid pid")
 		}
 		query.PID = &pid
 	}
 	if portValue := r.URL.Query().Get("local_port"); portValue != "" {
 		port, err := strconv.Atoi(portValue)
-		if err != nil {
-			return query, fmt.Errorf("invalid local_port: %w", err)
+		if err != nil || port < 1 || port > 65535 {
+			return query, fmt.Errorf("invalid local_port")
 		}
 		query.LocalPort = &port
 	}
 	if portValue := r.URL.Query().Get("remote_port"); portValue != "" {
 		port, err := strconv.Atoi(portValue)
-		if err != nil {
-			return query, fmt.Errorf("invalid remote_port: %w", err)
+		if err != nil || port < 1 || port > 65535 {
+			return query, fmt.Errorf("invalid remote_port")
 		}
 		query.RemotePort = &port
 	}
@@ -627,9 +935,9 @@ func parseForwardQuery(r *http.Request) (model.ForwardQuery, error) {
 	query := model.ForwardQuery{
 		Start:        start,
 		End:          end,
-		Proto:        r.URL.Query().Get("proto"),
-		OrigSrcIP:    r.URL.Query().Get("orig_src_ip"),
-		OrigDstIP:    r.URL.Query().Get("orig_dst_ip"),
+		Proto:        strings.ToLower(strings.TrimSpace(r.URL.Query().Get("proto"))),
+		OrigSrcIP:    strings.TrimSpace(r.URL.Query().Get("orig_src_ip")),
+		OrigDstIP:    strings.TrimSpace(r.URL.Query().Get("orig_dst_ip")),
 		Limit:        listParams.Limit,
 		Page:         listParams.Page,
 		PageSize:     listParams.PageSize,
@@ -639,6 +947,18 @@ func parseForwardQuery(r *http.Request) (model.ForwardQuery, error) {
 		CursorRowID:  listParams.CursorRowID,
 		UsePage:      listParams.UsePage,
 		IncludeTotal: listParams.IncludeTotal,
+	}
+	if !validProto(query.Proto) {
+		return query, fmt.Errorf("invalid proto")
+	}
+	if err := validateOptionalIP(query.OrigSrcIP, "orig_src_ip"); err != nil {
+		return query, err
+	}
+	if err := validateOptionalIP(query.OrigDstIP, "orig_dst_ip"); err != nil {
+		return query, err
+	}
+	if !oneOf(strings.ToLower(strings.TrimSpace(query.SortBy)), "", "time", "minute_ts", "hour_ts", "bytes_orig", "bytes_reply", "bytes_total", "flow_count", "orig_src_ip", "orig_dst_ip") || !validSortOrder(query.SortOrder) {
+		return query, fmt.Errorf("invalid sort")
 	}
 	if !query.UsePage {
 		if err := validateCursorSort(query.SortBy, query.SortOrder); err != nil {
@@ -670,12 +990,12 @@ func validateCursorSort(sortBy string, sortOrder string) error {
 func parseRange(value string) (time.Duration, error) {
 	value = strings.TrimSpace(value)
 	if strings.HasSuffix(value, "d") {
-		days, err := strconv.Atoi(strings.TrimSuffix(value, "d"))
+		days, err := strconv.ParseInt(strings.TrimSuffix(value, "d"), 10, 32)
 		if err != nil {
 			return 0, err
 		}
-		if days <= 0 {
-			return 0, fmt.Errorf("range must be positive")
+		if days <= 0 || days > 370 {
+			return 0, fmt.Errorf("range must be between 1d and 370d")
 		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
@@ -683,27 +1003,46 @@ func parseRange(value string) (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
-	if duration <= 0 {
-		return 0, fmt.Errorf("range must be positive")
+	if duration <= 0 || duration > maxQueryWindow {
+		return 0, fmt.Errorf("range must be positive and no greater than %s", maxQueryWindow)
 	}
 	return duration, nil
 }
 
-func parseBucket(value string) time.Duration {
+func parseBucket(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
 	if value == "" {
-		return time.Minute
+		return time.Minute, nil
 	}
 	if strings.HasSuffix(value, "d") {
-		days, err := strconv.Atoi(strings.TrimSuffix(value, "d"))
-		if err == nil {
-			return time.Duration(days) * 24 * time.Hour
+		days, err := strconv.ParseInt(strings.TrimSuffix(value, "d"), 10, 32)
+		if err == nil && days > 0 && days <= 370 {
+			return time.Duration(days) * 24 * time.Hour, nil
 		}
+		return 0, fmt.Errorf("invalid bucket")
 	}
 	duration, err := time.ParseDuration(value)
-	if err != nil {
-		return time.Minute
+	if err != nil || duration < time.Minute || duration > maxQueryWindow {
+		return 0, fmt.Errorf("invalid bucket")
 	}
-	return duration
+	return duration, nil
+}
+
+func resolveTimeseriesBucket(value string, window time.Duration, source string) (time.Duration, error) {
+	bucket, err := parseBucket(value)
+	if err != nil {
+		return 0, err
+	}
+	if strings.TrimSpace(value) == "" {
+		bucket = defaultBucketForWindow(window, source)
+	}
+	if source == store.DataSourceDay && bucket < 24*time.Hour {
+		return 24 * time.Hour, nil
+	}
+	if source == store.DataSourceHour && bucket < time.Hour {
+		return time.Hour, nil
+	}
+	return bucket, nil
 }
 
 func defaultBucketForWindow(window time.Duration, source string) time.Duration {
@@ -751,6 +1090,9 @@ func normalizeWindow(start time.Time, end time.Time, label string) (time.Time, t
 	if !end.After(start) {
 		return time.Time{}, time.Time{}, "", fmt.Errorf("end must be after start")
 	}
+	if end.Sub(start) > maxQueryWindow {
+		return time.Time{}, time.Time{}, "", fmt.Errorf("time window exceeds %s", maxQueryWindow)
+	}
 	return start.UTC(), end.UTC(), label, nil
 }
 
@@ -780,14 +1122,34 @@ func parseListQueryParams(query url.Values) (listQueryParams, error) {
 		return listQueryParams{}, err
 	}
 
+	usePage := query.Has("page") || query.Has("page_size")
+	if limit < 1 || limit > maxCursorLimit {
+		return listQueryParams{}, fmt.Errorf("limit must be between 1 and %d", maxCursorLimit)
+	}
+	if page < 1 || page > maxPageNumber {
+		return listQueryParams{}, fmt.Errorf("page must be between 1 and %d", maxPageNumber)
+	}
+	if pageSize < 1 || pageSize > maxPageSize {
+		return listQueryParams{}, fmt.Errorf("page_size must be between 1 and %d", maxPageSize)
+	}
+	includeTotal, err := parseOptionalBool(query, "include_total")
+	if err != nil {
+		return listQueryParams{}, err
+	}
+	if includeTotal && !usePage {
+		return listQueryParams{}, fmt.Errorf("include_total requires page pagination")
+	}
+	if query.Get("cursor") != "" && usePage {
+		return listQueryParams{}, fmt.Errorf("cursor cannot be combined with page pagination")
+	}
 	params := listQueryParams{
 		Limit:        limit,
-		Page:         normalizePositivePage(page),
-		PageSize:     normalizePageSize(pageSize),
-		SortBy:       query.Get("sort_by"),
-		SortOrder:    query.Get("sort_order"),
-		UsePage:      query.Has("page") || query.Has("page_size"),
-		IncludeTotal: parseBoolFlag(query.Get("include_total")),
+		Page:         page,
+		PageSize:     pageSize,
+		SortBy:       strings.ToLower(strings.TrimSpace(query.Get("sort_by"))),
+		SortOrder:    strings.ToLower(strings.TrimSpace(query.Get("sort_order"))),
+		UsePage:      usePage,
+		IncludeTotal: includeTotal,
 	}
 	if cursor := query.Get("cursor"); cursor != "" {
 		ts, rowID, err := store.DecodeCursor(cursor)
@@ -798,24 +1160,6 @@ func parseListQueryParams(query url.Values) (listQueryParams, error) {
 		params.CursorRowID = rowID
 	}
 	return params, nil
-}
-
-func normalizePositivePage(value int) int {
-	if value <= 0 {
-		return 1
-	}
-	return value
-}
-
-func normalizePageSize(value int) int {
-	switch {
-	case value <= 0:
-		return 50
-	case value > 200:
-		return 200
-	default:
-		return value
-	}
 }
 
 func parseIntWithDefault(value string, fallback int, field string) (int, error) {
@@ -830,30 +1174,81 @@ func parseIntWithDefault(value string, fallback int, field string) (int, error) 
 }
 
 func parsePageParams(r *http.Request) (int, int, bool, error) {
+	if strings.TrimSpace(r.URL.Query().Get("cursor")) != "" {
+		return 0, 0, false, fmt.Errorf("cursor pagination is not supported by this endpoint")
+	}
 	page, err := parseIntWithDefault(r.URL.Query().Get("page"), 1, "page")
 	if err != nil {
 		return 0, 0, false, err
 	}
-	page = normalizePositivePage(page)
+	if page < 1 || page > maxPageNumber {
+		return 0, 0, false, fmt.Errorf("page must be between 1 and %d", maxPageNumber)
+	}
 	pageSize, err := parseIntWithDefault(r.URL.Query().Get("page_size"), 25, "page_size")
 	if err != nil {
 		return 0, 0, false, err
 	}
-	pageSize = normalizePageSize(pageSize)
-	return page, pageSize, parseBoolFlag(r.URL.Query().Get("include_total")), nil
+	if pageSize < 1 || pageSize > maxPageSize {
+		return 0, 0, false, fmt.Errorf("page_size must be between 1 and %d", maxPageSize)
+	}
+	includeTotal, err := parseOptionalBool(r.URL.Query(), "include_total")
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return page, pageSize, includeTotal, nil
 }
 
-func parseBoolFlag(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
+func parseOptionalBool(query url.Values, field string) (bool, error) {
+	if !query.Has(field) {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(query.Get(field))) {
 	case "1", "true", "yes", "on":
-		return true
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
 	default:
-		return false
+		return false, fmt.Errorf("invalid %s boolean", field)
 	}
 }
 
-func summaryRequested(r *http.Request) bool {
-	return parseBoolFlag(r.URL.Query().Get("summary"))
+func oneOf(value string, allowed ...string) bool {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func validDirection(value model.Direction) bool {
+	return oneOf(string(value), "", string(model.DirectionIn), string(model.DirectionOut))
+}
+
+func validProto(value string) bool {
+	return oneOf(strings.ToLower(strings.TrimSpace(value)), "", "tcp", "udp")
+}
+
+func validAttribution(value model.Attribution) bool {
+	return oneOf(string(value), "", string(model.AttributionExact), string(model.AttributionHeuristic), string(model.AttributionGuess), string(model.AttributionUnknown))
+}
+
+func validSortOrder(value string) bool {
+	return oneOf(strings.ToLower(strings.TrimSpace(value)), "", "asc", "desc")
+}
+
+func validateOptionalIP(value string, field string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > 64 || net.ParseIP(value) == nil {
+		return fmt.Errorf("invalid %s", field)
+	}
+	return nil
+}
+
+func summaryRequested(r *http.Request) (bool, error) {
+	return parseOptionalBool(r.URL.Query(), "summary")
 }
 
 func mergeProcessListItems(primary []model.ProcessListItem, secondary []model.ProcessListItem) []model.ProcessListItem {

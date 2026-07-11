@@ -2,7 +2,9 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +16,85 @@ import (
 	"traffic-go/internal/model"
 	"traffic-go/internal/store"
 )
+
+func TestUnrepresentableKernelCountersAreDroppedWithoutPoisoningTheBaseline(t *testing.T) {
+	overflow := uint64(math.MaxInt64) + 1
+	if _, ok := representableCounterDelta(overflow, 0); ok {
+		t.Fatal("counter delta above SQLite int64 range must be rejected")
+	}
+	if delta, ok := representableCounterDelta(overflow+9, overflow); !ok || delta != 9 {
+		t.Fatalf("collector must resume after an overflow sample, got delta=%d ok=%v", delta, ok)
+	}
+	if _, ok := representableFlowDelta(model.DirectionOut, overflow, 0, 0, 0); ok {
+		t.Fatal("flow delta above SQLite int64 range must be rejected")
+	}
+
+	service := &Service{}
+	now := time.Unix(1_700_000_000, 0).UTC()
+	flow := model.ConntrackFlow{CTID: 77, Proto: "tcp", OrigBytes: overflow, ReplyBytes: 10, OrigPkts: 1, ReplyPkts: 1}
+	classified := classifiedFlow{Direction: model.DirectionOut}
+	snapshot, delta, forwardDelta, countFlow, resetOwners := service.updateSnapshot(
+		now, flow, classified, model.ProcessInfo{}, model.FlowSnapshot{}, false, true, true,
+	)
+	if delta != nil || forwardDelta != nil || !countFlow || resetOwners {
+		t.Fatalf("overflow sample should retain only flow count: delta=%+v forward=%+v count=%v reset=%v", delta, forwardDelta, countFlow, resetOwners)
+	}
+	if snapshot.LastOrig != overflow {
+		t.Fatalf("overflow sample did not advance baseline: got %d want %d", snapshot.LastOrig, overflow)
+	}
+
+	flow.OrigBytes += 9
+	_, delta, forwardDelta, countFlow, resetOwners = service.updateSnapshot(
+		now.Add(time.Second), flow, classified, model.ProcessInfo{}, snapshot, true, true, true,
+	)
+	if delta == nil || delta.upBytes != 9 || delta.downBytes != 0 || forwardDelta != nil || countFlow || resetOwners {
+		t.Fatalf("collector did not recover after overflow baseline: delta=%+v forward=%+v count=%v reset=%v", delta, forwardDelta, countFlow, resetOwners)
+	}
+}
+
+func TestFirstSyntheticObservationAfterBaselineDoesNotChargeLifetimeCounters(t *testing.T) {
+	service := &Service{}
+	now := time.Date(2026, 7, 11, 5, 50, 0, 0, time.UTC)
+	flow := model.ConntrackFlow{
+		CTID:          9001,
+		SyntheticCTID: true,
+		HasAccounting: true,
+		Proto:         "udp",
+		OrigBytes:     142_553_076_632,
+		ReplyBytes:    92_305_874_281,
+		OrigPkts:      1_000_000,
+		ReplyPkts:     900_000,
+	}
+	classified := classifiedFlow{
+		Proto:      "udp",
+		Direction:  model.DirectionOut,
+		LocalIP:    "217.69.7.251",
+		LocalPort:  55628,
+		RemoteIP:   "162.159.192.1",
+		RemotePort: 2408,
+	}
+
+	snapshot, delta, forwardDelta, countFlow, resetOwners := service.updateSnapshot(
+		now, flow, classified, model.ProcessInfo{}, model.FlowSnapshot{}, false, true, false,
+	)
+	if delta != nil || forwardDelta != nil || !countFlow || resetOwners {
+		t.Fatalf("first synthetic observation must seed counters only: delta=%+v forward=%+v count=%v reset=%v", delta, forwardDelta, countFlow, resetOwners)
+	}
+	if snapshot.LastOrig != flow.OrigBytes || snapshot.LastReply != flow.ReplyBytes || !snapshot.Counted {
+		t.Fatalf("unexpected synthetic baseline: %+v", snapshot)
+	}
+
+	flow.OrigBytes += 2048
+	flow.ReplyBytes += 4096
+	flow.OrigPkts++
+	flow.ReplyPkts += 2
+	_, delta, _, countFlow, resetOwners = service.updateSnapshot(
+		now.Add(time.Second), flow, classified, model.ProcessInfo{}, snapshot, true, true, true,
+	)
+	if delta == nil || delta.upBytes != 2048 || delta.downBytes != 4096 || delta.upPkts != 1 || delta.downPkts != 2 || countFlow || resetOwners {
+		t.Fatalf("synthetic flow must resume with incremental counters: delta=%+v count=%v reset=%v", delta, countFlow, resetOwners)
+	}
+}
 
 func TestNewUsesNoopCollectorOutsideLinuxUnlessMockDataEnabled(t *testing.T) {
 	if runtime.GOOS == "linux" {
@@ -137,8 +218,22 @@ func TestParseConntrackLine(t *testing.T) {
 	if flow.CTID != 12345 || flow.OrigSrcIP != "10.0.0.2" || flow.ReplyBytes != 4096 {
 		t.Fatalf("unexpected flow: %+v", flow)
 	}
+	if flow.SyntheticCTID {
+		t.Fatal("kernel-provided id must not be marked synthetic")
+	}
 	if !flow.HasAccounting {
 		t.Fatalf("expected accounting flag")
+	}
+}
+
+func TestParseConntrackObservationCarriesZone(t *testing.T) {
+	line := "ipv4 2 tcp 6 431999 ESTABLISHED src=10.0.0.2 dst=1.1.1.1 sport=51544 dport=443 packets=10 bytes=1024 src=1.1.1.1 dst=10.0.0.2 sport=443 dport=51544 packets=8 bytes=4096 mark=0 zone=17 use=1 id=12345"
+	observation, ok, err := parseConntrackObservation(line)
+	if err != nil {
+		t.Fatalf("parse conntrack observation: %v", err)
+	}
+	if !ok || observation.Zone != 17 || observation.Flow.CTID != 12345 {
+		t.Fatalf("unexpected zone-aware observation: %+v", observation)
 	}
 }
 
@@ -174,6 +269,9 @@ func TestParseConntrackLineWithoutIDOrCounters(t *testing.T) {
 	}
 	if flow.CTID == 0 {
 		t.Fatalf("expected synthetic ctid")
+	}
+	if !flow.SyntheticCTID {
+		t.Fatal("tuple-derived fallback id must be marked synthetic")
 	}
 	if flow.HasAccounting {
 		t.Fatalf("did not expect accounting flag")
@@ -699,6 +797,73 @@ func TestNormalizeObservedFlowsDedupesDuplicateTupleByMaxCounters(t *testing.T) 
 	}
 }
 
+func TestConntrackZonesKeepIdenticalTuplesIndependentlyAccounted(t *testing.T) {
+	base := model.ConntrackFlow{
+		Proto:         "tcp",
+		Family:        "ipv4",
+		OrigSrcIP:     "10.0.0.2",
+		OrigDstIP:     "1.1.1.1",
+		OrigSrcPort:   51544,
+		OrigDstPort:   443,
+		ReplySrcIP:    "1.1.1.1",
+		ReplyDstIP:    "10.0.0.2",
+		ReplySrcPort:  443,
+		ReplyDstPort:  51544,
+		OrigBytes:     100,
+		ReplyBytes:    50,
+		OrigPkts:      1,
+		ReplyPkts:     1,
+		HasAccounting: true,
+	}
+	first := base
+	first.CTID = 1001
+	second := base
+	second.CTID = 2001
+	second.OrigBytes = 200
+	second.ReplyBytes = 75
+
+	observed := normalizeConntrackObservations([]conntrackObservation{
+		{Flow: first, Zone: 1},
+		{Flow: second, Zone: 2},
+	}, map[string]struct{}{"10.0.0.2": {}}, socketIndex{})
+	if len(observed) != 2 {
+		t.Fatalf("identical tuples from separate zones must remain independent, got %+v", observed)
+	}
+	if observed[0].Identity == observed[1].Identity {
+		t.Fatalf("zone must participate in flow identity: %+v", observed)
+	}
+
+	minute := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	service := &Service{
+		currentMinute: minute,
+		buckets:       make(map[model.UsageKey]*bucketState),
+	}
+	for _, flow := range observed {
+		snapshot, delta, _, countFlow, _ := service.updateSnapshot(
+			minute,
+			flow.Flow,
+			flow.Classified,
+			model.ProcessInfo{},
+			model.FlowSnapshot{},
+			false,
+			true,
+			false,
+		)
+		if delta == nil || !countFlow {
+			t.Fatalf("expected independent initial contribution for zone %d", flow.Zone)
+		}
+		service.addUsage(string(flow.Identity), snapshot, *delta, countFlow)
+	}
+	if len(service.buckets) != 1 {
+		t.Fatalf("zone is an accounting identity, not an exposed usage dimension: %+v", service.buckets)
+	}
+	for _, bucket := range service.buckets {
+		if bucket.bytesUp != 300 || bucket.bytesDown != 125 || bucket.flowCount != 2 || len(bucket.perFlow) != 2 {
+			t.Fatalf("expected zone contributions to sum instead of max-merge, got %+v", bucket)
+		}
+	}
+}
+
 func TestSocketIndexSnapshotDefaultIntervalIsIndependentOfCollectorTick(t *testing.T) {
 	procFS := t.TempDir()
 	writeProcTCP(t, procFS, 11111)
@@ -851,6 +1016,239 @@ func TestCarryForwardSnapshotsPreventsRecountAfterTransientGap(t *testing.T) {
 	}
 }
 
+func TestSnapshotsForTickPreservesConfirmedLineageAfterLongSuccessfulSampleGap(t *testing.T) {
+	start := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	identity := flowIdentity("local|ipv4|tcp|out|53337|198.51.100.8|443|10.0.0.2")
+	previous := model.FlowSnapshot{
+		CTID:          9001,
+		Proto:         "tcp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     53337,
+		RemoteIP:      "198.51.100.8",
+		RemotePort:    443,
+		StartedAt:     start,
+		BaselineOrig:  420,
+		BaselineReply: 2100,
+		LastOrig:      420,
+		LastReply:     2100,
+		BaselineOPkts: 4,
+		BaselineRPkts: 9,
+		LastOPkts:     4,
+		LastRPkts:     9,
+		Counted:       true,
+		LastSeen:      start,
+	}
+	service := &Service{
+		snapshots:     map[string]model.FlowSnapshot{string(identity): previous},
+		snapshotReady: true,
+	}
+	observed := []observedFlow{{
+		Identity: identity,
+		Flow: model.ConntrackFlow{
+			CTID:       9001,
+			Proto:      "tcp",
+			OrigBytes:  500,
+			ReplyBytes: 2300,
+			OrigPkts:   5,
+			ReplyPkts:  11,
+		},
+		Classified: classifiedFlow{
+			Proto:      "tcp",
+			Direction:  model.DirectionOut,
+			LocalIP:    "10.0.0.2",
+			LocalPort:  53337,
+			RemoteIP:   "198.51.100.8",
+			RemotePort: 443,
+		},
+		RawIDs: map[uint64]struct{}{9001: {}},
+	}}
+
+	now := start.Add(defaultFlowGraceTTL + 20*time.Second)
+	next, ready, expiredOwnership := service.snapshotsForTick(now, observed)
+	if len(expiredOwnership) != 0 {
+		t.Fatalf("real conntrack IDs revived on the same tick must retain ownership: %v", expiredOwnership)
+	}
+	prev, exists := next[string(identity)]
+	if !ready || !exists {
+		t.Fatalf("expected stale snapshot for an observed identity to remain available")
+	}
+	lineageContinues := observedLineageContinues(prev, observed[0].Flow.CTID, observed[0].Flow.SyntheticCTID, observed[0].RawIDs)
+	snapshot, delta, _, countFlow, resetOwners := service.updateSnapshot(
+		now,
+		observed[0].Flow,
+		observed[0].Classified,
+		model.ProcessInfo{},
+		prev,
+		exists,
+		ready,
+		lineageContinues,
+	)
+	if countFlow || resetOwners {
+		t.Fatalf("continued CTID must not be counted or reassigned as a new flow")
+	}
+	if delta == nil || delta.upBytes != 80 || delta.downBytes != 200 || delta.upPkts != 1 || delta.downPkts != 2 {
+		t.Fatalf("expected only counters since the last successful sample, got %+v", delta)
+	}
+	if snapshot.StartedAt != start || snapshot.LastOrig != 500 || snapshot.LastReply != 2300 {
+		t.Fatalf("unexpected continued snapshot: %+v", snapshot)
+	}
+}
+
+func TestSnapshotsForTickRevivesStaleSyntheticCTIDWithMonotonicAccounting(t *testing.T) {
+	start := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	identity := flowIdentity("local|zone=0|ipv4|tcp|out|53337|198.51.100.8|443|10.0.0.2")
+	previous := model.FlowSnapshot{
+		CTID:          9001,
+		SyntheticCTID: true,
+		Proto:         "tcp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     53337,
+		RemoteIP:      "198.51.100.8",
+		RemotePort:    443,
+		LastOrig:      420,
+		LastReply:     2100,
+		Counted:       true,
+		LastSeen:      start,
+	}
+	service := &Service{
+		snapshots:     map[string]model.FlowSnapshot{string(identity): previous},
+		snapshotReady: true,
+	}
+	observed := []observedFlow{{
+		Identity: identity,
+		Flow: model.ConntrackFlow{
+			CTID:          9001,
+			SyntheticCTID: true,
+			HasAccounting: true,
+			Proto:         "tcp",
+			OrigBytes:     500,
+			ReplyBytes:    2300,
+		},
+		RawIDs: map[uint64]struct{}{9001: {}},
+	}}
+
+	next, ready, expiredOwnership := service.snapshotsForTick(start.Add(defaultFlowGraceTTL+time.Second), observed)
+	if !ready {
+		t.Fatal("expected existing collector baseline to remain ready")
+	}
+	if _, exists := next[string(identity)]; !exists {
+		t.Fatal("monotonic accounting must preserve a stale tuple-derived baseline across a collector outage")
+	}
+	if _, exists := expiredOwnership[string(identity)]; exists {
+		t.Fatal("continued monotonic accounting must retain existing flow ownership")
+	}
+}
+
+func TestSnapshotsForTickDoesNotReviveStaleSyntheticCTIDAfterCounterRollback(t *testing.T) {
+	start := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	identity := flowIdentity("local|zone=0|ipv4|udp|out|55628|162.159.192.1|2408|217.69.7.251")
+	service := &Service{
+		snapshots: map[string]model.FlowSnapshot{string(identity): {
+			CTID:          9001,
+			SyntheticCTID: true,
+			LastOrig:      142_000,
+			LastReply:     92_000,
+			LastOPkts:     1_140,
+			LastRPkts:     920,
+			LastSeen:      start,
+		}},
+		snapshotReady: true,
+	}
+	observed := []observedFlow{{
+		Identity: identity,
+		Flow: model.ConntrackFlow{
+			CTID:          9001,
+			SyntheticCTID: true,
+			HasAccounting: true,
+			OrigBytes:     200,
+			ReplyBytes:    100,
+			OrigPkts:      2,
+			ReplyPkts:     1,
+		},
+	}}
+
+	next, _, expiredOwnership := service.snapshotsForTick(start.Add(defaultFlowGraceTTL+time.Second), observed)
+	if _, exists := next[string(identity)]; exists {
+		t.Fatal("counter rollback must remain a new tuple-derived lineage")
+	}
+	if _, exists := expiredOwnership[string(identity)]; !exists {
+		t.Fatal("counter rollback must release the previous flow ownership")
+	}
+}
+
+func TestSnapshotsForTickExpiresOwnershipWhileTupleIsAbsent(t *testing.T) {
+	start := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	flowID := "local|zone=0|ipv4|tcp|out|53337|198.51.100.8|443|10.0.0.2"
+	service := &Service{
+		snapshots: map[string]model.FlowSnapshot{
+			flowID: {
+				CTID:      9001,
+				LastSeen:  start,
+				LastOrig:  420,
+				LastReply: 2100,
+				Counted:   true,
+			},
+		},
+		snapshotReady: true,
+	}
+
+	next, ready, expiredOwnership := service.snapshotsForTick(start.Add(defaultFlowGraceTTL+time.Second), nil)
+	if !ready || len(next) != 0 {
+		t.Fatalf("expired absent snapshot must be pruned without losing baseline readiness: ready=%v next=%v", ready, next)
+	}
+	if _, exists := expiredOwnership[flowID]; !exists {
+		t.Fatal("an absent expired snapshot must release and freeze its ownership immediately")
+	}
+}
+
+func TestSyntheticCTIDCounterRollbackStartsNewLineage(t *testing.T) {
+	now := time.Date(2026, 4, 20, 10, 0, 2, 0, time.UTC)
+	previous := model.FlowSnapshot{
+		CTID:          9001,
+		SyntheticCTID: true,
+		Proto:         "tcp",
+		Direction:     model.DirectionOut,
+		LocalIP:       "10.0.0.2",
+		LocalPort:     53337,
+		RemoteIP:      "198.51.100.8",
+		RemotePort:    443,
+		LastOrig:      900,
+		LastReply:     1200,
+		LastOPkts:     9,
+		LastRPkts:     12,
+		Counted:       true,
+		LastSeen:      now.Add(-time.Second),
+	}
+	flow := model.ConntrackFlow{
+		CTID:          9001,
+		SyntheticCTID: true,
+		Proto:         "tcp",
+		OrigBytes:     100,
+		ReplyBytes:    200,
+		OrigPkts:      1,
+		ReplyPkts:     2,
+	}
+	classified := classifiedFlow{
+		Proto:      "tcp",
+		Direction:  model.DirectionOut,
+		LocalIP:    "10.0.0.2",
+		LocalPort:  53337,
+		RemoteIP:   "198.51.100.8",
+		RemotePort: 443,
+	}
+	service := &Service{}
+	lineage := observedLineageContinues(previous, flow.CTID, flow.SyntheticCTID, map[uint64]struct{}{flow.CTID: {}})
+	_, delta, _, countFlow, resetOwners := service.updateSnapshot(now, flow, classified, model.ProcessInfo{}, previous, true, true, lineage)
+	if !countFlow || !resetOwners {
+		t.Fatalf("counter rollback on a synthetic id must start a new counted lineage, count=%v reset=%v", countFlow, resetOwners)
+	}
+	if delta == nil || delta.upBytes != 100 || delta.downBytes != 200 || delta.upPkts != 1 || delta.downPkts != 2 {
+		t.Fatalf("new synthetic lineage must count its full initial counters, got %+v", delta)
+	}
+}
+
 func TestTupleReuseKeepsPreviousContributionInOriginalBucket(t *testing.T) {
 	service := &Service{
 		currentMinute: time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC),
@@ -954,6 +1352,71 @@ func TestTupleReuseKeepsPreviousContributionInOriginalBucket(t *testing.T) {
 	}
 	if owner, ok := service.usageFlowOwner[flowID]; !ok || owner != newKey {
 		t.Fatalf("expected flow owner to move only for the new lineage, got %v %v", ok, owner)
+	}
+}
+
+func TestExpiredOwnershipFreezesPreviousGeneration(t *testing.T) {
+	now := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	service := &Service{
+		currentMinute: now,
+		buckets:       make(map[model.UsageKey]*bucketState),
+		snapshots:     make(map[string]model.FlowSnapshot),
+		snapshotReady: true,
+	}
+	flowID := "local|zone=0|ipv4|tcp|out|47920|198.51.100.44|443|10.0.0.2"
+	oldSnapshot := model.FlowSnapshot{
+		Proto:       "tcp",
+		Direction:   model.DirectionOut,
+		PID:         1088,
+		Comm:        "worker",
+		Exe:         "/usr/bin/worker",
+		LocalPort:   47920,
+		RemoteIP:    "198.51.100.44",
+		RemotePort:  443,
+		Attribution: model.AttributionExact,
+	}
+
+	service.addUsage(flowID, oldSnapshot, deltaPair{upBytes: 300, downBytes: 900}, true)
+	oldSnapshot.LastSeen = now
+	service.snapshots[flowID] = oldSnapshot
+	_, _, expiredOwnership := service.snapshotsForTick(now.Add(defaultFlowGraceTTL+time.Second), nil)
+	if _, exists := expiredOwnership[flowID]; !exists {
+		t.Fatal("absent old generation must expire its ownership")
+	}
+	for expiredFlowID := range expiredOwnership {
+		service.releaseFlowOwnership(expiredFlowID)
+	}
+	// The next connection initially has the same attribution key and tuple.
+	service.addUsage(flowID, oldSnapshot, deltaPair{upBytes: 40, downBytes: 60}, true)
+
+	newSnapshot := oldSnapshot
+	newSnapshot.PID = 2099
+	newSnapshot.Comm = "curl"
+	newSnapshot.Exe = "/usr/bin/curl"
+	service.addUsage(flowID, newSnapshot, deltaPair{upBytes: 10, downBytes: 20}, false)
+
+	oldKey := model.UsageKey{
+		MinuteTS:    now.Unix(),
+		Proto:       oldSnapshot.Proto,
+		Direction:   oldSnapshot.Direction,
+		PID:         oldSnapshot.PID,
+		Comm:        oldSnapshot.Comm,
+		Exe:         oldSnapshot.Exe,
+		LocalPort:   oldSnapshot.LocalPort,
+		RemoteIP:    oldSnapshot.RemoteIP,
+		RemotePort:  oldSnapshot.RemotePort,
+		Attribution: oldSnapshot.Attribution,
+	}
+	newKey := oldKey
+	newKey.PID = newSnapshot.PID
+	newKey.Comm = newSnapshot.Comm
+	newKey.Exe = newSnapshot.Exe
+
+	if state := service.buckets[oldKey]; state == nil || state.bytesUp != 300 || state.bytesDown != 900 || state.flowCount != 1 || len(state.perFlow) != 1 {
+		t.Fatalf("completed generation must remain frozen in its original bucket, got %+v", state)
+	}
+	if state := service.buckets[newKey]; state == nil || state.bytesUp != 50 || state.bytesDown != 80 || state.flowCount != 1 || len(state.perFlow) != 1 {
+		t.Fatalf("only the active reused generation may be reclassified, got %+v", state)
 	}
 }
 
@@ -1101,7 +1564,7 @@ func TestTupleReuseWithOverlappingCTIDsStartsNewLineage(t *testing.T) {
 		t.Fatalf("expected strongest candidate CTID to be selected, got %+v", observed[0].Flow)
 	}
 
-	lineageContinues := observedLineageContinues(prev, observed[0].Flow.CTID, observed[0].RawIDs)
+	lineageContinues := observedLineageContinues(prev, observed[0].Flow.CTID, observed[0].Flow.SyntheticCTID, observed[0].RawIDs)
 	if lineageContinues {
 		t.Fatalf("expected selected new CTID to break lineage even when previous CTID is still in RawIDs")
 	}
@@ -1303,7 +1766,7 @@ func TestAddUsageMovesFlowOwnershipAcrossUsageKeys(t *testing.T) {
 	if state := service.buckets[unknownKey]; state != nil {
 		t.Fatalf("expected unknown bucket to be drained after key change, got %+v", state)
 	}
-	if state := service.buckets[exactKey]; state == nil || len(state.flows) != 1 {
+	if state := service.buckets[exactKey]; state == nil || len(state.perFlow) != 1 {
 		t.Fatalf("expected exact bucket to own the flow, got %+v", state)
 	} else if state.bytesUp != 300 {
 		t.Fatalf("expected migrated bytes to move with the flow, got %+v", state)
@@ -1366,7 +1829,7 @@ func TestAddForwardUsageMovesFlowOwnershipFromUsageBucket(t *testing.T) {
 	if state := service.buckets[usageKey]; state != nil {
 		t.Fatalf("expected usage bucket contribution to be transferred, got %+v", state)
 	}
-	if state := service.forwardBuckets[forwardKey]; state == nil || len(state.flows) != 1 {
+	if state := service.forwardBuckets[forwardKey]; state == nil || len(state.perFlow) != 1 {
 		t.Fatalf("expected forward bucket to own the flow, got %+v", state)
 	} else if state.bytesUp != 300 {
 		t.Fatalf("expected forward bucket to retain migrated bytes, got %+v", state)
@@ -1551,5 +2014,49 @@ func TestAttachSocketMetadataFallsBackWhenTupleEntryHasNoInode(t *testing.T) {
 	}
 	if resolved.Inode != 88001 || !resolved.MatchedByLocal {
 		t.Fatalf("expected local fallback inode, got %+v", resolved)
+	}
+}
+
+func TestDiagnosticsRequiresRecentSuccessfulCollection(t *testing.T) {
+	service := &Service{cfg: config.Default(), snapshots: make(map[string]model.FlowSnapshot)}
+	recent := time.Now().UTC().Add(-5 * time.Second)
+	service.snapshotReady = true
+	service.recordTickOutcome(recent, nil)
+	diagnostics := service.Diagnostics()
+	if !diagnostics.CollectionFresh || diagnostics.LastSuccessfulTickTS == nil || diagnostics.LastSuccessfulTickAgeSecs == nil {
+		t.Fatalf("expected recent successful collection to be fresh: %+v", diagnostics)
+	}
+
+	service.recordTickOutcome(recent.Add(time.Second), errors.New("conntrack unavailable"))
+	diagnostics = service.Diagnostics()
+	if !diagnostics.CollectionFresh || diagnostics.ConsecutiveTickFailures != 1 {
+		t.Fatalf("expected one transient failure to retain a fresh last success: %+v", diagnostics)
+	}
+
+	service.recordTickOutcome(time.Now().UTC().Add(-time.Minute), nil)
+	diagnostics = service.Diagnostics()
+	if diagnostics.CollectionFresh {
+		t.Fatalf("expected an old successful collection to be stale: %+v", diagnostics)
+	}
+}
+
+func TestCollectionFreshnessUsesConfiguredLongTickInterval(t *testing.T) {
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	if !collectionIsFresh(now, now.Add(-3*time.Hour), 4*time.Hour) {
+		t.Fatal("a valid long collection interval must not be capped to one hour for readiness")
+	}
+	if collectionIsFresh(now, now.Add(-13*time.Hour), 4*time.Hour) {
+		t.Fatal("collection must become stale after three configured intervals")
+	}
+}
+
+func BenchmarkParseConntrackObservation(b *testing.B) {
+	line := "ipv4 2 tcp 6 431999 ESTABLISHED src=10.0.0.2 dst=1.1.1.1 sport=51544 dport=443 packets=10 bytes=1024 src=1.1.1.1 dst=10.0.0.2 sport=443 dport=51544 packets=8 bytes=4096 mark=0 zone=17 use=1 id=12345"
+	b.ReportAllocs()
+	for b.Loop() {
+		observation, ok, err := parseConntrackObservation(line)
+		if err != nil || !ok || observation.Flow.CTID != 12345 {
+			b.Fatalf("unexpected parse result: ok=%t err=%v observation=%+v", ok, err, observation)
+		}
 	}
 }

@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +14,80 @@ import (
 	"traffic-go/internal/config"
 	"traffic-go/internal/model"
 )
+
+func TestOpenCreatesPrivateDatabaseDirectoryAndFile(t *testing.T) {
+	cfg := config.Default()
+	dbDir := filepath.Join(t.TempDir(), "private", "state")
+	cfg.DBPath = filepath.Join(dbDir, "traffic.db")
+
+	trafficStore, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = trafficStore.Close() })
+
+	if _, err := os.Stat(cfg.DBPath); err != nil {
+		t.Fatalf("database was not created: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	dirInfo, err := os.Stat(dbDir)
+	if err != nil {
+		t.Fatalf("stat database directory: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("expected database directory mode 0700, got %04o", got)
+	}
+	for _, path := range []string{cfg.DBPath, cfg.DBPath + "-wal", cfg.DBPath + "-shm"} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat sqlite file %s: %v", filepath.Base(path), err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("expected %s mode 0600, got %04o", filepath.Base(path), got)
+		}
+	}
+}
+
+func TestFlushMinuteBatchDeduplicatesKnownProcessUpserts(t *testing.T) {
+	trafficStore := newTestStore(t)
+	ctx := context.Background()
+	if _, err := trafficStore.db.ExecContext(ctx, `
+CREATE TABLE known_process_audit (id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TRIGGER audit_known_process_insert AFTER INSERT ON known_processes BEGIN
+    INSERT INTO known_process_audit (id) VALUES (NULL);
+END;
+CREATE TRIGGER audit_known_process_update AFTER UPDATE ON known_processes BEGIN
+    INSERT INTO known_process_audit (id) VALUES (NULL);
+END;
+`); err != nil {
+		t.Fatalf("create known process audit: %v", err)
+	}
+	minute := time.Date(2026, 4, 20, 10, 15, 0, 0, time.UTC).Unix()
+	common := model.UsageKey{
+		MinuteTS: minute, Proto: "tcp", Direction: model.DirectionOut, PID: 42,
+		Comm: "curl", Exe: "/usr/bin/curl", LocalPort: 50500, RemotePort: 443,
+		Attribution: model.AttributionExact,
+	}
+	first := common
+	first.RemoteIP = "1.1.1.1"
+	second := common
+	second.RemoteIP = "8.8.8.8"
+	if err := trafficStore.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		first:  {BytesUp: 1},
+		second: {BytesUp: 2},
+	}, nil); err != nil {
+		t.Fatalf("flush process batch: %v", err)
+	}
+	var writes int
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM known_process_audit`).Scan(&writes); err != nil {
+		t.Fatalf("count known process writes: %v", err)
+	}
+	if writes != 1 {
+		t.Fatalf("expected one known-process upsert for duplicate process dimensions, got %d", writes)
+	}
+}
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -29,7 +106,7 @@ func newTestStore(t *testing.T) *Store {
 func TestSchemaCreatesLogEvidenceHostPortIndexes(t *testing.T) {
 	store := newTestStore(t)
 
-	for _, indexName := range []string{"idx_log_evidence_entry_port", "idx_log_evidence_host_port"} {
+	for _, indexName := range []string{"idx_log_evidence_source_entry_ts_v2", "idx_log_evidence_source_host_port_ts_v2"} {
 		row := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, indexName)
 		var count int
 		if err := row.Scan(&count); err != nil {
@@ -37,6 +114,16 @@ func TestSchemaCreatesLogEvidenceHostPortIndexes(t *testing.T) {
 		}
 		if count != 1 {
 			t.Fatalf("expected %s to exist, found %d", indexName, count)
+		}
+	}
+	for _, legacyName := range []string{"idx_log_evidence_lookup", "idx_log_evidence_client_lookup", "idx_log_evidence_target_lookup", "idx_log_evidence_created_at", "idx_log_evidence_entry_port", "idx_log_evidence_host_port"} {
+		row := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, legacyName)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			t.Fatalf("count legacy %s: %v", legacyName, err)
+		}
+		if count != 0 {
+			t.Fatalf("obsolete evidence index %s should be removed", legacyName)
 		}
 	}
 }
@@ -70,6 +157,80 @@ func TestFlushAndQueryInterfaceTimeseries(t *testing.T) {
 	}
 	if points[1].Interface != "eth0" || points[1].RxBytes != 5120 || points[1].TxBytes != 10240 {
 		t.Fatalf("unexpected eth0 point: %+v", points[1])
+	}
+}
+
+func TestFlushMinuteBatchRollsBackAllCounterFamiliesWhenInterfaceWriteFails(t *testing.T) {
+	trafficStore := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 20, 10, 15, 0, 0, time.UTC).Unix()
+	usage := map[model.UsageKey]model.UsageDelta{
+		{
+			MinuteTS:    minute,
+			Proto:       "tcp",
+			Direction:   model.DirectionOut,
+			PID:         42,
+			Comm:        "curl",
+			Exe:         "/usr/bin/curl",
+			LocalPort:   50500,
+			RemoteIP:    "1.1.1.1",
+			RemotePort:  443,
+			Attribution: model.AttributionExact,
+		}: {BytesUp: 100, BytesDown: 200, PktsUp: 1, PktsDown: 2, FlowCount: 1},
+	}
+	forward := map[model.ForwardUsageKey]model.UsageDelta{
+		{
+			MinuteTS:  minute,
+			Proto:     "tcp",
+			OrigSrcIP: "10.0.0.2",
+			OrigDstIP: "1.1.1.1",
+			OrigSPort: 50500,
+			OrigDPort: 443,
+		}: {BytesUp: 300, BytesDown: 400, PktsUp: 3, PktsDown: 4, FlowCount: 1},
+	}
+	interfaces := map[string]model.InterfaceUsageDelta{"eth0": {RxBytes: 600, TxBytes: 500}}
+
+	if _, err := trafficStore.db.ExecContext(ctx, `
+CREATE TRIGGER fail_interface_insert
+BEFORE INSERT ON interface_1m
+BEGIN
+    SELECT RAISE(ABORT, 'injected interface failure');
+END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	if err := trafficStore.FlushMinuteBatch(ctx, minute, usage, forward, interfaces); err == nil {
+		t.Fatalf("expected injected interface write failure")
+	}
+
+	for _, table := range []string{"usage_1m", "usage_1m_forward", "interface_1m", "known_processes"} {
+		var rows int
+		if err := trafficStore.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&rows); err != nil {
+			t.Fatalf("count %s after rollback: %v", table, err)
+		}
+		if rows != 0 {
+			t.Fatalf("expected %s to roll back with the failed batch, found %d rows", table, rows)
+		}
+	}
+
+	if _, err := trafficStore.db.ExecContext(ctx, `DROP TRIGGER fail_interface_insert`); err != nil {
+		t.Fatalf("drop failure trigger: %v", err)
+	}
+	if err := trafficStore.FlushMinuteBatch(ctx, minute, usage, forward, interfaces); err != nil {
+		t.Fatalf("retry atomic minute batch: %v", err)
+	}
+
+	var usageUp, forwardOrig, interfaceRX int64
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT bytes_up FROM usage_1m`).Scan(&usageUp); err != nil {
+		t.Fatalf("query usage retry: %v", err)
+	}
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT bytes_orig FROM usage_1m_forward`).Scan(&forwardOrig); err != nil {
+		t.Fatalf("query forward retry: %v", err)
+	}
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT rx_bytes FROM interface_1m`).Scan(&interfaceRX); err != nil {
+		t.Fatalf("query interface retry: %v", err)
+	}
+	if usageUp != 100 || forwardOrig != 300 || interfaceRX != 600 {
+		t.Fatalf("retry must commit each family exactly once, usage=%d forward=%d interface=%d", usageUp, forwardOrig, interfaceRX)
 	}
 }
 
@@ -159,7 +320,9 @@ func TestQueryInterfaceTimeseriesSummaryIncludesMinuteTail(t *testing.T) {
 
 func TestResolveUsageSource(t *testing.T) {
 	store := newTestStore(t)
-	start := time.Unix(0, 0)
+	now := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	start := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
 	end := start.Add(31 * 24 * time.Hour)
 
 	source, err := store.ResolveUsageSource(start, end, false)
@@ -172,6 +335,61 @@ func TestResolveUsageSource(t *testing.T) {
 
 	if _, err := store.ResolveUsageSource(start, end, true); err != ErrDimensionUnavailable {
 		t.Fatalf("expected dimension unavailable, got %v", err)
+	}
+}
+
+func TestResolveUsageSourceRejectsWindowBeforeDailyRetention(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	start := dayRetentionStartUTC(now, store.retention).Add(-time.Second)
+	if _, err := store.ResolveUsageSource(start, now, false); err != ErrRangeUnavailable {
+		t.Fatalf("expected range unavailable before daily retention, got %v", err)
+	}
+}
+
+func TestResolveUsageSourceUsesLongestActuallyAvailableRetentionLayer(t *testing.T) {
+	trafficStore := newTestStore(t)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	trafficStore.now = func() time.Time { return now }
+	trafficStore.retention.MinuteDays = 7
+	trafficStore.retention.HourMonths = 4
+	trafficStore.retention.DayMonths = 1
+	start := time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC)
+	source, err := trafficStore.ResolveUsageSource(start, start.Add(time.Hour), false)
+	if err != nil || source != DataSourceHour {
+		t.Fatalf("expected still-retained hour data despite shorter day retention, source=%q err=%v", source, err)
+	}
+
+	trafficStore.retention.MinuteDays = 120
+	trafficStore.retention.HourMonths = 1
+	start = now.Add(-60 * 24 * time.Hour)
+	source, err = trafficStore.ResolveUsageSource(start, start.Add(time.Hour), false)
+	if err != nil || source != DataSourceMinute {
+		t.Fatalf("expected longest minute retention to win over shorter aggregates, source=%q err=%v", source, err)
+	}
+}
+
+func TestQueryInterfaceTimeseriesEnforcesPointLimit(t *testing.T) {
+	trafficStore := newTestStore(t)
+	ctx := context.Background()
+	start := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	_, err := trafficStore.db.ExecContext(ctx, `
+WITH RECURSIVE a(x) AS (
+    SELECT 0 UNION ALL SELECT x + 1 FROM a WHERE x < 100
+), b(y) AS (
+    SELECT 0 UNION ALL SELECT y + 1 FROM b WHERE y < 99
+)
+INSERT INTO interface_1m (minute_ts, interface, rx_bytes, tx_bytes)
+SELECT ?, printf('if-%05d', x * 100 + y), 1, 1 FROM a CROSS JOIN b
+`, start.Unix())
+	if err != nil {
+		t.Fatalf("seed interface points: %v", err)
+	}
+
+	_, err = trafficStore.QueryInterfaceTimeseries(ctx, start, start.Add(time.Minute), time.Minute, DataSourceMinute)
+	if err != ErrTimeseriesPointLimit {
+		t.Fatalf("expected interface point limit, got %v", err)
 	}
 }
 
@@ -849,8 +1067,9 @@ INSERT INTO usage_monthly (
 	if !summaries[1].Archived || !summaries[1].DetailAvailable || summaries[1].DetailRange != "last_month" {
 		t.Fatalf("unexpected march archive status: %+v", summaries[1])
 	}
-	if summaries[1].BytesUp != 999 || summaries[1].BytesDown != 999 || summaries[1].FlowCount != 99 {
-		t.Fatalf("archived month should be preferred over retained details: %+v", summaries[1])
+	if summaries[1].BytesUp != 1010 || summaries[1].BytesDown != 1021 || summaries[1].FlowCount != 100 ||
+		summaries[1].ForwardBytesOrig != 33 || summaries[1].ForwardBytesReply != 44 || summaries[1].ForwardFlowCount != 2 {
+		t.Fatalf("late retained detail should increment the archived month exactly once: %+v", summaries[1])
 	}
 	if !summaries[2].Archived || !summaries[2].DetailAvailable || summaries[2].DetailRange != "" {
 		t.Fatalf("unexpected january archive status: %+v", summaries[2])
@@ -933,6 +1152,277 @@ INSERT INTO usage_1d (
 	}
 	if evidenceCount != 7 || chainCount != 8 {
 		t.Fatalf("existing monthly archive counts should be preserved, evidence=%d chain=%d", evidenceCount, chainCount)
+	}
+}
+
+func TestArchivedMonthAcceptsLateTrafficEvidenceAndChainWithoutDoubleCountingUpserts(t *testing.T) {
+	trafficStore := newTestStore(t)
+	ctx := context.Background()
+	initial := time.Date(2026, 4, 20, 10, 15, 0, 0, time.UTC)
+	late := time.Date(2026, 4, 10, 8, 25, 0, 0, time.UTC)
+	trafficStore.now = func() time.Time { return time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC) }
+
+	usageKey := model.UsageKey{
+		MinuteTS: initial.Unix(), Proto: "tcp", Direction: model.DirectionOut, PID: 42,
+		Comm: "curl", Exe: "/usr/bin/curl", LocalPort: 50500, RemoteIP: "1.1.1.1",
+		RemotePort: 443, Attribution: model.AttributionExact,
+	}
+	forwardKey := model.ForwardUsageKey{
+		MinuteTS: initial.Unix(), Proto: "tcp", OrigSrcIP: "10.0.0.2", OrigDstIP: "1.1.1.1",
+		OrigSPort: 50500, OrigDPort: 443,
+	}
+	if err := trafficStore.FlushMinute(ctx, initial.Unix(), map[model.UsageKey]model.UsageDelta{
+		usageKey: {BytesUp: 100, BytesDown: 200, FlowCount: 1},
+	}, map[model.ForwardUsageKey]model.UsageDelta{
+		forwardKey: {BytesUp: 300, BytesDown: 400, FlowCount: 1},
+	}); err != nil {
+		t.Fatalf("flush initial traffic: %v", err)
+	}
+	if err := trafficStore.UpsertLogEvidenceBatch(ctx, []model.LogEvidence{{
+		Source: "nginx", EventTS: initial.Unix(), Fingerprint: "archive-initial-evidence",
+	}}); err != nil {
+		t.Fatalf("insert initial evidence: %v", err)
+	}
+	pid := 42
+	exe := "/usr/bin/curl"
+	initialChain := model.UsageChainRecord{
+		TimeBucket: initial.Unix(), PID: &pid, Comm: "curl", Exe: &exe,
+		SourceIP: "203.0.113.10", TargetIP: "198.51.100.10", BytesTotal: 300,
+		FlowCount: 1, EvidenceCount: 1, SampleFingerprint: "archive-initial-chain",
+	}
+	if err := trafficStore.UpsertUsageChains(ctx, []model.UsageChainRecord{initialChain}); err != nil {
+		t.Fatalf("insert initial chain: %v", err)
+	}
+	if err := trafficStore.AggregateHour(ctx, initial); err != nil {
+		t.Fatalf("aggregate initial hour: %v", err)
+	}
+	if err := trafficStore.Cleanup(ctx); err != nil {
+		t.Fatalf("archive initial month: %v", err)
+	}
+
+	usageKey.MinuteTS = late.Unix()
+	forwardKey.MinuteTS = late.Unix()
+	if err := trafficStore.FlushMinute(ctx, late.Unix(), map[model.UsageKey]model.UsageDelta{
+		usageKey: {BytesUp: 11, BytesDown: 22, FlowCount: 2},
+	}, map[model.ForwardUsageKey]model.UsageDelta{
+		forwardKey: {BytesUp: 33, BytesDown: 44, FlowCount: 2},
+	}); err != nil {
+		t.Fatalf("flush late archived traffic: %v", err)
+	}
+	lateEvidence := model.LogEvidence{
+		Source: "nginx", EventTS: late.Unix(), Fingerprint: "archive-late-evidence", Message: "late",
+	}
+	if err := trafficStore.UpsertLogEvidenceBatch(ctx, []model.LogEvidence{lateEvidence}); err != nil {
+		t.Fatalf("insert late evidence: %v", err)
+	}
+	lateChain := model.UsageChainRecord{
+		TimeBucket: late.Unix(), PID: &pid, Comm: "curl", Exe: &exe,
+		SourceIP: "203.0.113.11", TargetIP: "198.51.100.11", BytesTotal: 55,
+		FlowCount: 1, EvidenceCount: 1, SampleFingerprint: "archive-late-chain",
+	}
+	if err := trafficStore.UpsertUsageChains(ctx, []model.UsageChainRecord{lateChain}); err != nil {
+		t.Fatalf("insert late chain: %v", err)
+	}
+	if err := trafficStore.AggregateHour(ctx, late); err != nil {
+		t.Fatalf("aggregate late chain hour: %v", err)
+	}
+
+	// Conflict updates must not look like additional late rows to the archive.
+	lateEvidence.Message = "late-updated"
+	if err := trafficStore.UpsertLogEvidenceBatch(ctx, []model.LogEvidence{lateEvidence}); err != nil {
+		t.Fatalf("update late evidence: %v", err)
+	}
+	lateChain.BytesTotal = 66
+	if err := trafficStore.UpsertUsageChains(ctx, []model.UsageChainRecord{lateChain}); err != nil {
+		t.Fatalf("update late chain: %v", err)
+	}
+	if err := trafficStore.AggregateHour(ctx, late); err != nil {
+		t.Fatalf("reaggregate updated late chain: %v", err)
+	}
+	if err := trafficStore.Cleanup(ctx); err != nil {
+		t.Fatalf("refresh archived month: %v", err)
+	}
+
+	var bytesUp, bytesDown, flows, forwardOrig, forwardReply, forwardFlows, evidence, chains int64
+	monthTS := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC).Unix()
+	if err := trafficStore.db.QueryRowContext(ctx, `
+SELECT bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
+       forward_flow_count, evidence_count, chain_count
+FROM usage_monthly WHERE month_ts = ?
+`, monthTS).Scan(&bytesUp, &bytesDown, &flows, &forwardOrig, &forwardReply, &forwardFlows, &evidence, &chains); err != nil {
+		t.Fatalf("query refreshed archive: %v", err)
+	}
+	if bytesUp != 111 || bytesDown != 222 || flows != 3 || forwardOrig != 333 || forwardReply != 444 || forwardFlows != 3 {
+		t.Fatalf("unexpected late traffic totals: up=%d down=%d flows=%d fwd=%d/%d/%d", bytesUp, bytesDown, flows, forwardOrig, forwardReply, forwardFlows)
+	}
+	if evidence != 2 || chains != 2 {
+		t.Fatalf("late row upserts must count once, evidence=%d chains=%d", evidence, chains)
+	}
+}
+
+func TestCleanupPreservesExpiredDirtyChainUntilItCanBeAggregated(t *testing.T) {
+	trafficStore := newTestStore(t)
+	ctx := context.Background()
+	late := time.Date(2026, 4, 1, 8, 25, 0, 0, time.UTC)
+	trafficStore.now = func() time.Time { return time.Date(2026, 5, 1, 0, 5, 0, 0, time.UTC) }
+	pid := 42
+	exe := "/usr/bin/curl"
+	if err := trafficStore.UpsertUsageChains(ctx, []model.UsageChainRecord{{
+		TimeBucket: late.Unix(), PID: &pid, Comm: "curl", Exe: &exe,
+		SourceIP: "203.0.113.11", TargetIP: "198.51.100.11", BytesTotal: 55,
+		FlowCount: 1, EvidenceCount: 1, SampleFingerprint: "expired-dirty-chain",
+	}}); err != nil {
+		t.Fatalf("insert expired dirty chain: %v", err)
+	}
+	if err := trafficStore.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup before dirty aggregation: %v", err)
+	}
+	var minuteRows, dirtyRows int
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_chain_1m`).Scan(&minuteRows); err != nil {
+		t.Fatalf("count preserved minute chain: %v", err)
+	}
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM dirty_chain_hours`).Scan(&dirtyRows); err != nil {
+		t.Fatalf("count preserved dirty hour: %v", err)
+	}
+	if minuteRows != 1 || dirtyRows != 1 {
+		t.Fatalf("cleanup must preserve dirty source rows, minute=%d dirty=%d", minuteRows, dirtyRows)
+	}
+
+	if err := trafficStore.AggregateHour(ctx, late); err != nil {
+		t.Fatalf("aggregate preserved dirty hour: %v", err)
+	}
+	if err := trafficStore.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup after dirty aggregation: %v", err)
+	}
+	var archiveChains int64
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT chain_count FROM usage_monthly WHERE month_ts = ?`, monthStartUTC(late).Unix()).Scan(&archiveChains); err != nil {
+		t.Fatalf("query archived late chain: %v", err)
+	}
+	if archiveChains != 1 {
+		t.Fatalf("expected preserved dirty chain in monthly archive, got %d", archiveChains)
+	}
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_chain_1m`).Scan(&minuteRows); err != nil {
+		t.Fatalf("count cleaned minute chain: %v", err)
+	}
+	if minuteRows != 0 {
+		t.Fatalf("aggregated expired minute chain should be cleaned, got %d", minuteRows)
+	}
+}
+
+func TestAggregateHoursRecomputesEachAffectedDayOnce(t *testing.T) {
+	trafficStore := newTestStore(t)
+	ctx := context.Background()
+	day := time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC)
+	if _, err := trafficStore.db.ExecContext(ctx, `
+CREATE TABLE day_aggregation_audit (id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TRIGGER audit_usage_day_insert AFTER INSERT ON usage_1d BEGIN
+    INSERT INTO day_aggregation_audit (id) VALUES (NULL);
+END;
+CREATE TRIGGER audit_usage_day_update AFTER UPDATE ON usage_1d BEGIN
+    INSERT INTO day_aggregation_audit (id) VALUES (NULL);
+END;
+`); err != nil {
+		t.Fatalf("create day aggregation audit: %v", err)
+	}
+
+	hours := []time.Time{day.Add(time.Hour), day.Add(2 * time.Hour), day.Add(3 * time.Hour)}
+	for index, hour := range hours {
+		minute := hour.Add(5 * time.Minute).Unix()
+		if err := trafficStore.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+			{
+				MinuteTS: minute, Proto: "tcp", Direction: model.DirectionOut, Comm: "curl",
+				LocalPort: 50500, RemoteIP: "1.1.1.1", RemotePort: 443, Attribution: model.AttributionExact,
+			}: {BytesUp: int64(index + 1), FlowCount: 1},
+		}, nil); err != nil {
+			t.Fatalf("seed hour %s: %v", hour, err)
+		}
+	}
+	if err := trafficStore.AggregateHours(ctx, hours); err != nil {
+		t.Fatalf("aggregate catch-up hours: %v", err)
+	}
+	var dayWrites, bytesUp int64
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM day_aggregation_audit`).Scan(&dayWrites); err != nil {
+		t.Fatalf("count day writes: %v", err)
+	}
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT bytes_up FROM usage_1d WHERE day_ts = ?`, day.Unix()).Scan(&bytesUp); err != nil {
+		t.Fatalf("query day total: %v", err)
+	}
+	if dayWrites != 1 || bytesUp != 6 {
+		t.Fatalf("expected one day recomputation with full total, writes=%d bytes=%d", dayWrites, bytesUp)
+	}
+}
+
+func TestCleanupRemovesStaleKnownProcessesButKeepsRecentEntries(t *testing.T) {
+	trafficStore := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	trafficStore.now = func() time.Time { return now }
+	if _, err := trafficStore.db.ExecContext(ctx, `
+INSERT INTO known_processes (pid, comm, exe, seen_ts) VALUES
+    (1, 'stale', '/usr/bin/stale', ?),
+    (2, 'recent', '/usr/bin/recent', ?)
+`, now.Add(-knownProcessRetention-time.Hour).Unix(), now.Add(-time.Hour).Unix()); err != nil {
+		t.Fatalf("seed known processes: %v", err)
+	}
+	if err := trafficStore.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	var stale, recent int
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM known_processes WHERE comm = 'stale'`).Scan(&stale); err != nil {
+		t.Fatalf("count stale process: %v", err)
+	}
+	if err := trafficStore.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM known_processes WHERE comm = 'recent'`).Scan(&recent); err != nil {
+		t.Fatalf("count recent process: %v", err)
+	}
+	if stale != 0 || recent != 1 {
+		t.Fatalf("unexpected known process retention result stale=%d recent=%d", stale, recent)
+	}
+}
+
+func TestPassiveWALCheckpointDoesNotWaitForActiveReader(t *testing.T) {
+	trafficStore := newTestStore(t)
+	ctx := context.Background()
+	minute := time.Date(2026, 4, 20, 10, 15, 0, 0, time.UTC).Unix()
+	key := model.UsageKey{
+		MinuteTS: minute, Proto: "tcp", Direction: model.DirectionOut, Comm: "curl",
+		LocalPort: 50500, RemoteIP: "1.1.1.1", RemotePort: 443, Attribution: model.AttributionExact,
+	}
+	if err := trafficStore.FlushMinute(ctx, minute, map[model.UsageKey]model.UsageDelta{
+		key: {BytesUp: 1},
+	}, nil); err != nil {
+		t.Fatalf("seed first WAL frame: %v", err)
+	}
+
+	readTx, err := trafficStore.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin read snapshot: %v", err)
+	}
+	defer readTx.Rollback()
+	var rows int
+	if err := readTx.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_1m`).Scan(&rows); err != nil {
+		t.Fatalf("establish read snapshot: %v", err)
+	}
+	key.MinuteTS = minute + 60
+	if err := trafficStore.FlushMinute(ctx, minute+60, map[model.UsageKey]model.UsageDelta{
+		key: {BytesUp: 2},
+	}, nil); err != nil {
+		t.Fatalf("seed WAL frame after read snapshot: %v", err)
+	}
+
+	checkpointCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := trafficStore.CheckpointWAL(checkpointCtx); err != nil {
+		t.Fatalf("passive checkpoint with active reader: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("passive checkpoint waited for active reader: %v", elapsed)
+	}
+	if err := readTx.Rollback(); err != nil {
+		t.Fatalf("release read snapshot: %v", err)
+	}
+	if err := trafficStore.CheckpointWALTruncate(ctx); err != nil {
+		t.Fatalf("truncate checkpoint after reader release: %v", err)
 	}
 }
 
@@ -2366,7 +2856,7 @@ func TestQueryTopProcessesAllReturnsAllGroups(t *testing.T) {
 		t.Fatalf("flush minute: %v", err)
 	}
 
-	all, err := store.QueryTopProcessesAll(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, "pid")
+	all, err := store.QueryTopProcessesAllLimited(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, "pid", 0)
 	if err != nil {
 		t.Fatalf("query all top processes: %v", err)
 	}
@@ -2374,7 +2864,7 @@ func TestQueryTopProcessesAllReturnsAllGroups(t *testing.T) {
 		t.Fatalf("expected all 5 pid groups, got %d: %+v", len(all), all)
 	}
 
-	byComm, err := store.QueryTopProcessesAll(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, "comm")
+	byComm, err := store.QueryTopProcessesAllLimited(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, "comm", 0)
 	if err != nil {
 		t.Fatalf("query all top processes by comm: %v", err)
 	}
@@ -2406,7 +2896,7 @@ func TestQueryTopRemotesAllReturnsAllGroups(t *testing.T) {
 		t.Fatalf("flush minute: %v", err)
 	}
 
-	all, err := store.QueryTopRemotesAll(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, model.DirectionOut, true)
+	all, err := store.QueryTopRemotesAllLimited(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, model.DirectionOut, true, 0)
 	if err != nil {
 		t.Fatalf("query all top remotes: %v", err)
 	}
@@ -2414,7 +2904,7 @@ func TestQueryTopRemotesAllReturnsAllGroups(t *testing.T) {
 		t.Fatalf("expected all 4 remote groups, got %d: %+v", len(all), all)
 	}
 
-	inbound, err := store.QueryTopRemotesAll(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, model.DirectionIn, true)
+	inbound, err := store.QueryTopRemotesAllLimited(ctx, minute.Add(-time.Minute), minute.Add(time.Minute), DataSourceMinute, model.DirectionIn, true, 0)
 	if err != nil {
 		t.Fatalf("query inbound top remotes: %v", err)
 	}

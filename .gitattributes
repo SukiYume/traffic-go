@@ -1,0 +1,9 @@
+* text=auto
+
+# Deployment and CI files must remain executable/parseable after a Windows
+# checkout and when packaged for Linux.
+*.sh text eol=lf
+*.service text eol=lf
+Makefile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

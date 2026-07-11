@@ -138,16 +138,6 @@ export function minuteDimensionsUnavailable(dataSource?: DataSource | null) {
   return DATA_SOURCE_META[dataSource].minuteDimensionsUnavailable;
 }
 
-export function bucketLabel(bucket: BucketKey) {
-  return {
-    '1m': '1 分钟',
-    '5m': '5 分钟',
-    '1h': '1 小时',
-    '6h': '6 小时',
-    '1d': '1 天',
-  }[bucket];
-}
-
 export function dataSourceLabel(dataSource: DataSource) {
   return DATA_SOURCE_META[dataSource].label;
 }
@@ -220,14 +210,6 @@ export function formatUrlPath(value?: string | null) {
   } catch {
     return trimmed;
   }
-}
-
-export function attributionLabel(value: string | null | undefined) {
-  if (value === 'exact') return 'exact';
-  if (value === 'heuristic') return 'heuristic';
-  if (value === 'guess') return 'guess';
-  if (value === 'unknown') return 'unknown';
-  return '未标记';
 }
 
 export function attributionDescription(value: string | null | undefined) {

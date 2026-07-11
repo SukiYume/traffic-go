@@ -2,6 +2,8 @@ package evidence
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +15,11 @@ import (
 )
 
 type fakeEvidenceStore struct {
-	upserted []model.LogEvidence
+	upserted   []model.LogEvidence
+	upsertErr  error
+	batchSizes []int
+	batchCalls int
+	failBatch  int
 }
 
 func (f *fakeEvidenceStore) QueryLogEvidence(context.Context, store.LogEvidenceQuery) ([]model.LogEvidence, error) {
@@ -21,6 +27,14 @@ func (f *fakeEvidenceStore) QueryLogEvidence(context.Context, store.LogEvidenceQ
 }
 
 func (f *fakeEvidenceStore) UpsertLogEvidenceBatch(_ context.Context, rows []model.LogEvidence) error {
+	f.batchCalls++
+	f.batchSizes = append(f.batchSizes, len(rows))
+	if f.upsertErr != nil {
+		return f.upsertErr
+	}
+	if f.failBatch > 0 && f.batchCalls == f.failBatch {
+		return errors.New("injected batch failure")
+	}
 	f.upserted = append(f.upserted, rows...)
 	return nil
 }
@@ -45,8 +59,12 @@ func TestLookupOrScanReturnsPartialRowsWhenScanBudgetExpires(t *testing.T) {
 	endTS := time.Date(2026, 4, 18, 12, 1, 0, 0, time.UTC).Unix()
 	bucketTS := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC).Unix()
 
+	parserCalls := 0
 	parser := func(source string, line string, _ time.Time) (model.LogEvidence, bool) {
-		time.Sleep(10 * time.Millisecond)
+		parserCalls++
+		if parserCalls > 1 {
+			time.Sleep(15 * time.Millisecond)
+		}
 		return Normalize(model.LogEvidence{
 			Source:  source,
 			EventTS: bucketTS,
@@ -57,7 +75,10 @@ func TestLookupOrScanReturnsPartialRowsWhenScanBudgetExpires(t *testing.T) {
 		}), true
 	}
 
-	rows, note, err := LookupOrScan(context.Background(), store, SearchOptions{
+	persistCtx := context.Background()
+	sharedScanCtx, cancel := context.WithTimeout(persistCtx, 40*time.Millisecond)
+	defer cancel()
+	rows, note, err := LookupOrScan(persistCtx, store, SearchOptions{
 		Source:               "ss",
 		LogDir:               logPath,
 		BucketTS:             bucketTS,
@@ -65,10 +86,12 @@ func TestLookupOrScanReturnsPartialRowsWhenScanBudgetExpires(t *testing.T) {
 		Parser:               parser,
 		StrictWindow:         120,
 		FallbackWindow:       900,
-		ScanBudget:           25 * time.Millisecond,
+		ScanBudget:           40 * time.Millisecond,
 		MaxScanFilesStrict:   1,
 		MaxScanFilesFallback: 1,
 		MaxScanLinesPerFile:  100,
+		ScanContext:          sharedScanCtx,
+		PersistContext:       persistCtx,
 	})
 	if err != nil {
 		t.Fatalf("lookup or scan: %v", err)
@@ -286,6 +309,158 @@ func TestPrefetchWindowUsesCursorForAppendedPlainLogs(t *testing.T) {
 	}
 	if third.RowsImported != 0 {
 		t.Fatalf("expected third prefetch to skip unchanged file, got %+v", third)
+	}
+}
+
+func TestPrefetchWindowDoesNotAdvanceCursorWhenPersistenceFails(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ss-server.log")
+	if err := os.WriteFile(logPath, []byte("2026-04-18T12:00:00Z connect to first.example:443\n"), 0o644); err != nil {
+		t.Fatalf("write initial log: %v", err)
+	}
+
+	evidenceStore := &fakeEvidenceStore{}
+	cursors := make(map[string]PrefetchCursor)
+	cursorKey := func(source string, path string) string { return source + "|" + path }
+	lookupCursor := func(source string, path string) (PrefetchCursor, bool) {
+		cursor, ok := cursors[cursorKey(source, path)]
+		return cursor, ok
+	}
+	commitCursor := func(source string, path string, cursor PrefetchCursor) {
+		cursors[cursorKey(source, path)] = cursor
+	}
+	parseLine := func(source string, line string, _ time.Time) (model.LogEvidence, bool) {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			return model.LogEvidence{}, false
+		}
+		ts, err := time.Parse(time.RFC3339, fields[0])
+		if err != nil {
+			return model.LogEvidence{}, false
+		}
+		hostPort := fields[len(fields)-1]
+		return Normalize(model.LogEvidence{
+			Source: source, EventTS: ts.Unix(), Host: strings.TrimSuffix(hostPort, ":443"),
+			Method: "connect", Message: line,
+		}), true
+	}
+	options := PrefetchOptions{
+		Source:              "ss",
+		LogDir:              logPath,
+		StartTS:             time.Date(2026, 4, 18, 11, 59, 0, 0, time.UTC).Unix(),
+		EndTS:               time.Date(2026, 4, 18, 12, 5, 0, 0, time.UTC).Unix(),
+		Parser:              parseLine,
+		MaxScanFiles:        1,
+		MaxScanLinesPerFile: 100,
+		CursorLookup:        lookupCursor,
+		CursorCommit:        commitCursor,
+	}
+	if _, err := PrefetchWindow(context.Background(), evidenceStore, options); err != nil {
+		t.Fatalf("initial prefetch: %v", err)
+	}
+	key := cursorKey("ss", logPath)
+	previous, ok := cursors[key]
+	if !ok || previous.Offset == 0 {
+		t.Fatalf("initial cursor was not committed: %+v", cursors)
+	}
+
+	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := file.WriteString("2026-04-18T12:01:00Z connect to retry.example:443\n"); err != nil {
+		_ = file.Close()
+		t.Fatalf("append retry row: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close append: %v", err)
+	}
+
+	evidenceStore.upsertErr = errors.New("injected upsert failure")
+	if _, err := PrefetchWindow(context.Background(), evidenceStore, options); err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	if got := cursors[key]; got != previous {
+		t.Fatalf("cursor advanced across failed persistence: before=%+v after=%+v", previous, got)
+	}
+
+	evidenceStore.upsertErr = nil
+	result, err := PrefetchWindow(context.Background(), evidenceStore, options)
+	if err != nil {
+		t.Fatalf("retry prefetch: %v", err)
+	}
+	if result.RowsImported != 1 {
+		t.Fatalf("retry skipped unpersisted appended row: %+v", result)
+	}
+	if got := evidenceStore.upserted[len(evidenceStore.upserted)-1].Host; got != "retry.example" {
+		t.Fatalf("unexpected retried evidence row: %+v", evidenceStore.upserted)
+	}
+}
+
+func TestPrefetchWindowPersistsAtMostFiveHundredRowsPerBatchBeforeCursorPublish(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "service.log")
+	var content strings.Builder
+	for index := 0; index < 501; index++ {
+		fmt.Fprintf(&content, "row-%04d.example\n", index)
+	}
+	if err := os.WriteFile(logPath, []byte(content.String()), 0o600); err != nil {
+		t.Fatalf("write batch log: %v", err)
+	}
+
+	evidenceStore := &fakeEvidenceStore{failBatch: 2}
+	cursors := make(map[string]PrefetchCursor)
+	lookupCursor := func(source, path string) (PrefetchCursor, bool) {
+		cursor, ok := cursors[source+"|"+path]
+		return cursor, ok
+	}
+	commitCursor := func(source, path string, cursor PrefetchCursor) {
+		cursors[source+"|"+path] = cursor
+	}
+	reference := time.Now().UTC().Truncate(time.Second)
+	parser := func(source string, line string, reference time.Time) (model.LogEvidence, bool) {
+		return Normalize(model.LogEvidence{
+			Source: source, EventTS: reference.Unix(), Host: line,
+			Method: "test", Message: line, Fingerprint: line,
+		}), true
+	}
+	options := PrefetchOptions{
+		Source: "test", LogDir: logPath,
+		StartTS: reference.Add(-time.Minute).Unix(), EndTS: reference.Add(time.Minute).Unix(), ReferenceTS: reference.Unix(),
+		Parser: parser, MaxScanFiles: 1, MaxScanLinesPerFile: 1000,
+		CursorLookup: lookupCursor, CursorCommit: commitCursor,
+	}
+
+	if _, err := PrefetchWindow(context.Background(), evidenceStore, options); err == nil {
+		t.Fatal("expected second persistence batch to fail")
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursor published after intermediate batch failure: %+v", cursors)
+	}
+	if len(evidenceStore.batchSizes) != 2 || evidenceStore.batchSizes[0] != 500 || evidenceStore.batchSizes[1] != 1 {
+		t.Fatalf("unexpected failed-attempt batch sizes: %+v", evidenceStore.batchSizes)
+	}
+
+	evidenceStore.failBatch = 0
+	evidenceStore.batchCalls = 0
+	evidenceStore.batchSizes = nil
+	result, err := PrefetchWindow(context.Background(), evidenceStore, options)
+	if err != nil {
+		t.Fatalf("retry batched prefetch: %v", err)
+	}
+	if result.RowsImported != 501 {
+		t.Fatalf("retry imported %d rows, want 501", result.RowsImported)
+	}
+	if len(evidenceStore.batchSizes) != 2 || evidenceStore.batchSizes[0] != 500 || evidenceStore.batchSizes[1] != 1 {
+		t.Fatalf("unexpected retry batch sizes: %+v", evidenceStore.batchSizes)
+	}
+	for _, size := range evidenceStore.batchSizes {
+		if size > prefetchEvidencePersistBatchSize {
+			t.Fatalf("persistence batch exceeded cap: %d", size)
+		}
+	}
+	if got := cursors["test|"+logPath].Offset; got != int64(len(content.String())) {
+		t.Fatalf("cursor=%d, want EOF=%d after all batches succeeded", got, len(content.String()))
 	}
 }
 

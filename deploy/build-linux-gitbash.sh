@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 
 find_go() {
-  if command -v go >/dev/null 2>&1; then
-    command -v go
+  if [[ -n "${GO:-}" ]]; then
+    printf '%s\n' "${GO}"
     return 0
   fi
 
-  if [[ -f "${ROOT_DIR}/.tools/go/bin/go.exe" ]]; then
+  # The repository-local toolchain is intentionally preferred so a stale
+  # system Go cannot silently determine release provenance.
+  if [[ -x "${ROOT_DIR}/.tools/go/bin/go.exe" ]]; then
     printf '%s\n' "${ROOT_DIR}/.tools/go/bin/go.exe"
+    return 0
+  fi
+
+  if command -v go >/dev/null 2>&1; then
+    command -v go
     return 0
   fi
 
@@ -19,13 +26,20 @@ find_go() {
 }
 
 find_npm() {
-  if command -v npm.cmd >/dev/null 2>&1; then
-    printf '%s\n' "npm.cmd"
+  if [[ -n "${NPM:-}" ]]; then
+    printf '%s\n' "${NPM}"
     return 0
   fi
 
+  # Prefer the POSIX launcher shipped in the Windows Node archive. It preserves
+  # argument boundaries in Git Bash and is executable, unlike npm.cmd on NTFS.
   if command -v npm >/dev/null 2>&1; then
     printf '%s\n' "npm"
+    return 0
+  fi
+
+  if command -v npm.cmd >/dev/null 2>&1; then
+    printf '%s\n' "npm.cmd"
     return 0
   fi
 
@@ -51,6 +65,7 @@ echo "Using npm: ${NPM_BIN}"
 APP_NAME="traffic-go" \
 GO="${GO_BIN}" \
 NPM="${NPM_BIN}" \
+GOTOOLCHAIN="${GOTOOLCHAIN:-go1.26.5+auto}" \
 WEB_DIR="web" \
 RELEASE_ROOT="release" \
 bash "${SCRIPT_DIR}/package-release.sh"

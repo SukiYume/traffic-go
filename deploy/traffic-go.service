@@ -8,18 +8,33 @@ Wants=network-online.target
 Type=simple
 User=__RUN_USER__
 Group=__RUN_GROUP__
-WorkingDirectory=__INSTALL_ROOT__
-ExecStartPre=-__MODPROBE_BIN__ nf_conntrack
-ExecStartPre=-__SYSCTL_BIN__ -w net.netfilter.nf_conntrack_acct=1
+WorkingDirectory=__STATE_DIR__
 ExecStart=__INSTALL_BIN__ -config __INSTALL_CONFIG__
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=30
+TimeoutStopSec=30
 LimitNOFILE=65536
-UMask=0007
+LimitCORE=0
+UMask=0077
 NoNewPrivileges=true
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__STATE_DIR__
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

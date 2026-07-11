@@ -1,4 +1,4 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query";
 import { createColumnHelper, type SortingState } from "@tanstack/react-table";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
@@ -8,11 +8,18 @@ import { EmptyState } from "../components/EmptyState";
 import { FiltersBar } from "../components/FiltersBar";
 import { QueryErrorState } from "../components/QueryErrorState";
 import { RangeSelect } from "../components/RangeSelect";
-import { isDimensionUnavailableError, normalizeUsageSortKey } from "../api";
+import { RefreshControl } from "../components/RefreshControl";
+import {
+  ApiError,
+  isDimensionUnavailableError,
+  normalizeUsageSortKey,
+} from "../api";
 import { useApiClient } from "../api-context";
+import { latestSuccessfulUpdate, liveQueryOptions } from "../query-refresh";
 import type { DataSource, RangeKey, UsageExplain, UsageRow } from "../types";
 import { useRangeSearchParam } from "../useRangeSearchParam";
 import { useResettingPage } from "../useResettingPage";
+import { useExactTotal } from "../useExactTotal";
 import {
   attributionDescription,
   clampText,
@@ -56,7 +63,9 @@ function usageRowKey(row: UsageRow) {
   ]);
 }
 
-function explicitUsageWindowFromParams(params: URLSearchParams): ExplicitUsageWindow | null {
+function explicitUsageWindowFromParams(
+  params: URLSearchParams,
+): ExplicitUsageWindow | null {
   const start = Number(params.get("start"));
   const end = Number(params.get("end"));
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
@@ -90,8 +99,14 @@ function setUsageSearchParams(
   setParams(nextParams, { replace: true });
 }
 
-function defaultUsageSorting(range: RangeKey, explicitWindow: ExplicitUsageWindow | null): SortingState {
-  if (!explicitWindow && (range === "last_month" || range === "two_months_ago")) {
+function defaultUsageSorting(
+  range: RangeKey,
+  explicitWindow: ExplicitUsageWindow | null,
+): SortingState {
+  if (
+    !explicitWindow &&
+    (range === "last_month" || range === "two_months_ago")
+  ) {
     return [{ id: "bytesTotal", desc: true }];
   }
   return [{ id: "minuteTs", desc: true }];
@@ -142,7 +157,12 @@ function loopbackLinks(row: UsageRow, explain: UsageExplain) {
     if (!peer.remoteIp || isLoopbackIp(peer.remoteIp)) continue;
     const port = peer.remotePort != null ? `:${peer.remotePort}` : "";
     const key = `peer-${peer.direction}-${peer.remoteIp}-${peer.localPort ?? ""}-${peer.remotePort ?? ""}`;
-    if (links.some((link) => link.key === key || link.title.includes(peer.remoteIp))) continue;
+    if (
+      links.some(
+        (link) => link.key === key || link.title.includes(peer.remoteIp),
+      )
+    )
+      continue;
     links.push({
       key,
       title: `${endpoint} ↔ ${peer.remoteIp}${port}`,
@@ -248,12 +268,11 @@ function UsageExpandPanel({
   dataSource?: DataSource;
 }): ReactNode {
   const api = useApiClient();
-  const [allowScan, setAllowScan] = useState(false);
   const serviceName = serviceNameForPort(row.remotePort, row.proto);
   const portLabel =
     row.remotePort != null
       ? serviceName
-      ? `${row.remotePort} / ${serviceName}`
+        ? `${row.remotePort} / ${serviceName}`
         : String(row.remotePort)
       : "未知";
   const bucketSeconds = usageBucketSeconds(dataSource);
@@ -263,7 +282,6 @@ function UsageExpandPanel({
   const explainQuery = useQuery({
     queryKey: [
       "usage-explain",
-      allowScan,
       dataSource,
       row.minuteTs,
       row.proto,
@@ -276,12 +294,43 @@ function UsageExpandPanel({
       row.remotePort,
       row.attribution,
     ],
-    queryFn: ({ signal }) => api.getUsageExplain(row, { dataSource, allowScan }, { signal }),
+    queryFn: ({ signal }) =>
+      api.getUsageExplain(row, { dataSource }, { signal }),
     enabled: dataSource != null,
     staleTime: 30_000,
+    refetchOnWindowFocus: true,
   });
-  const explain = explainQuery.data;
-  const canDeepScan = dataSource === "usage_1m" && !allowScan;
+  const [scanRetrying, setScanRetrying] = useState(false);
+  const scanMutation = useMutation({
+    mutationFn: async () => {
+      const maxRetries = 3;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await api.getUsageExplain(row, {
+            dataSource,
+            allowScan: true,
+          });
+        } catch (error) {
+          if (
+            !(error instanceof ApiError) ||
+            error.code !== "scan_rate_limited" ||
+            attempt >= maxRetries
+          ) {
+            throw error;
+          }
+          const retryDelayMs = Math.min(
+            5_000,
+            Math.max(100, (error.retryAfterSeconds ?? 2) * 1_000),
+          );
+          setScanRetrying(true);
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+        }
+      }
+    },
+    onSettled: () => setScanRetrying(false),
+  });
+  const explain = scanMutation.data ?? explainQuery.data;
+  const canDeepScan = dataSource === "usage_1m";
   const loopbackCandidates =
     explain && isLoopbackIp(row.remoteIp) ? loopbackLinks(row, explain) : [];
 
@@ -326,26 +375,51 @@ function UsageExpandPanel({
           <strong>
             {explain
               ? `置信度 ${explainConfidenceLabel(explain.confidence)}`
-              : explainQuery.isPending
+              : explainQuery.isPending || scanMutation.isPending
                 ? "分析中…"
-              : "未命中"}
+                : "未命中"}
           </strong>
         </div>
-        {canDeepScan ? (
+        {canDeepScan && !scanMutation.isSuccess ? (
           <div className="row-expand-actions">
             <button
               type="button"
               className="chip"
-              onClick={() => setAllowScan(true)}
+              onClick={() => scanMutation.mutate()}
+              disabled={scanMutation.isPending}
             >
-              尝试深度扫描日志
+              {scanRetrying
+                ? "等待扫描槽位"
+                : scanMutation.isPending
+                  ? "深度扫描中"
+                  : scanMutation.isError
+                    ? "重试深度扫描日志"
+                    : "尝试深度扫描日志"}
             </button>
           </div>
         ) : null}
-        {explainQuery.isError ? (
-          <div className="row-expand-analysis-note">分析失败，请稍后重试。</div>
+        {explainQuery.isError && !explain ? (
+          <div className="row-expand-analysis-note">
+            分析失败。
+            <button
+              type="button"
+              className="chip ghost"
+              onClick={() => void explainQuery.refetch()}
+            >
+              重试
+            </button>
+          </div>
         ) : null}
-        {allowScan && explainQuery.isPending ? (
+        {scanMutation.isError ? (
+          <div className="row-expand-analysis-note" role="alert">
+            深度扫描失败：
+            {scanMutation.error instanceof Error &&
+            scanMutation.error.message.trim()
+              ? scanMutation.error.message
+              : "请稍后重试。"}
+          </div>
+        ) : null}
+        {scanMutation.isPending ? (
           <div className="row-expand-analysis-note">
             正在扫描配置的日志文件并回填更深的关联线索…
           </div>
@@ -515,7 +589,8 @@ function UsageExpandPanel({
 
 export function UsagePage() {
   const api = useApiClient();
-  const { range, explicitWindow, filters, setRange, setFilters } = useUsageFilters();
+  const { range, explicitWindow, filters, setRange, setFilters } =
+    useUsageFilters();
   const defaultSorting = useMemo(
     () => defaultUsageSorting(range, explicitWindow),
     [range, explicitWindow?.start, explicitWindow?.end],
@@ -526,7 +601,9 @@ export function UsagePage() {
   // Serialize filters to a stable string so this effect only fires when filter
   // values actually change, not on every render (filters object is recreated each render).
   const filtersKey = JSON.stringify(filters);
-  const windowKey = explicitWindow ? `${explicitWindow.start}-${explicitWindow.end}` : range;
+  const windowKey = explicitWindow
+    ? `${explicitWindow.start}-${explicitWindow.end}`
+    : range;
   const pageResetKey = JSON.stringify([
     windowKey,
     filtersKey,
@@ -534,6 +611,7 @@ export function UsagePage() {
     sorting[0]?.desc ?? null,
   ]);
   const [page, setPage] = useResettingPage(pageResetKey);
+  const { includeTotal, requestExactTotal } = useExactTotal(pageResetKey);
 
   useEffect(() => {
     setSorting(defaultSorting);
@@ -557,30 +635,39 @@ export function UsagePage() {
       page,
       currentSort?.id,
       currentSort?.desc,
+      includeTotal,
     ],
     queryFn: ({ signal }) =>
-      api.getUsage({
-        ...(explicitWindow ? { start: explicitWindow.start, end: explicitWindow.end } : { range }),
-        ...filters,
-        page,
-        pageSize,
-        sortBy: normalizeUsageSortKey(currentSort?.id),
-        sortOrder: currentSort?.desc ? "desc" : "asc",
-        includeTotal: true,
-      }, { signal }),
+      api.getUsage(
+        {
+          ...(explicitWindow
+            ? { start: explicitWindow.start, end: explicitWindow.end }
+            : { range }),
+          ...filters,
+          page,
+          pageSize,
+          sortBy: normalizeUsageSortKey(currentSort?.id),
+          sortOrder: currentSort?.desc ? "desc" : "asc",
+          includeTotal,
+        },
+        { signal },
+      ),
     placeholderData: keepPreviousData,
+    ...liveQueryOptions,
   });
   const processes = useQuery({
     queryKey: ["processes"],
     queryFn: ({ signal }) => api.getProcesses({ signal }),
+    ...liveQueryOptions,
   });
+  const currentData = query.isPlaceholderData ? undefined : query.data;
 
   useEffect(() => {
-    if (!minuteDimensionsUnavailable(query.data?.dataSource ?? null)) return;
+    if (!minuteDimensionsUnavailable(currentData?.dataSource ?? null)) return;
     if (!filters.pid && !filters.exe && !filters.attribution) return;
     setFilters(clearMinuteOnlyFilters(filters));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtersKey, query.data?.dataSource]);
+  }, [filtersKey, currentData?.dataSource]);
 
   useEffect(() => {
     if (!isDimensionUnavailableError(query.error)) return;
@@ -598,7 +685,9 @@ export function UsagePage() {
   );
 
   const columns = useMemo(() => {
-    const isAggregated = minuteDimensionsUnavailable(query.data?.dataSource ?? null);
+    const isAggregated = minuteDimensionsUnavailable(
+      currentData?.dataSource ?? null,
+    );
 
     const baseColumns = [
       columnHelper.accessor("minuteTs", {
@@ -632,7 +721,9 @@ export function UsagePage() {
               >
                 {ip}
               </button>
-              {isLoopbackIp(ip) ? <span className="inline-tag">本机回环</span> : null}
+              {isLoopbackIp(ip) ? (
+                <span className="inline-tag">本机回环</span>
+              ) : null}
             </span>
           );
         },
@@ -731,12 +822,13 @@ export function UsagePage() {
     ];
 
     return [...baseColumns, ...detailedColumns, ...tailColumns];
-  }, [query.data?.dataSource, onFilterByIp]);
+  }, [currentData?.dataSource, onFilterByIp]);
 
-  const usageTableClassName =
-    minuteDimensionsUnavailable(query.data?.dataSource ?? null)
-      ? "usage-table usage-table-hourly table-dense"
-      : "usage-table table-dense";
+  const usageTableClassName = minuteDimensionsUnavailable(
+    currentData?.dataSource ?? null,
+  )
+    ? "usage-table usage-table-hourly table-dense"
+    : "usage-table table-dense";
 
   return (
     <div className="page">
@@ -746,7 +838,7 @@ export function UsagePage() {
           <h2>流量明细</h2>
           <p>
             这里展示逐条连接记录，适合做精细排查：建议先按时间和方向收敛范围，再按进程、PID、EXE
-            或对端 IP 过滤， 点击任意行可展开查看速率、归因与日志关联线索。
+            或对端 IP 过滤；点击任意数据行可展开或收起速率、归因与日志关联线索。
             <br />
             <strong style={{ color: "#94a3b8" }}>归因状态说明：</strong>{" "}
             exact(精确命中
@@ -757,35 +849,62 @@ export function UsagePage() {
               <strong>时间范围</strong>
               <span>{explicitWindow?.label ?? rangeLabel(range)}</span>
             </div>
-            {query.data ? (
-              <DataSourceBadge dataSource={query.data.dataSource} />
+            {currentData ? (
+              <DataSourceBadge
+                dataSource={currentData.dataSource}
+                coverage={currentData.coverage}
+              />
             ) : null}
           </section>
         </div>
-        <RangeSelect value={range} onChange={setRange} />
+        <div className="page-head-actions">
+          <RangeSelect value={range} onChange={setRange} />
+          <RefreshControl
+            updatedAt={latestSuccessfulUpdate(
+              query.dataUpdatedAt,
+              processes.dataUpdatedAt,
+            )}
+            isFetching={query.isFetching || processes.isFetching}
+            onRefresh={() =>
+              Promise.all([query.refetch(), processes.refetch()])
+            }
+          />
+        </div>
       </header>
 
       <FiltersBar
-        dataSource={query.data?.dataSource}
+        dataSource={currentData?.dataSource}
         processes={processes.data?.processes ?? []}
         filters={filters}
         onChange={setFilters}
       />
 
-      {query.isError && query.data?.rows.length ? (
+      {query.isError && currentData?.rows.length ? (
         <QueryErrorState
           error={query.error}
-          title="明细刷新失败，当前展示旧结果"
+          title="明细刷新失败，当前展示上次成功结果"
           compact
+          onRetry={query.refetch}
+          retrying={query.isFetching}
         />
       ) : null}
 
-      {query.isError && !query.data?.rows.length ? (
-        <QueryErrorState error={query.error} title="明细加载失败" />
-      ) : query.data?.rows.length ? (
+      {query.isError && !currentData?.rows.length ? (
+        <QueryErrorState
+          error={query.error}
+          title="明细加载失败"
+          onRetry={query.refetch}
+          retrying={query.isFetching}
+        />
+      ) : query.isPlaceholderData || (query.isPending && !currentData) ? (
+        <EmptyState
+          title="明细加载中"
+          description="正在读取当前时间范围和筛选条件下的流量记录。"
+        />
+      ) : currentData?.rows.length ? (
         <DataTable
           columns={columns}
-          data={query.data.rows}
+          data={currentData.rows}
           tableClassName={usageTableClassName}
           sorting={sorting}
           onSortingChange={setSorting}
@@ -798,16 +917,18 @@ export function UsagePage() {
             <UsageExpandPanel
               row={row}
               onFilterByIp={onFilterByIp}
-              dataSource={query.data?.dataSource}
+              dataSource={currentData.dataSource}
             />
           )}
           pagination={{
-            page: query.data.page,
-            pageSize: query.data.pageSize,
-            totalRows: query.data.totalRows,
-            hasMore: query.data.hasMore,
-            totalRowsExact: query.data.totalRowsExact,
+            page: currentData.page,
+            pageSize: currentData.pageSize,
+            totalRows: currentData.totalRows,
+            hasMore: currentData.hasMore,
+            totalRowsExact: currentData.totalRowsExact,
             onPageChange: setPage,
+            onRequestExactTotal: requestExactTotal,
+            exactTotalBusy: query.isFetching && includeTotal,
           }}
         />
       ) : (

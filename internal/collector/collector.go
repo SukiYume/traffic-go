@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"runtime"
@@ -21,32 +22,36 @@ type Runner interface {
 	Start(context.Context) error
 	ActiveProcesses() []model.ProcessListItem
 	ActiveStats() model.ActiveStats
+	ReadyStatus() model.CollectorReadiness
 	Diagnostics() model.CollectorDiagnostics
 }
 
 type Service struct {
-	cfg               config.Config
-	store             *store.Store
-	logger            *log.Logger
-	resolver          *processResolver
-	currentMinute     time.Time
-	buckets           map[model.UsageKey]*bucketState
-	forwardBuckets    map[model.ForwardUsageKey]*bucketState
-	interfaceBuckets  map[string]model.InterfaceUsageDelta
-	usageFlowOwner    map[string]model.UsageKey
-	fwdFlowOwner      map[string]model.ForwardUsageKey
-	runtimeMu         sync.RWMutex
-	snapshots         map[string]model.FlowSnapshot
-	snapshotReady     bool
-	processHints      map[string]processHint
-	localIPs          map[string]struct{}
-	lastIPRefresh     time.Time
-	interfaceCounters map[string]interfaceCounter
-	socketIndex       socketIndex
-	lastSockRefresh   time.Time
-	socketReady       bool
-	warnedNoAcct      bool
-	lastTickMetrics   tickMetrics
+	cfg                     config.Config
+	store                   *store.Store
+	logger                  *log.Logger
+	resolver                *processResolver
+	currentMinute           time.Time
+	buckets                 map[model.UsageKey]*bucketState
+	forwardBuckets          map[model.ForwardUsageKey]*bucketState
+	interfaceBuckets        map[string]model.InterfaceUsageDelta
+	usageFlowOwner          map[string]model.UsageKey
+	fwdFlowOwner            map[string]model.ForwardUsageKey
+	frozenFlowSequence      uint64
+	runtimeMu               sync.RWMutex
+	snapshots               map[string]model.FlowSnapshot
+	snapshotReady           bool
+	processHints            map[string]processHint
+	localIPs                map[string]struct{}
+	lastIPRefresh           time.Time
+	interfaceCounters       map[string]interfaceCounter
+	socketIndex             socketIndex
+	lastSockRefresh         time.Time
+	socketReady             bool
+	warnedNoAcct            bool
+	lastTickMetrics         tickMetrics
+	lastSuccessfulTick      time.Time
+	consecutiveTickFailures int64
 }
 
 type bucketState struct {
@@ -55,7 +60,6 @@ type bucketState struct {
 	pktsUp    int64
 	pktsDown  int64
 	flowCount int64
-	flows     map[string]struct{}
 	perFlow   map[string]flowContribution
 }
 
@@ -129,6 +133,10 @@ func (f *failingCollector) ActiveStats() model.ActiveStats {
 	return model.ActiveStats{}
 }
 
+func (f *failingCollector) ReadyStatus() model.CollectorReadiness {
+	return model.CollectorReadiness{}
+}
+
 func (f *failingCollector) Diagnostics() model.CollectorDiagnostics {
 	return model.CollectorDiagnostics{
 		AttributionCounts: make(map[string]int64),
@@ -140,14 +148,13 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := s.refreshLocalIPs(); err != nil {
 		s.logger.Printf("refresh local IPs: %v", err)
 	}
-	ticker := time.NewTicker(s.cfg.TickInterval)
-	defer ticker.Stop()
+	// Schedule the next collection only after the current one finishes. A ticker
+	// retains a pending tick while collection is slow, which makes an overloaded
+	// single-core host run ticks back-to-back with no recovery window.
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 
 	for {
-		if err := s.runTick(ctx, time.Now().UTC()); err != nil {
-			s.logger.Printf("collector tick failed: %v", err)
-		}
-
 		select {
 		case <-ctx.Done():
 			flushCtx, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
@@ -156,9 +163,28 @@ func (s *Service) Start(ctx context.Context) error {
 			}
 			cancel()
 			return nil
-		case <-ticker.C:
+		case <-timer.C:
+			tickAt := time.Now().UTC()
+			if err := s.runTick(ctx, tickAt); err != nil {
+				s.recordTickOutcome(time.Now().UTC(), err)
+				s.logger.Printf("collector tick failed: %v", err)
+			} else {
+				s.recordTickOutcome(time.Now().UTC(), nil)
+			}
+			timer.Reset(s.cfg.TickInterval)
 		}
 	}
+}
+
+func (s *Service) recordTickOutcome(at time.Time, err error) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	if err != nil {
+		s.consecutiveTickFailures++
+		return
+	}
+	s.lastSuccessfulTick = at.UTC()
+	s.consecutiveTickFailures = 0
 }
 
 func (s *Service) runTick(ctx context.Context, now time.Time) error {
@@ -187,13 +213,13 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 	}
 
 	conntrackStarted := time.Now()
-	flows, err := ReadConntrackSnapshot(s.cfg.ConntrackPath)
+	flows, err := readConntrackObservations(s.cfg.ConntrackPath)
 	metrics.conntrackRead = time.Since(conntrackStarted)
 	if err != nil {
 		return err
 	}
 	metrics.rawFlowCount = len(flows)
-	if len(flows) > 0 && !s.warnedNoAcct && !hasConntrackAccounting(flows) {
+	if len(flows) > 0 && !s.warnedNoAcct && !hasConntrackObservationAccounting(flows) {
 		s.logger.Printf("conntrack accounting appears disabled; enable `sysctl -w net.netfilter.nf_conntrack_acct=1` to collect byte and packet counters")
 		s.warnedNoAcct = true
 	}
@@ -208,7 +234,7 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 
 	inodesNeeded := make(map[uint64]struct{})
 	localIPs := s.localIPSnapshot()
-	observed := normalizeObservedFlows(flows, localIPs, socketIndex)
+	observed := normalizeConntrackObservations(flows, localIPs, socketIndex)
 	metrics.observedFlowCount = len(observed)
 	for _, flow := range observed {
 		if flow.Classified.Inode > 0 {
@@ -219,9 +245,17 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 	resolveStarted := time.Now()
 	processes := s.resolver.Resolve(ctx, inodesNeeded)
 	metrics.processResolve = time.Since(resolveStarted)
-	prevSnapshots := s.snapshotCopy()
-	baselineReady := s.isSnapshotReady()
-	nextSnapshots := s.carryForwardSnapshots(prevSnapshots, now)
+	// Build one mutable next-state map. Stale entries are retained only when the
+	// same identity was observed again, allowing a confirmed conntrack lineage to
+	// resume from its last counters after a long read outage without keeping every
+	// vanished flow indefinitely.
+	nextSnapshots, baselineReady, expiredOwnership := s.snapshotsForTick(now, observed)
+	for flowID := range expiredOwnership {
+		// Once a snapshot ages out, its contribution belongs to a completed
+		// generation even if the tuple is absent on this tick. Freezing now is
+		// essential: otherwise a later tuple reuse could inherit its owner.
+		s.releaseFlowOwnership(flowID)
+	}
 
 	for _, flow := range observed {
 		classified := flow.Classified
@@ -234,11 +268,8 @@ func (s *Service) runTick(ctx context.Context, now time.Time) error {
 		}
 
 		flowID := string(flow.Identity)
-		prev, exists := prevSnapshots[flowID]
-		if exists && now.Sub(prev.LastSeen) > defaultFlowGraceTTL {
-			exists = false
-		}
-		lineageContinues := observedLineageContinues(prev, flow.Flow.CTID, flow.RawIDs)
+		prev, exists := nextSnapshots[flowID]
+		lineageContinues := observedLineageContinues(prev, flow.Flow.CTID, flow.Flow.SyntheticCTID, flow.RawIDs)
 		snapshot, delta, forwardDelta, countFlow, resetOwners := s.updateSnapshot(now, flow.Flow, classified, process, prev, exists, baselineReady, lineageContinues)
 		nextSnapshots[flowID] = snapshot
 		if snapshot.Direction != model.DirectionForward && snapshot.PID > 0 {
@@ -293,9 +324,18 @@ func (s *Service) collectInterfaceDeltas() error {
 			continue
 		}
 		if previous, ok := s.interfaceCounters[counter.Name]; ok {
+			rxBytes, rxOK := representableCounterDelta(counter.RxBytes, previous.RxBytes)
+			txBytes, txOK := representableCounterDelta(counter.TxBytes, previous.TxBytes)
+			if !rxOK || !txOK {
+				// SQLite stores signed 64-bit counters. Treat an unrepresentable
+				// kernel delta as a corrupt sample, advance the baseline below, and
+				// resume with the next representable increment.
+				s.interfaceCounters[counter.Name] = counter
+				continue
+			}
 			delta := model.InterfaceUsageDelta{
-				RxBytes: int64(clampDelta(counter.RxBytes, previous.RxBytes)),
-				TxBytes: int64(clampDelta(counter.TxBytes, previous.TxBytes)),
+				RxBytes: rxBytes,
+				TxBytes: txBytes,
 			}
 			if delta.RxBytes != 0 || delta.TxBytes != 0 {
 				current := s.interfaceBuckets[counter.Name]
@@ -399,9 +439,49 @@ func (s *Service) carryForwardSnapshots(prev map[string]model.FlowSnapshot, now 
 	return next
 }
 
-func hasConntrackAccounting(flows []model.ConntrackFlow) bool {
+func (s *Service) snapshotsForTick(now time.Time, observed []observedFlow) (map[string]model.FlowSnapshot, bool, map[string]struct{}) {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+
+	next := make(map[string]model.FlowSnapshot, len(s.snapshots))
+	expiredOwnership := make(map[string]struct{})
+	for flowID, snapshot := range s.snapshots {
+		if now.Sub(snapshot.LastSeen) <= defaultFlowGraceTTL {
+			next[flowID] = snapshot
+		} else {
+			expiredOwnership[flowID] = struct{}{}
+		}
+	}
+	for _, flow := range observed {
+		flowID := string(flow.Identity)
+		if _, exists := next[flowID]; exists {
+			continue
+		}
+		if snapshot, exists := s.snapshots[flowID]; exists {
+			if (!snapshot.SyntheticCTID && !flow.Flow.SyntheticCTID) || syntheticCountersContinue(snapshot, flow.Flow) {
+				next[flowID] = snapshot
+				delete(expiredOwnership, flowID)
+			} else {
+				expiredOwnership[flowID] = struct{}{}
+			}
+		}
+	}
+	return next, s.snapshotReady, expiredOwnership
+}
+
+func syntheticCountersContinue(previous model.FlowSnapshot, current model.ConntrackFlow) bool {
+	if !previous.SyntheticCTID || !current.SyntheticCTID || !current.HasAccounting || previous.CTID == 0 || previous.CTID != current.CTID {
+		return false
+	}
+	return current.OrigBytes >= previous.LastOrig &&
+		current.ReplyBytes >= previous.LastReply &&
+		current.OrigPkts >= previous.LastOPkts &&
+		current.ReplyPkts >= previous.LastRPkts
+}
+
+func hasConntrackObservationAccounting(flows []conntrackObservation) bool {
 	for _, flow := range flows {
-		if flow.HasAccounting {
+		if flow.Flow.HasAccounting {
 			return true
 		}
 	}
@@ -468,6 +548,7 @@ func (s *Service) updateSnapshot(
 
 	snapshot := model.FlowSnapshot{
 		CTID:          flow.CTID,
+		SyntheticCTID: flow.SyntheticCTID,
 		Proto:         flow.Proto,
 		LocalIP:       localIP,
 		LocalPort:     localPort,
@@ -496,32 +577,32 @@ func (s *Service) updateSnapshot(
 			snapshot.Counted = true
 			return snapshot, nil, nil, false, false
 		}
-		snapshot.Counted = true
-		if classified.Direction == model.DirectionForward {
-			return snapshot, nil, &deltaPair{
-				upBytes:   int64(flow.OrigBytes),
-				downBytes: int64(flow.ReplyBytes),
-				upPkts:    int64(flow.OrigPkts),
-				downPkts:  int64(flow.ReplyPkts),
-			}, true, false
+		if flow.SyntheticCTID {
+			// Tuple-derived IDs cannot distinguish a connection that appeared after
+			// startup from a long-lived connection missed by the first baseline
+			// read. Seed its counters and count the flow, but never charge the full
+			// kernel lifetime as traffic. Subsequent ticks use monotonic deltas, and
+			// an observed rollback below still proves a genuinely new lineage.
+			snapshot.Counted = true
+			return snapshot, nil, nil, true, false
 		}
-
-		delta := deltaPair{}
-		switch classified.Direction {
-		case model.DirectionIn:
-			delta.upBytes = int64(flow.ReplyBytes)
-			delta.downBytes = int64(flow.OrigBytes)
-			delta.upPkts = int64(flow.ReplyPkts)
-			delta.downPkts = int64(flow.OrigPkts)
-		default:
-			delta.upBytes = int64(flow.OrigBytes)
-			delta.downBytes = int64(flow.ReplyBytes)
-			delta.upPkts = int64(flow.OrigPkts)
-			delta.downPkts = int64(flow.ReplyPkts)
+		snapshot.Counted = true
+		delta, representable := representableFlowDelta(classified.Direction, flow.OrigBytes, flow.ReplyBytes, flow.OrigPkts, flow.ReplyPkts)
+		if !representable {
+			return snapshot, nil, nil, true, false
+		}
+		if classified.Direction == model.DirectionForward {
+			return snapshot, nil, &delta, true, false
 		}
 		return snapshot, &delta, nil, true, false
 	}
 
+	// Older kernels may omit id=. Their tuple-derived fallback cannot prove
+	// lineage across tuple reuse; a counter rollback is positive evidence that a
+	// new connection replaced the previous one, even inside the short grace TTL.
+	if flow.SyntheticCTID && lineageContinues && (flow.OrigBytes < prev.LastOrig || flow.ReplyBytes < prev.LastReply || flow.OrigPkts < prev.LastOPkts || flow.ReplyPkts < prev.LastRPkts) {
+		lineageContinues = false
+	}
 	newLineage := exists && !lineageContinues
 	if newLineage || snapshotTupleChanged(prev, snapshot) || flow.OrigBytes < prev.LastOrig || flow.ReplyBytes < prev.LastReply {
 		if lineageContinues {
@@ -540,26 +621,12 @@ func (s *Service) updateSnapshot(
 		if !baselineReady {
 			return snapshot, nil, nil, false, true
 		}
-		if classified.Direction == model.DirectionForward {
-			return snapshot, nil, &deltaPair{
-				upBytes:   int64(flow.OrigBytes),
-				downBytes: int64(flow.ReplyBytes),
-				upPkts:    int64(flow.OrigPkts),
-				downPkts:  int64(flow.ReplyPkts),
-			}, true, true
+		delta, representable := representableFlowDelta(classified.Direction, flow.OrigBytes, flow.ReplyBytes, flow.OrigPkts, flow.ReplyPkts)
+		if !representable {
+			return snapshot, nil, nil, true, true
 		}
-		delta := deltaPair{}
-		switch classified.Direction {
-		case model.DirectionIn:
-			delta.upBytes = int64(flow.ReplyBytes)
-			delta.downBytes = int64(flow.OrigBytes)
-			delta.upPkts = int64(flow.ReplyPkts)
-			delta.downPkts = int64(flow.OrigPkts)
-		default:
-			delta.upBytes = int64(flow.OrigBytes)
-			delta.downBytes = int64(flow.ReplyBytes)
-			delta.upPkts = int64(flow.OrigPkts)
-			delta.downPkts = int64(flow.ReplyPkts)
+		if classified.Direction == model.DirectionForward {
+			return snapshot, nil, &delta, true, true
 		}
 		return snapshot, &delta, nil, true, true
 	}
@@ -575,28 +642,13 @@ func (s *Service) updateSnapshot(
 	replyDelta := clampDelta(flow.ReplyBytes, prev.LastReply)
 	origPktDelta := clampDelta(flow.OrigPkts, prev.LastOPkts)
 	replyPktDelta := clampDelta(flow.ReplyPkts, prev.LastRPkts)
-
-	if classified.Direction == model.DirectionForward {
-		return snapshot, nil, &deltaPair{
-			upBytes:   int64(origDelta),
-			downBytes: int64(replyDelta),
-			upPkts:    int64(origPktDelta),
-			downPkts:  int64(replyPktDelta),
-		}, false, false
+	delta, representable := representableFlowDelta(classified.Direction, origDelta, replyDelta, origPktDelta, replyPktDelta)
+	if !representable {
+		return snapshot, nil, nil, false, false
 	}
 
-	delta := deltaPair{}
-	switch classified.Direction {
-	case model.DirectionIn:
-		delta.upBytes = int64(replyDelta)
-		delta.downBytes = int64(origDelta)
-		delta.upPkts = int64(replyPktDelta)
-		delta.downPkts = int64(origPktDelta)
-	default:
-		delta.upBytes = int64(origDelta)
-		delta.downBytes = int64(replyDelta)
-		delta.upPkts = int64(origPktDelta)
-		delta.downPkts = int64(replyPktDelta)
+	if classified.Direction == model.DirectionForward {
+		return snapshot, nil, &delta, false, false
 	}
 	return snapshot, &delta, nil, false, false
 }
@@ -628,6 +680,41 @@ func clampDelta(current, previous uint64) uint64 {
 	return current - previous
 }
 
+func representableCounterDelta(current, previous uint64) (int64, bool) {
+	return representableUint64(clampDelta(current, previous))
+}
+
+func representableFlowDelta(direction model.Direction, origBytes, replyBytes, origPkts, replyPkts uint64) (deltaPair, bool) {
+	origBytesValue, origBytesOK := representableUint64(origBytes)
+	replyBytesValue, replyBytesOK := representableUint64(replyBytes)
+	origPktsValue, origPktsOK := representableUint64(origPkts)
+	replyPktsValue, replyPktsOK := representableUint64(replyPkts)
+	if !origBytesOK || !replyBytesOK || !origPktsOK || !replyPktsOK {
+		return deltaPair{}, false
+	}
+	if direction == model.DirectionIn {
+		return deltaPair{
+			upBytes:   replyBytesValue,
+			downBytes: origBytesValue,
+			upPkts:    replyPktsValue,
+			downPkts:  origPktsValue,
+		}, true
+	}
+	return deltaPair{
+		upBytes:   origBytesValue,
+		downBytes: replyBytesValue,
+		upPkts:    origPktsValue,
+		downPkts:  replyPktsValue,
+	}, true
+}
+
+func representableUint64(value uint64) (int64, bool) {
+	if value > uint64(math.MaxInt64) {
+		return 0, false
+	}
+	return int64(value), true
+}
+
 func snapshotTupleChanged(prev, next model.FlowSnapshot) bool {
 	return prev.Proto != next.Proto ||
 		prev.Direction != next.Direction ||
@@ -637,8 +724,11 @@ func snapshotTupleChanged(prev, next model.FlowSnapshot) bool {
 		prev.RemotePort != next.RemotePort
 }
 
-func observedLineageContinues(prev model.FlowSnapshot, selectedCTID uint64, rawIDs map[uint64]struct{}) bool {
+func observedLineageContinues(prev model.FlowSnapshot, selectedCTID uint64, selectedSynthetic bool, rawIDs map[uint64]struct{}) bool {
 	if prev.CTID == 0 || len(rawIDs) == 0 {
+		return false
+	}
+	if prev.SyntheticCTID != selectedSynthetic {
 		return false
 	}
 	if selectedCTID != 0 && selectedCTID != prev.CTID {
@@ -706,6 +796,18 @@ func (s *Service) addUsage(flowID string, snapshot model.FlowSnapshot, delta del
 
 func (s *Service) releaseFlowOwnership(flowID string) {
 	s.ensureFlowOwners()
+	usageKey, ownsUsage := s.usageFlowOwner[flowID]
+	forwardKey, ownsForward := s.fwdFlowOwner[flowID]
+	if ownsUsage || ownsForward {
+		s.frozenFlowSequence++
+		frozenFlowID := fmt.Sprintf("%s\x00closed:%d", flowID, s.frozenFlowSequence)
+		if ownsUsage {
+			s.buckets[usageKey].freezeFlow(flowID, frozenFlowID)
+		}
+		if ownsForward {
+			s.forwardBuckets[forwardKey].freezeFlow(flowID, frozenFlowID)
+		}
+	}
 	delete(s.usageFlowOwner, flowID)
 	delete(s.fwdFlowOwner, flowID)
 }
@@ -796,10 +898,7 @@ func (s *Service) flushCurrentBuckets(ctx context.Context) error {
 		}
 	}
 
-	if err := s.store.FlushMinute(ctx, s.currentMinute.Unix(), usage, forward); err != nil {
-		return err
-	}
-	if err := s.store.FlushInterfaceMinute(ctx, s.currentMinute.Unix(), s.interfaceBuckets); err != nil {
+	if err := s.store.FlushMinuteBatch(ctx, s.currentMinute.Unix(), usage, forward, s.interfaceBuckets); err != nil {
 		return err
 	}
 	s.buckets = make(map[model.UsageKey]*bucketState)
@@ -821,7 +920,6 @@ func (s *Service) ensureFlowOwners() {
 
 func newBucketState() *bucketState {
 	return &bucketState{
-		flows:   make(map[string]struct{}),
 		perFlow: make(map[string]flowContribution),
 	}
 }
@@ -829,9 +927,6 @@ func newBucketState() *bucketState {
 func (b *bucketState) applyContribution(flowID string, contribution flowContribution) {
 	if b == nil || contribution.isZero() {
 		return
-	}
-	if b.flows == nil {
-		b.flows = make(map[string]struct{})
 	}
 	if b.perFlow == nil {
 		b.perFlow = make(map[string]flowContribution)
@@ -852,7 +947,6 @@ func (b *bucketState) applyContribution(flowID string, contribution flowContribu
 	b.pktsUp += contribution.delta.upPkts
 	b.pktsDown += contribution.delta.downPkts
 	b.flowCount += contribution.flowCount
-	b.flows[flowID] = struct{}{}
 }
 
 func (b *bucketState) detachFlow(flowID string) flowContribution {
@@ -860,13 +954,11 @@ func (b *bucketState) detachFlow(flowID string) flowContribution {
 		return flowContribution{}
 	}
 	if b.perFlow == nil {
-		delete(b.flows, flowID)
 		return flowContribution{}
 	}
 
 	contribution := b.perFlow[flowID]
 	delete(b.perFlow, flowID)
-	delete(b.flows, flowID)
 
 	b.bytesUp -= contribution.delta.upBytes
 	b.bytesDown -= contribution.delta.downBytes
@@ -876,11 +968,26 @@ func (b *bucketState) detachFlow(flowID string) flowContribution {
 	return contribution
 }
 
+// freezeFlow gives a completed connection generation an immutable internal key.
+// The aggregate totals stay unchanged, while a later connection that reuses the
+// same tuple can still be reclassified without moving the completed generation.
+func (b *bucketState) freezeFlow(flowID, frozenFlowID string) {
+	if b == nil || b.perFlow == nil {
+		return
+	}
+	contribution, exists := b.perFlow[flowID]
+	if !exists {
+		return
+	}
+	delete(b.perFlow, flowID)
+	b.perFlow[frozenFlowID] = contribution
+}
+
 func (b *bucketState) empty() bool {
 	if b == nil {
 		return true
 	}
-	return len(b.flows) == 0 && len(b.perFlow) == 0 && b.bytesUp == 0 && b.bytesDown == 0 && b.pktsUp == 0 && b.pktsDown == 0 && b.flowCount == 0
+	return len(b.perFlow) == 0 && b.bytesUp == 0 && b.bytesDown == 0 && b.pktsUp == 0 && b.pktsDown == 0 && b.flowCount == 0
 }
 
 func (s *Service) refreshLocalIPs() error {
@@ -1006,6 +1113,19 @@ func (s *Service) Diagnostics() model.CollectorDiagnostics {
 	}
 
 	now := time.Now().UTC()
+	var lastSuccessfulTickTS *int64
+	var lastSuccessfulTickAge *int64
+	collectionFresh := collectionIsFresh(now, s.lastSuccessfulTick, s.cfg.TickInterval)
+	if !s.lastSuccessfulTick.IsZero() {
+		ts := s.lastSuccessfulTick.Unix()
+		ageDuration := now.Sub(s.lastSuccessfulTick)
+		if ageDuration < 0 {
+			ageDuration = 0
+		}
+		age := int64(ageDuration.Seconds())
+		lastSuccessfulTickTS = &ts
+		lastSuccessfulTickAge = &age
+	}
 	var socketAge *int64
 	if s.socketReady && !s.lastSockRefresh.IsZero() {
 		age := int64(now.Sub(s.lastSockRefresh).Seconds())
@@ -1023,6 +1143,10 @@ func (s *Service) Diagnostics() model.CollectorDiagnostics {
 		UnresolvedLocalConnections: unresolvedLocal,
 		AttributionCounts:          attributionCounts,
 		SnapshotReady:              s.snapshotReady,
+		CollectionFresh:            collectionFresh,
+		LastSuccessfulTickTS:       lastSuccessfulTickTS,
+		LastSuccessfulTickAgeSecs:  lastSuccessfulTickAge,
+		ConsecutiveTickFailures:    s.consecutiveTickFailures,
 		SocketIndexReady:           s.socketReady,
 		SocketIndexAgeSeconds:      socketAge,
 		LocalIPCount:               len(s.localIPs),
@@ -1038,21 +1162,34 @@ func (s *Service) Diagnostics() model.CollectorDiagnostics {
 	}
 }
 
-func (s *Service) snapshotCopy() map[string]model.FlowSnapshot {
+func (s *Service) ReadyStatus() model.CollectorReadiness {
 	s.runtimeMu.RLock()
 	defer s.runtimeMu.RUnlock()
-
-	copied := make(map[string]model.FlowSnapshot, len(s.snapshots))
-	for flowID, snapshot := range s.snapshots {
-		copied[flowID] = snapshot
+	return model.CollectorReadiness{
+		SnapshotReady:   s.snapshotReady,
+		CollectionFresh: collectionIsFresh(time.Now().UTC(), s.lastSuccessfulTick, s.cfg.TickInterval),
 	}
-	return copied
 }
 
-func (s *Service) isSnapshotReady() bool {
-	s.runtimeMu.RLock()
-	defer s.runtimeMu.RUnlock()
-	return s.snapshotReady
+func collectionIsFresh(now, lastSuccessfulTick time.Time, tickInterval time.Duration) bool {
+	if lastSuccessfulTick.IsZero() {
+		return false
+	}
+	age := now.Sub(lastSuccessfulTick)
+	if age < 0 {
+		age = 0
+	}
+	if tickInterval <= 0 {
+		tickInterval = config.Default().TickInterval
+	}
+	staleAfter := time.Duration(1<<63 - 1)
+	if tickInterval <= staleAfter/3 {
+		staleAfter = 3 * tickInterval
+	}
+	if staleAfter < 10*time.Second {
+		staleAfter = 10 * time.Second
+	}
+	return age <= staleAfter
 }
 
 func (s *Service) replaceSnapshots(next map[string]model.FlowSnapshot) {

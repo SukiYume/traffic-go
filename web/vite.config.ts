@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import react from '@vitejs/plugin-react';
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 
 function resolveProxyTarget(): string {
   const explicitTarget = process.env.TRAFFIC_GO_DEV_PROXY?.trim();
@@ -31,11 +31,20 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
-          react: ['react', 'react-dom'],
-          router: ['react-router-dom'],
-          query: ['@tanstack/react-query', '@tanstack/react-table'],
-          charts: ['recharts'],
+        manualChunks(id) {
+          const normalized = id.replace(/\\/g, '/');
+          if (normalized.includes('/node_modules/react/') || normalized.includes('/node_modules/react-dom/') || normalized.includes('/node_modules/scheduler/')) {
+            return 'react';
+          }
+          if (normalized.includes('/node_modules/react-router') || normalized.includes('/node_modules/@remix-run/')) {
+            return 'router';
+          }
+          if (normalized.includes('/node_modules/@tanstack/')) {
+            return 'query';
+          }
+          if (normalized.includes('/node_modules/recharts/') || normalized.includes('/node_modules/d3-')) {
+            return 'charts';
+          }
         },
       },
     },

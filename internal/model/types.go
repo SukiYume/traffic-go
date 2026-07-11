@@ -21,6 +21,7 @@ const (
 
 type ConntrackFlow struct {
 	CTID          uint64
+	SyntheticCTID bool
 	Proto         string
 	Family        string
 	OrigSrcIP     string
@@ -48,6 +49,7 @@ type ProcessInfo struct {
 
 type FlowSnapshot struct {
 	CTID          uint64
+	SyntheticCTID bool
 	Proto         string
 	LocalIP       string
 	LocalPort     int
@@ -199,6 +201,21 @@ type RemoteSummary struct {
 	DataSource string    `json:"data_source"`
 }
 
+// DashboardSnapshot is the shared persisted-data portion of the dashboard.
+// Building all panels in one pass avoids making several competing scans over
+// the same long-window summary rows on small hosts.
+type DashboardSnapshot struct {
+	DataSource         string            `json:"data_source"`
+	BytesUp            int64             `json:"bytes_up"`
+	BytesDown          int64             `json:"bytes_down"`
+	FlowCount          int64             `json:"flow_count"`
+	Timeseries         []TimeseriesPoint `json:"timeseries"`
+	TopProcesses       []ProcessSummary  `json:"top_processes"`
+	TopInboundRemotes  []RemoteSummary   `json:"top_inbound_remotes"`
+	TopOutboundRemotes []RemoteSummary   `json:"top_outbound_remotes"`
+	TopPorts           []TopEntry        `json:"top_ports"`
+}
+
 type ProcessListItem struct {
 	PID  int    `json:"pid"`
 	Comm string `json:"comm"`
@@ -210,12 +227,23 @@ type ActiveStats struct {
 	Processes   int64
 }
 
+// CollectorReadiness is the constant-time subset used by readiness probes.
+// Full CollectorDiagnostics may intentionally scan active snapshots.
+type CollectorReadiness struct {
+	SnapshotReady   bool
+	CollectionFresh bool
+}
+
 type CollectorDiagnostics struct {
 	ActiveConnections          int64            `json:"active_connections"`
 	ActiveProcesses            int64            `json:"active_processes"`
 	UnresolvedLocalConnections int64            `json:"unresolved_local_connections"`
 	AttributionCounts          map[string]int64 `json:"attribution_counts"`
 	SnapshotReady              bool             `json:"snapshot_ready"`
+	CollectionFresh            bool             `json:"collection_fresh"`
+	LastSuccessfulTickTS       *int64           `json:"last_successful_tick_ts,omitempty"`
+	LastSuccessfulTickAgeSecs  *int64           `json:"last_successful_tick_age_seconds,omitempty"`
+	ConsecutiveTickFailures    int64            `json:"consecutive_tick_failures"`
 	SocketIndexReady           bool             `json:"socket_index_ready"`
 	SocketIndexAgeSeconds      *int64           `json:"socket_index_age_seconds,omitempty"`
 	LocalIPCount               int              `json:"local_ip_count"`

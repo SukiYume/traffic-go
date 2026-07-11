@@ -7,11 +7,14 @@ import { DataTable } from '../components/DataTable';
 import { EmptyState } from '../components/EmptyState';
 import { QueryErrorState } from '../components/QueryErrorState';
 import { RangeSelect } from '../components/RangeSelect';
+import { RefreshControl } from '../components/RefreshControl';
 import { useApiClient } from '../api-context';
+import { liveQueryOptions } from '../query-refresh';
 import { normalizeForwardSortKey } from '../sort-keys';
 import type { ForwardUsageRow } from '../types';
 import { useRangeSearchParam } from '../useRangeSearchParam';
 import { useResettingPage } from '../useResettingPage';
+import { useExactTotal } from '../useExactTotal';
 import { formatBytes, formatDateTime, rangeLabel } from '../utils';
 
 const pageSize = 25;
@@ -46,8 +49,9 @@ export function ForwardPage() {
     currentSort?.desc ?? null,
   ]);
   const [page, setPage] = useResettingPage(pageResetKey);
+  const { includeTotal, requestExactTotal } = useExactTotal(pageResetKey);
   const query = useQuery({
-    queryKey: ['forward', range, filters.origSrcIp, filters.origDstIp, filters.proto, page, currentSort?.id, currentSort?.desc],
+    queryKey: ['forward', range, filters.origSrcIp, filters.origDstIp, filters.proto, page, currentSort?.id, currentSort?.desc, includeTotal],
     queryFn: ({ signal }) =>
       api.getForwardUsage({
         range,
@@ -58,10 +62,12 @@ export function ForwardPage() {
         pageSize,
         sortBy: normalizeForwardSortKey(currentSort?.id),
         sortOrder: currentSort?.desc ? 'desc' : 'asc',
-        includeTotal: true,
+        includeTotal,
       }, { signal }),
     placeholderData: keepPreviousData,
+    ...liveQueryOptions,
   });
+  const currentData = query.isPlaceholderData ? undefined : query.data;
 
   const columns = useMemo(
     () => [
@@ -113,10 +119,13 @@ export function ForwardPage() {
               <strong>时间范围</strong>
               <span>{rangeLabel(range)}</span>
             </div>
-            {query.data ? <DataSourceBadge dataSource={query.data.dataSource} /> : null}
+            {currentData ? <DataSourceBadge dataSource={currentData.dataSource} coverage={currentData.coverage} /> : null}
           </section>
         </div>
-        <RangeSelect value={range} onChange={setRange} />
+        <div className="page-head-actions">
+          <RangeSelect value={range} onChange={setRange} />
+          <RefreshControl updatedAt={query.dataUpdatedAt} isFetching={query.isFetching} onRefresh={query.refetch} />
+        </div>
       </header>
 
       <section className="filters" style={{ marginBottom: 16 }}>
@@ -146,29 +155,32 @@ export function ForwardPage() {
         </label>
       </section>
 
-      {query.isError && (query.data?.rows.length ?? 0) > 0 ? (
-        <QueryErrorState error={query.error} title="转发流量刷新失败，当前展示旧结果" compact />
+      {query.isError && (currentData?.rows.length ?? 0) > 0 ? (
+        <QueryErrorState error={query.error} title="转发流量刷新失败，当前展示上次成功结果" compact onRetry={query.refetch} retrying={query.isFetching} />
       ) : null}
 
-      {query.isError && !query.data?.rows.length ? (
-        <QueryErrorState error={query.error} title="转发流量加载失败" />
-      ) : query.isPending && !query.data ? (
+      {query.isError && !currentData?.rows.length ? (
+        <QueryErrorState error={query.error} title="转发流量加载失败" onRetry={query.refetch} retrying={query.isFetching} />
+      ) : query.isPlaceholderData || (query.isPending && !currentData) ? (
         <EmptyState title="转发流量加载中" description="正在汇总当前时间范围内的 forward / NAT 流量。" />
-      ) : query.data?.rows.length ? (
+      ) : currentData?.rows.length ? (
         <DataTable
           columns={columns}
-          data={query.data.rows}
+          data={currentData.rows}
           tableClassName="forward-table table-dense"
           sorting={sorting}
           onSortingChange={setSorting}
           manualSorting
+          busy={query.isFetching}
           pagination={{
-            page: query.data.page,
-            pageSize: query.data.pageSize,
-            totalRows: query.data.totalRows,
-            hasMore: query.data.hasMore,
-            totalRowsExact: query.data.totalRowsExact,
+            page: currentData.page,
+            pageSize: currentData.pageSize,
+            totalRows: currentData.totalRows,
+            hasMore: currentData.hasMore,
+            totalRowsExact: currentData.totalRowsExact,
             onPageChange: setPage,
+            onRequestExactTotal: requestExactTotal,
+            exactTotalBusy: query.isFetching && includeTotal,
           }}
         />
       ) : (

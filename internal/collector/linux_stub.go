@@ -31,6 +31,10 @@ func (n *noopCollector) ActiveStats() model.ActiveStats {
 	return model.ActiveStats{}
 }
 
+func (n *noopCollector) ReadyStatus() model.CollectorReadiness {
+	return model.CollectorReadiness{}
+}
+
 func (n *noopCollector) Diagnostics() model.CollectorDiagnostics {
 	return model.CollectorDiagnostics{
 		AttributionCounts: make(map[string]int64),
@@ -63,16 +67,13 @@ func (m *mockCollector) Start(ctx context.Context) error {
 				FlowCount: 1,
 			},
 		}
-		if err := m.store.FlushMinute(ctx, now.Unix(), usage, nil); err != nil {
-			m.logger.Printf("mock flush failed: %v", err)
-		}
-		if err := m.store.FlushInterfaceMinute(ctx, now.Unix(), map[string]model.InterfaceUsageDelta{
+		if err := m.store.FlushMinuteBatch(ctx, now.Unix(), usage, nil, map[string]model.InterfaceUsageDelta{
 			"eth0": {
 				RxBytes: 640 * 1024,
 				TxBytes: 192 * 1024,
 			},
 		}); err != nil {
-			m.logger.Printf("mock interface flush failed: %v", err)
+			m.logger.Printf("mock flush failed: %v", err)
 		}
 
 		select {
@@ -100,13 +101,22 @@ func (m *mockCollector) ActiveStats() model.ActiveStats {
 	}
 }
 
+func (m *mockCollector) ReadyStatus() model.CollectorReadiness {
+	return model.CollectorReadiness{SnapshotReady: true, CollectionFresh: true}
+}
+
 func (m *mockCollector) Diagnostics() model.CollectorDiagnostics {
+	now := time.Now().UTC().Unix()
+	age := int64(0)
 	return model.CollectorDiagnostics{
 		ActiveConnections: 1,
 		ActiveProcesses:   1,
 		AttributionCounts: map[string]int64{
 			string(model.AttributionExact): 1,
 		},
-		SnapshotReady: true,
+		SnapshotReady:             true,
+		CollectionFresh:           true,
+		LastSuccessfulTickTS:      &now,
+		LastSuccessfulTickAgeSecs: &age,
 	}
 }

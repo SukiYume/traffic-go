@@ -217,12 +217,22 @@ CREATE TABLE IF NOT EXISTS log_evidence (
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_log_evidence_lookup ON log_evidence (source, event_ts, client_ip, target_ip);
-CREATE INDEX IF NOT EXISTS idx_log_evidence_client_lookup ON log_evidence (source, event_ts, client_ip);
-CREATE INDEX IF NOT EXISTS idx_log_evidence_target_lookup ON log_evidence (source, event_ts, target_ip);
-CREATE INDEX IF NOT EXISTS idx_log_evidence_created_at ON log_evidence (created_at);
-CREATE INDEX IF NOT EXISTS idx_log_evidence_entry_port ON log_evidence (source, event_ts, entry_port);
-CREATE INDEX IF NOT EXISTS idx_log_evidence_host_port ON log_evidence (source, event_ts, host_normalized, target_port);
+-- Remove the original range-first indexes after installing the corrected
+-- equality-first forms below. Keeping both sets doubles evidence write
+-- amplification and database space without helping the current query plans.
+DROP INDEX IF EXISTS idx_log_evidence_lookup;
+DROP INDEX IF EXISTS idx_log_evidence_client_lookup;
+DROP INDEX IF EXISTS idx_log_evidence_target_lookup;
+DROP INDEX IF EXISTS idx_log_evidence_created_at;
+DROP INDEX IF EXISTS idx_log_evidence_entry_port;
+DROP INDEX IF EXISTS idx_log_evidence_host_port;
+CREATE INDEX IF NOT EXISTS idx_log_evidence_event_ts_v2 ON log_evidence (event_ts);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_source_ts_v2 ON log_evidence (source, event_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_source_client_ts_v2 ON log_evidence (source, client_ip, event_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_source_target_ts_v2 ON log_evidence (source, target_ip, event_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_source_entry_ts_v2 ON log_evidence (source, entry_port, event_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_source_host_ts_v2 ON log_evidence (source, host_normalized, event_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_log_evidence_source_host_port_ts_v2 ON log_evidence (source, host_normalized, target_port, event_ts DESC);
 
 CREATE TABLE IF NOT EXISTS usage_chain_1m (
     minute_ts INTEGER NOT NULL,

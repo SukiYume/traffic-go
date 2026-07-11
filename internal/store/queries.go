@@ -14,10 +14,31 @@ import (
 	"traffic-go/internal/model"
 )
 
+var ErrTimeseriesPointLimit = errors.New("timeseries point limit exceeded")
+
+const maxTimeseriesPoints = 10000
+
 type sourceInfo struct {
 	Table     string
 	TimeCol   string
 	DataLabel string
+}
+
+// Readiness performs a cheap real query against the read pool. It deliberately
+// avoids the heavyweight diagnostics table counts so readiness probes remain
+// safe to run frequently on small servers.
+func (s *Store) Readiness(ctx context.Context) error {
+	if s == nil || s.queryDB() == nil {
+		return errors.New("store unavailable")
+	}
+	var value int
+	if err := s.queryDB().QueryRowContext(ctx, "SELECT 1").Scan(&value); err != nil {
+		return fmt.Errorf("store readiness: %w", err)
+	}
+	if value != 1 {
+		return errors.New("store readiness returned unexpected value")
+	}
+	return nil
 }
 
 func usageSourceInfo(source string) sourceInfo {
@@ -61,6 +82,9 @@ func DecodeCursor(cursor string) (int64, int64, error) {
 	if cursor == "" {
 		return 0, 0, nil
 	}
+	if len(cursor) > 96 {
+		return 0, 0, errors.New("invalid cursor")
+	}
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
 		return 0, 0, err
@@ -77,6 +101,9 @@ func DecodeCursor(cursor string) (int64, int64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	if ts <= 0 || rowID <= 0 {
+		return 0, 0, errors.New("invalid cursor")
+	}
 	return ts, rowID, nil
 }
 
@@ -90,6 +117,9 @@ func clampLimit(limit int) int {
 func clampPage(page int) int {
 	if page <= 0 {
 		return 1
+	}
+	if page > 1_000_000 {
+		return 1_000_000
 	}
 	return page
 }
@@ -144,6 +174,19 @@ type summaryPart struct {
 	end   int64
 }
 
+// SummaryCoverage describes the time interval actually covered by a mixed
+// retention query. Hour and day rows represent whole buckets, so a request
+// whose boundary is older than the finer retention layer must be rounded
+// outward instead of silently dropping the partial bucket.
+//
+// EffectiveStart and EffectiveEnd use the same half-open Unix-second interval
+// convention as the summary queries: [effective_start, effective_end).
+type SummaryCoverage struct {
+	Approximate    bool  `json:"approximate"`
+	EffectiveStart int64 `json:"effective_start"`
+	EffectiveEnd   int64 `json:"effective_end"`
+}
+
 func floorUnix(value int64, unit int64) int64 {
 	return (value / unit) * unit
 }
@@ -156,11 +199,12 @@ func ceilUnix(value int64, unit int64) int64 {
 	return floored + unit
 }
 
-func (s *Store) summaryParts(start, end time.Time, sourceInfo func(string) sourceInfo) []summaryPart {
+func (s *Store) summaryPlan(start, end time.Time, sourceInfo func(string) sourceInfo) ([]summaryPart, SummaryCoverage) {
 	startUnix := start.UTC().Unix()
 	endUnix := end.UTC().Unix()
+	coverage := SummaryCoverage{EffectiveStart: startUnix, EffectiveEnd: endUnix}
 	if endUnix <= startUnix {
-		return nil
+		return nil, coverage
 	}
 
 	now := s.now().UTC()
@@ -168,42 +212,116 @@ func (s *Store) summaryParts(start, end time.Time, sourceInfo func(string) sourc
 	hourStart := hourRetentionStartUTC(now, s.retention).Unix()
 	currentHour := now.Truncate(time.Hour).Unix()
 
-	parts := make([]summaryPart, 0, 4)
+	// Even the finest persisted rows represent complete minutes. Start with
+	// minute-aligned outward bounds, then widen them further when only hour or
+	// day buckets are retained at a request edge.
+	effectiveStart := floorUnix(startUnix, 60)
+	effectiveEnd := ceilUnix(endUnix, 60)
+	startBucketSeconds := int64(0)
+	switch {
+	case effectiveStart < hourStart:
+		effectiveStart = floorUnix(effectiveStart, 86400)
+		startBucketSeconds = 86400
+	case effectiveStart < minuteStart:
+		effectiveStart = floorUnix(effectiveStart, 3600)
+		startBucketSeconds = 3600
+	}
+
+	// Resolve the last included persisted minute rather than the exclusive end
+	// itself. An end exactly on a retention boundary still belongs to the older
+	// layer on its left.
+	endProbe := effectiveEnd - 1
+	switch {
+	case endProbe < hourStart:
+		effectiveEnd = ceilUnix(effectiveEnd, 86400)
+	case endProbe < minuteStart:
+		effectiveEnd = ceilUnix(effectiveEnd, 3600)
+	default:
+		// The minute cutoff can split an hour. If the requested interval also
+		// reaches into the expired part of that same hour, using only the retained
+		// minute tail would leave a gap. Include the complete hour instead.
+		if effectiveStart < minuteStart &&
+			effectiveEnd != floorUnix(effectiveEnd, 3600) &&
+			floorUnix(effectiveEnd, 3600) < minuteStart {
+			effectiveEnd = ceilUnix(effectiveEnd, 3600)
+		}
+	}
+	if startBucketSeconds > 0 {
+		effectiveEnd = maxInt64(effectiveEnd, effectiveStart+startBucketSeconds)
+	}
+
+	coverage.EffectiveStart = effectiveStart
+	coverage.EffectiveEnd = effectiveEnd
+	coverage.Approximate = effectiveStart != startUnix || effectiveEnd != endUnix
+
+	parts := make([]summaryPart, 0, 5)
 	appendPart := func(source string, partStart int64, partEnd int64) {
 		if partStart >= partEnd {
 			return
 		}
-		parts = append(parts, summaryPart{info: sourceInfo(source), start: partStart, end: partEnd})
-	}
-
-	dayStart := ceilUnix(startUnix, 86400)
-	dayEnd := minInt64(floorUnix(endUnix, 86400), hourStart)
-	appendPart(DataSourceDay, dayStart, dayEnd)
-
-	fullHourStart := ceilUnix(maxInt64(startUnix, hourStart), 3600)
-	fullHourEnd := minInt64(floorUnix(endUnix, 3600), currentHour)
-	appendPart(DataSourceHour, fullHourStart, fullHourEnd)
-
-	if startUnix >= minuteStart {
-		appendPart(DataSourceMinute, startUnix, minInt64(endUnix, ceilUnix(startUnix, 3600)))
-	}
-
-	tailStart := maxInt64(ceilUnix(startUnix, 3600), minInt64(floorUnix(endUnix, 3600), currentHour))
-	tailStart = maxInt64(tailStart, minuteStart)
-	appendPart(DataSourceMinute, tailStart, endUnix)
-
-	if len(parts) == 0 {
-		source, err := s.ResolveUsageSource(start, end, false)
-		if err != nil {
-			return nil
+		info := sourceInfo(source)
+		if len(parts) > 0 {
+			last := &parts[len(parts)-1]
+			if last.end == partStart && last.info.Table == info.Table && last.info.TimeCol == info.TimeCol && last.info.DataLabel == info.DataLabel {
+				last.end = partEnd
+				return
+			}
 		}
-		appendPart(source, startUnix, endUnix)
+		parts = append(parts, summaryPart{info: info, start: partStart, end: partEnd})
 	}
+
+	// The day/hour retention boundary is a UTC month boundary, hence also a day
+	// boundary. Outward-rounded day rows therefore join the hour region without
+	// overlap.
+	appendPart(DataSourceDay, effectiveStart, minInt64(effectiveEnd, hourStart))
+
+	// Between the day boundary and the current hour, use hour rows for aligned
+	// middle buckets. Exact partial-hour edges are served by retained minute rows.
+	regionStart := maxInt64(effectiveStart, hourStart)
+	regionEnd := minInt64(effectiveEnd, currentHour)
+	if regionStart < regionEnd {
+		middleStart := regionStart
+		if middleStart != floorUnix(middleStart, 3600) {
+			leadingEnd := minInt64(regionEnd, ceilUnix(middleStart, 3600))
+			appendPart(DataSourceMinute, middleStart, leadingEnd)
+			middleStart = leadingEnd
+		}
+
+		middleEnd := regionEnd
+		trailingStart := regionEnd
+		if regionEnd != floorUnix(regionEnd, 3600) {
+			trailingStart = maxInt64(middleStart, floorUnix(regionEnd, 3600))
+			middleEnd = trailingStart
+		}
+		appendPart(DataSourceHour, middleStart, middleEnd)
+		appendPart(DataSourceMinute, trailingStart, regionEnd)
+	}
+
+	// The current hour has not been aggregated yet and is always read from the
+	// minute table. This also covers entirely future/empty windows consistently.
+	appendPart(DataSourceMinute, maxInt64(effectiveStart, currentHour), effectiveEnd)
+
+	return parts, coverage
+}
+
+func (s *Store) summaryParts(start, end time.Time, sourceInfo func(string) sourceInfo) []summaryPart {
+	parts, _ := s.summaryPlan(start, end, sourceInfo)
 	return parts
+}
+
+// SummaryCoverage returns API-ready metadata for the same mixed-retention plan
+// used by all summary query families.
+func (s *Store) SummaryCoverage(start, end time.Time) SummaryCoverage {
+	_, coverage := s.summaryPlan(start, end, usageSourceInfo)
+	return coverage
 }
 
 func (s *Store) usageSummaryParts(start, end time.Time) []summaryPart {
 	return s.summaryParts(start, end, usageSourceInfo)
+}
+
+func (s *Store) forwardSummaryParts(start, end time.Time) []summaryPart {
+	return s.summaryParts(start, end, forwardSourceInfo)
 }
 
 func (s *Store) interfaceSummaryParts(start, end time.Time) []summaryPart {
@@ -229,6 +347,10 @@ func usageSummaryDataLabel(parts []summaryPart) string {
 
 func interfaceSummaryDataLabel(parts []summaryPart) string {
 	return summaryDataLabel(parts, DataSourceInterfaceMinute, DataSourceInterfaceHour, DataSourceInterfaceDay)
+}
+
+func forwardSummaryDataLabel(parts []summaryPart) string {
+	return summaryDataLabel(parts, DataSourceMinuteForward, DataSourceHourForward, DataSourceDayForward)
 }
 
 func buildSummaryUnion(parts []summaryPart, emptySelect string, selectPart func(summaryPart) string) (string, []any) {
@@ -276,6 +398,23 @@ func appendCursorPagination(builder *strings.Builder, args *[]any, timeCol strin
 	builder.WriteString(fmt.Sprintf(" ORDER BY %s DESC, rowid DESC LIMIT ?", timeCol))
 	*args = append(*args, resolvedLimit+1)
 	return resolvedLimit
+}
+
+func appendSummaryPagination(builder *strings.Builder, args *[]any, orderClause string, usePage bool, includeTotal bool, page int, pageSize int, cursorTS int64, cursorRowID int64, limit int) {
+	if usePage {
+		if includeTotal {
+			appendOffsetPagination(builder, args, orderClause, page, pageSize)
+		} else {
+			appendOffsetPaginationWithLimitExtra(builder, args, orderClause, page, pageSize, 1)
+		}
+		return
+	}
+	if cursorTS > 0 {
+		builder.WriteString(" WHERE (time_bucket < ? OR (time_bucket = ? AND row_id < ?))")
+		*args = append(*args, cursorTS, cursorTS, cursorRowID)
+	}
+	builder.WriteString(" ORDER BY time_bucket DESC, row_id DESC LIMIT ?")
+	*args = append(*args, clampLimit(limit)+1)
 }
 
 func (s *Store) QueryOverview(ctx context.Context, start, end time.Time, source string) (model.OverviewStats, error) {
@@ -461,7 +600,8 @@ WHERE %[1]s >= ? AND %[1]s < ?
 		builder.WriteString(" AND pid = ?")
 		args = append(args, *query.PID)
 	}
-	builder.WriteString(" GROUP BY bucket_ts, group_value ORDER BY bucket_ts ASC, group_value ASC")
+	builder.WriteString(" GROUP BY bucket_ts, group_value ORDER BY bucket_ts ASC, group_value ASC LIMIT ?")
+	args = append(args, maxTimeseriesPoints+1)
 
 	db := s.queryDB()
 	rows, err := db.QueryContext(ctx, builder.String(), args...)
@@ -478,8 +618,58 @@ WHERE %[1]s >= ? AND %[1]s < ?
 			return nil, fmt.Errorf("scan timeseries: %w", err)
 		}
 		points = append(points, point)
+		if len(points) > maxTimeseriesPoints {
+			return nil, ErrTimeseriesPointLimit
+		}
 	}
 	return points, rows.Err()
+}
+
+// QueryTimeseriesSummary stitches non-overlapping day/hour/minute retention
+// segments together. In particular, the current (not-yet-aggregated) hour is
+// always read from usage_1m, so long windows do not silently lose their tail.
+func (s *Store) QueryTimeseriesSummary(ctx context.Context, query model.TimeseriesQuery) ([]model.TimeseriesPoint, string, error) {
+	parts := s.usageSummaryParts(query.Start, query.End)
+	label := usageSummaryDataLabel(parts)
+	type pointKey struct {
+		ts    int64
+		group string
+	}
+	merged := make(map[pointKey]model.TimeseriesPoint)
+	for _, part := range parts {
+		partQuery := query
+		partQuery.Start = time.Unix(part.start, 0).UTC()
+		partQuery.End = time.Unix(part.end, 0).UTC()
+		points, err := s.QueryTimeseries(ctx, partQuery, part.info.DataLabel)
+		if err != nil {
+			return nil, "", err
+		}
+		for _, point := range points {
+			key := pointKey{ts: point.BucketTS, group: point.Group}
+			existing := merged[key]
+			existing.BucketTS = point.BucketTS
+			existing.Group = point.Group
+			existing.BytesUp += point.BytesUp
+			existing.BytesDown += point.BytesDown
+			existing.FlowCount += point.FlowCount
+			existing.DataSource = label
+			merged[key] = existing
+			if len(merged) > maxTimeseriesPoints {
+				return nil, "", ErrTimeseriesPointLimit
+			}
+		}
+	}
+	points := make([]model.TimeseriesPoint, 0, len(merged))
+	for _, point := range merged {
+		points = append(points, point)
+	}
+	sort.Slice(points, func(i, j int) bool {
+		if points[i].BucketTS == points[j].BucketTS {
+			return points[i].Group < points[j].Group
+		}
+		return points[i].BucketTS < points[j].BucketTS
+	})
+	return points, label, nil
 }
 
 func (s *Store) queryInterfaceTimeseries(ctx context.Context, startUnix, endUnix int64, bucketSeconds int64, info sourceInfo) ([]model.InterfaceTimeseriesPoint, error) {
@@ -493,7 +683,8 @@ FROM %[2]s
 WHERE %[1]s >= ? AND %[1]s < ?
 GROUP BY bucket_ts, interface
 ORDER BY bucket_ts ASC, interface ASC
-`, info.TimeCol, info.Table), bucketSeconds, bucketSeconds, startUnix, endUnix)
+LIMIT ?
+`, info.TimeCol, info.Table), bucketSeconds, bucketSeconds, startUnix, endUnix, maxTimeseriesPoints+1)
 	if err != nil {
 		return nil, fmt.Errorf("query interface timeseries: %w", err)
 	}
@@ -507,6 +698,9 @@ ORDER BY bucket_ts ASC, interface ASC
 			return nil, fmt.Errorf("scan interface timeseries: %w", err)
 		}
 		points = append(points, point)
+		if len(points) > maxTimeseriesPoints {
+			return nil, ErrTimeseriesPointLimit
+		}
 	}
 	return points, rows.Err()
 }
@@ -545,6 +739,9 @@ func (s *Store) QueryInterfaceTimeseriesSummary(ctx context.Context, start, end 
 			existing.TxBytes += point.TxBytes
 			existing.DataSource = label
 			merged[key] = existing
+			if len(merged) > maxTimeseriesPoints {
+				return nil, "", ErrTimeseriesPointLimit
+			}
 		}
 	}
 	points := make([]model.InterfaceTimeseriesPoint, 0, len(merged))
@@ -773,6 +970,155 @@ WHERE %s >= ? AND %s < ?
 	return records, nextCursor, 0, nil
 }
 
+func buildUsageSummaryRows(parts []summaryPart, query model.UsageQuery) (string, []any, error) {
+	if query.Attribution != "" || query.RemotePort != nil || query.PID != nil || strings.TrimSpace(query.Exe) != "" {
+		return "", nil, ErrDimensionUnavailable
+	}
+	selects := make([]string, 0, len(parts))
+	args := make([]any, 0, len(parts)*4)
+	for _, part := range parts {
+		var builder strings.Builder
+		if isAggregatedUsageSource(part.info.DataLabel) {
+			localPortExpr := aggregatedUsageLocalPortExpr(query)
+			builder.WriteString(fmt.Sprintf(`
+SELECT MIN(rowid) AS row_id, %[1]s AS time_bucket, proto, direction,
+       NULL AS pid, comm, NULL AS exe, %[3]s AS local_port, remote_ip,
+       NULL AS remote_port, NULL AS attribution,
+       COALESCE(SUM(bytes_up), 0) AS bytes_up,
+       COALESCE(SUM(bytes_down), 0) AS bytes_down,
+       COALESCE(SUM(pkts_up), 0) AS pkts_up,
+       COALESCE(SUM(pkts_down), 0) AS pkts_down,
+       COALESCE(SUM(flow_count), 0) AS flow_count,
+       '%[4]s' AS data_source
+FROM %[2]s
+WHERE %[1]s >= ? AND %[1]s < ?
+`, part.info.TimeCol, part.info.Table, localPortExpr, part.info.DataLabel))
+			partArgs := []any{part.start, part.end}
+			appendUsageFiltersDetailed(&builder, &partArgs, query, true)
+			builder.WriteString(fmt.Sprintf(" GROUP BY %s, proto, direction, comm, %s, remote_ip", part.info.TimeCol, localPortExpr))
+			selects = append(selects, builder.String())
+			args = append(args, partArgs...)
+			continue
+		}
+		builder.WriteString(fmt.Sprintf(`
+SELECT rowid AS row_id, %[1]s AS time_bucket, proto, direction, pid, comm, exe,
+       local_port, remote_ip, remote_port, attribution,
+       bytes_up, bytes_down, pkts_up, pkts_down, flow_count,
+       '%[3]s' AS data_source
+FROM %[2]s
+WHERE %[1]s >= ? AND %[1]s < ?
+`, part.info.TimeCol, part.info.Table, part.info.DataLabel))
+		partArgs := []any{part.start, part.end}
+		appendUsageFiltersDetailed(&builder, &partArgs, query, false)
+		selects = append(selects, builder.String())
+		args = append(args, partArgs...)
+	}
+	if len(selects) == 0 {
+		return `SELECT 0 AS row_id, 0 AS time_bucket, '' AS proto, '' AS direction,
+NULL AS pid, '' AS comm, NULL AS exe, 0 AS local_port, '' AS remote_ip,
+NULL AS remote_port, NULL AS attribution, 0 AS bytes_up, 0 AS bytes_down,
+0 AS pkts_up, 0 AS pkts_down, 0 AS flow_count, '' AS data_source WHERE 0`, nil, nil
+	}
+	return strings.Join(selects, "\nUNION ALL\n"), args, nil
+}
+
+func usageSummaryOrderClause(sortBy, sortOrder string) string {
+	order := normalizeSortOrder(sortOrder)
+	switch sortBy {
+	case "bytes_up":
+		return fmt.Sprintf(" ORDER BY bytes_up %s, time_bucket DESC, row_id DESC", order)
+	case "bytes_down":
+		return fmt.Sprintf(" ORDER BY bytes_down %s, time_bucket DESC, row_id DESC", order)
+	case "bytes_total":
+		return fmt.Sprintf(" ORDER BY (bytes_up + bytes_down) %s, time_bucket DESC, row_id DESC", order)
+	case "flow_count":
+		return fmt.Sprintf(" ORDER BY flow_count %s, time_bucket DESC, row_id DESC", order)
+	case "remote_ip":
+		return fmt.Sprintf(" ORDER BY remote_ip %s, time_bucket DESC, row_id DESC", order)
+	case "direction":
+		return fmt.Sprintf(" ORDER BY direction %s, time_bucket DESC, row_id DESC", order)
+	case "proto":
+		return fmt.Sprintf(" ORDER BY proto %s, time_bucket DESC, row_id DESC", order)
+	case "local_port":
+		return fmt.Sprintf(" ORDER BY local_port %s, time_bucket DESC, row_id DESC", order)
+	case "comm":
+		return fmt.Sprintf(" ORDER BY comm COLLATE NOCASE %s, time_bucket DESC, row_id DESC", order)
+	default:
+		return fmt.Sprintf(" ORDER BY time_bucket %s, row_id %s", order, order)
+	}
+}
+
+func (s *Store) QueryUsageSummaryCount(ctx context.Context, query model.UsageQuery) (int, string, error) {
+	parts := s.usageSummaryParts(query.Start, query.End)
+	unionSQL, args, err := buildUsageSummaryRows(parts, query)
+	if err != nil {
+		return 0, "", err
+	}
+	total, err := countRows(ctx, s.queryDB(), "SELECT COUNT(*) FROM ("+unionSQL+") AS summary_usage", args, "usage summary")
+	return total, usageSummaryDataLabel(parts), err
+}
+
+// QueryUsageSummary returns a globally sorted/paged union across the
+// retention layers. summaryParts guarantees that the layers do not overlap.
+func (s *Store) QueryUsageSummary(ctx context.Context, query model.UsageQuery) ([]model.UsageRecord, string, int, string, error) {
+	parts := s.usageSummaryParts(query.Start, query.End)
+	dataSource := usageSummaryDataLabel(parts)
+	unionSQL, args, err := buildUsageSummaryRows(parts, query)
+	if err != nil {
+		return nil, "", 0, "", err
+	}
+	var builder strings.Builder
+	builder.WriteString("SELECT * FROM (" + unionSQL + ") AS summary_usage")
+	var totalRows int
+	if query.UsePage && query.IncludeTotal {
+		totalRows, _, err = s.QueryUsageSummaryCount(ctx, query)
+		if err != nil {
+			return nil, "", 0, "", err
+		}
+	}
+	appendSummaryPagination(&builder, &args, usageSummaryOrderClause(query.SortBy, query.SortOrder), query.UsePage, query.IncludeTotal, query.Page, query.PageSize, query.CursorTS, query.CursorRowID, query.Limit)
+	rows, err := s.queryDB().QueryContext(ctx, builder.String(), args...)
+	if err != nil {
+		return nil, "", 0, "", fmt.Errorf("query usage summary: %w", err)
+	}
+	defer rows.Close()
+	records, err := scanUsageSummaryRows(rows)
+	if err != nil {
+		return nil, "", 0, "", err
+	}
+	if query.UsePage {
+		if !query.IncludeTotal {
+			records, totalRows = trimOffsetPage(records, query.Page, query.PageSize)
+		}
+		return records, "", totalRows, dataSource, nil
+	}
+	records, nextCursor := trimPage(records, clampLimit(query.Limit), func(record model.UsageRecord) int64 { return record.TimeBucket }, func(record model.UsageRecord) int64 { return record.RowID })
+	return records, nextCursor, 0, dataSource, nil
+}
+
+func scanUsageSummaryRows(rows *sql.Rows) ([]model.UsageRecord, error) {
+	records := make([]model.UsageRecord, 0)
+	for rows.Next() {
+		var record model.UsageRecord
+		var pid sql.NullInt64
+		var exe sql.NullString
+		var remotePort sql.NullInt64
+		var attribution sql.NullString
+		if err := rows.Scan(&record.RowID, &record.TimeBucket, &record.Proto, &record.Direction,
+			&pid, &record.Comm, &exe, &record.LocalPort, &record.RemoteIP, &remotePort,
+			&attribution, &record.BytesUp, &record.BytesDown, &record.PktsUp, &record.PktsDown,
+			&record.FlowCount, &record.DataSource); err != nil {
+			return nil, fmt.Errorf("scan usage summary: %w", err)
+		}
+		record.PID = nullableInt(pid)
+		record.Exe = nullableString(exe)
+		record.RemotePort = nullableInt(remotePort)
+		record.Attribution = nullableAttribution(attribution)
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 func buildForwardUsageCountSQL(query model.ForwardQuery, source string) (string, []any) {
 	info := forwardSourceInfo(source)
 	var builder strings.Builder
@@ -895,6 +1241,8 @@ SELECT COUNT(*) FROM (
 	case "pid":
 		if resolvedGroupBy == "pid" {
 			sortExpr = "pid"
+		} else {
+			sortExpr = "comm COLLATE NOCASE"
 		}
 	}
 	order := normalizeSortOrder(sortOrder)
@@ -907,7 +1255,7 @@ SELECT %s,
 FROM %s
 WHERE %s >= ? AND %s < ?
 GROUP BY %s
-ORDER BY %s %s, comm COLLATE NOCASE ASC
+ORDER BY %s %s, comm COLLATE NOCASE ASC, comm ASC, COALESCE(pid, -1) ASC, COALESCE(exe, '') ASC
 LIMIT ? OFFSET ?
 `, selectExpr, info.Table, info.TimeCol, info.TimeCol, groupExpr, sortExpr, order), start.Unix(), end.Unix(), pageSize+boolInt(!includeTotal), pageOffset)
 	if err != nil {
@@ -939,7 +1287,7 @@ LIMIT ? OFFSET ?
 	return entries, totalRows, nil
 }
 
-func (s *Store) QueryTopProcessesAll(ctx context.Context, start, end time.Time, source string, groupBy string) ([]model.ProcessSummary, error) {
+func (s *Store) QueryTopProcessesAllLimited(ctx context.Context, start, end time.Time, source string, groupBy string, limit int) ([]model.ProcessSummary, error) {
 	info := usageSourceInfo(source)
 	resolvedGroupBy := "pid"
 	if isAggregatedUsageSource(source) || strings.EqualFold(groupBy, "comm") {
@@ -952,7 +1300,7 @@ func (s *Store) QueryTopProcessesAll(ctx context.Context, start, end time.Time, 
 		selectExpr = "NULL AS pid, comm, NULL AS exe"
 	}
 
-	rows, err := s.queryDB().QueryContext(ctx, fmt.Sprintf(`
+	statement := fmt.Sprintf(`
 SELECT %s,
        COALESCE(SUM(bytes_up), 0),
        COALESCE(SUM(bytes_down), 0),
@@ -960,7 +1308,13 @@ SELECT %s,
 FROM %s
 WHERE %s >= ? AND %s < ?
 GROUP BY %s
-`, selectExpr, info.Table, info.TimeCol, info.TimeCol, groupExpr), start.Unix(), end.Unix())
+`, selectExpr, info.Table, info.TimeCol, info.TimeCol, groupExpr)
+	args := []any{start.Unix(), end.Unix()}
+	if limit > 0 {
+		statement += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.queryDB().QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query all top processes: %w", err)
 	}
@@ -1005,30 +1359,40 @@ func processSummarySortExpr(sortBy string, resolvedGroupBy string) string {
 	case "pid":
 		if resolvedGroupBy == "pid" {
 			sortExpr = "pid"
+		} else {
+			sortExpr = "comm COLLATE NOCASE"
 		}
 	}
 	return sortExpr
 }
 
-func (s *Store) QueryTopProcessesSummary(ctx context.Context, start, end time.Time, groupBy, sortBy, sortOrder string, limit, offset int, includeTotal bool) ([]model.ProcessSummary, int, string, error) {
+type processSummarySource struct {
+	dataSource      string
+	partSQL         string
+	args            []any
+	resolvedGroupBy string
+	groupExpr       string
+	selectExpr      string
+}
+
+func (s *Store) buildProcessSummarySource(start, end time.Time, groupBy string) processSummarySource {
 	parts := s.usageSummaryParts(start, end)
-	dataSource := usageSummaryDataLabel(parts)
-	pageSize := clampPageSize(limit)
-	pageOffset := offset
-	if pageOffset < 0 {
-		pageOffset = 0
+	source := processSummarySource{
+		dataSource:      usageSummaryDataLabel(parts),
+		resolvedGroupBy: "pid",
+		groupExpr:       "pid, comm, exe",
+		selectExpr:      "pid, comm, exe",
 	}
-
-	resolvedGroupBy := "pid"
-	if dataSource != DataSourceMinute || strings.EqualFold(groupBy, "comm") {
-		resolvedGroupBy = "comm"
+	if source.dataSource != DataSourceMinute || strings.EqualFold(groupBy, "comm") {
+		source.resolvedGroupBy = "comm"
+		source.groupExpr = "comm"
+		source.selectExpr = "NULL AS pid, comm, NULL AS exe"
 	}
-
-	partSQL, args := buildSummaryUnion(
+	source.partSQL, source.args = buildSummaryUnion(
 		parts,
 		`SELECT NULL AS pid, '' AS comm, NULL AS exe, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count WHERE 0`,
 		func(part summaryPart) string {
-			if resolvedGroupBy == "pid" && part.info.DataLabel == DataSourceMinute {
+			if source.resolvedGroupBy == "pid" && part.info.DataLabel == DataSourceMinute {
 				return fmt.Sprintf(`
 SELECT pid, comm, exe, bytes_up, bytes_down, flow_count
 FROM %[1]s
@@ -1040,16 +1404,19 @@ FROM %[1]s
 WHERE %[2]s >= ? AND %[2]s < ?`, part.info.Table, part.info.TimeCol)
 		},
 	)
+	return source
+}
 
-	groupExpr := "pid, comm, exe"
-	selectExpr := "pid, comm, exe"
-	if resolvedGroupBy == "comm" {
-		groupExpr = "comm"
-		selectExpr = "NULL AS pid, comm, NULL AS exe"
+func (s *Store) QueryTopProcessesSummary(ctx context.Context, start, end time.Time, groupBy, sortBy, sortOrder string, limit, offset int, includeTotal bool) ([]model.ProcessSummary, int, string, error) {
+	source := s.buildProcessSummarySource(start, end, groupBy)
+	pageSize := clampPageSize(limit)
+	pageOffset := offset
+	if pageOffset < 0 {
+		pageOffset = 0
 	}
 	cte := `
 WITH summary_usage AS (
-` + partSQL + `
+` + source.partSQL + `
 )`
 	countSQL := fmt.Sprintf(`
 %s
@@ -1057,17 +1424,17 @@ SELECT COUNT(*) FROM (
     SELECT 1
     FROM summary_usage
     GROUP BY %s
-)`, cte, groupExpr)
+)`, cte, source.groupExpr)
 
 	db := s.queryDB()
 	var totalRows int
 	if includeTotal {
-		if err := db.QueryRowContext(ctx, countSQL, args...).Scan(&totalRows); err != nil {
+		if err := db.QueryRowContext(ctx, countSQL, source.args...).Scan(&totalRows); err != nil {
 			return nil, 0, "", fmt.Errorf("count top process summary: %w", err)
 		}
 	}
 
-	sortExpr := processSummarySortExpr(sortBy, resolvedGroupBy)
+	sortExpr := processSummarySortExpr(sortBy, source.resolvedGroupBy)
 	order := normalizeSortOrder(sortOrder)
 	querySQL := fmt.Sprintf(`
 %s
@@ -1077,10 +1444,10 @@ SELECT %s,
        COALESCE(SUM(flow_count), 0)
 FROM summary_usage
 GROUP BY %s
-ORDER BY %s %s, comm COLLATE NOCASE ASC
+ORDER BY %s %s, comm COLLATE NOCASE ASC, comm ASC, COALESCE(pid, -1) ASC, COALESCE(exe, '') ASC
 LIMIT ? OFFSET ?
-`, cte, selectExpr, groupExpr, sortExpr, order)
-	queryArgs := append(append([]any{}, args...), pageSize+boolInt(!includeTotal), pageOffset)
+`, cte, source.selectExpr, source.groupExpr, sortExpr, order)
+	queryArgs := append(append([]any{}, source.args...), pageSize+boolInt(!includeTotal), pageOffset)
 	rows, err := db.QueryContext(ctx, querySQL, queryArgs...)
 	if err != nil {
 		return nil, 0, "", fmt.Errorf("query top process summary: %w", err)
@@ -1094,7 +1461,7 @@ LIMIT ? OFFSET ?
 			pidValue sql.NullInt64
 			exeValue sql.NullString
 		)
-		entry.DataSource = dataSource
+		entry.DataSource = source.dataSource
 		if err := rows.Scan(&pidValue, &entry.Comm, &exeValue, &entry.BytesUp, &entry.BytesDown, &entry.FlowCount); err != nil {
 			return nil, 0, "", fmt.Errorf("scan top process summary: %w", err)
 		}
@@ -1108,39 +1475,12 @@ LIMIT ? OFFSET ?
 	if !includeTotal {
 		entries, totalRows = trimOffsetPage(entries, 1+(pageOffset/pageSize), pageSize)
 	}
-	return entries, totalRows, dataSource, nil
+	return entries, totalRows, source.dataSource, nil
 }
 
-func (s *Store) QueryTopProcessesSummaryAll(ctx context.Context, start, end time.Time, groupBy string) ([]model.ProcessSummary, string, error) {
-	parts := s.usageSummaryParts(start, end)
-	dataSource := usageSummaryDataLabel(parts)
-	resolvedGroupBy := "pid"
-	if dataSource != DataSourceMinute || strings.EqualFold(groupBy, "comm") {
-		resolvedGroupBy = "comm"
-	}
-	partSQL, args := buildSummaryUnion(
-		parts,
-		`SELECT NULL AS pid, '' AS comm, NULL AS exe, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count WHERE 0`,
-		func(part summaryPart) string {
-			if resolvedGroupBy == "pid" && part.info.DataLabel == DataSourceMinute {
-				return fmt.Sprintf(`
-SELECT pid, comm, exe, bytes_up, bytes_down, flow_count
-FROM %[1]s
-WHERE %[2]s >= ? AND %[2]s < ?`, part.info.Table, part.info.TimeCol)
-			}
-			return fmt.Sprintf(`
-SELECT NULL AS pid, comm, NULL AS exe, bytes_up, bytes_down, flow_count
-FROM %[1]s
-WHERE %[2]s >= ? AND %[2]s < ?`, part.info.Table, part.info.TimeCol)
-		},
-	)
-	groupExpr := "pid, comm, exe"
-	selectExpr := "pid, comm, exe"
-	if resolvedGroupBy == "comm" {
-		groupExpr = "comm"
-		selectExpr = "NULL AS pid, comm, NULL AS exe"
-	}
-	rows, err := s.queryDB().QueryContext(ctx, fmt.Sprintf(`
+func (s *Store) QueryTopProcessesSummaryAllLimited(ctx context.Context, start, end time.Time, groupBy string, limit int) ([]model.ProcessSummary, string, error) {
+	source := s.buildProcessSummarySource(start, end, groupBy)
+	statement := fmt.Sprintf(`
 WITH summary_usage AS (
 %s
 )
@@ -1150,13 +1490,18 @@ SELECT %s,
        COALESCE(SUM(flow_count), 0)
 FROM summary_usage
 GROUP BY %s
-`, partSQL, selectExpr, groupExpr), args...)
+`, source.partSQL, source.selectExpr, source.groupExpr)
+	if limit > 0 {
+		statement += " LIMIT ?"
+		source.args = append(source.args, limit)
+	}
+	rows, err := s.queryDB().QueryContext(ctx, statement, source.args...)
 	if err != nil {
 		return nil, "", fmt.Errorf("query all top process summary: %w", err)
 	}
 	defer rows.Close()
-	entries, err := scanProcessSummaries(rows, dataSource)
-	return entries, dataSource, err
+	entries, err := scanProcessSummaries(rows, source.dataSource)
+	return entries, source.dataSource, err
 }
 
 func (s *Store) QueryTopRemotes(ctx context.Context, start, end time.Time, source string, direction model.Direction, includeLoopback bool, sortBy, sortOrder string, limit, offset int, includeTotal bool) ([]model.RemoteSummary, int, error) {
@@ -1194,7 +1539,7 @@ func (s *Store) QueryTopRemotes(ctx context.Context, start, end time.Time, sourc
 SELECT direction, remote_ip, COALESCE(SUM(bytes_up), 0), COALESCE(SUM(bytes_down), 0), COALESCE(SUM(flow_count), 0)
 %s
 GROUP BY direction, remote_ip
-ORDER BY %s %s, remote_ip ASC
+ORDER BY %s %s, remote_ip ASC, direction ASC
 LIMIT ? OFFSET ?
 `, filterBuilder.String(), sortExpr, order)
 	queryArgs := append(append([]any{}, args...), pageSize+boolInt(!includeTotal), pageOffset)
@@ -1222,7 +1567,7 @@ LIMIT ? OFFSET ?
 	return entries, totalRows, nil
 }
 
-func (s *Store) QueryTopRemotesAll(ctx context.Context, start, end time.Time, source string, direction model.Direction, includeLoopback bool) ([]model.RemoteSummary, error) {
+func (s *Store) QueryTopRemotesAllLimited(ctx context.Context, start, end time.Time, source string, direction model.Direction, includeLoopback bool, limit int) ([]model.RemoteSummary, error) {
 	info := usageSourceInfo(source)
 	filterBuilder := strings.Builder{}
 	filterBuilder.WriteString(fmt.Sprintf("FROM %s WHERE %s >= ? AND %s < ?", info.Table, info.TimeCol, info.TimeCol))
@@ -1234,11 +1579,16 @@ func (s *Store) QueryTopRemotesAll(ctx context.Context, start, end time.Time, so
 	if !includeLoopback {
 		filterBuilder.WriteString(" AND remote_ip <> '' AND remote_ip NOT LIKE '127.%' AND remote_ip <> '::1'")
 	}
-	rows, err := s.queryDB().QueryContext(ctx, `
+	statement := `
 SELECT direction, remote_ip, COALESCE(SUM(bytes_up), 0), COALESCE(SUM(bytes_down), 0), COALESCE(SUM(flow_count), 0)
-`+filterBuilder.String()+`
+` + filterBuilder.String() + `
 GROUP BY direction, remote_ip
-`, args...)
+`
+	if limit > 0 {
+		statement += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.queryDB().QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query all top remotes: %w", err)
 	}
@@ -1280,16 +1630,18 @@ func remoteSummarySortExpr(sortBy string) string {
 	return sortExpr
 }
 
-func (s *Store) QueryTopRemotesSummary(ctx context.Context, start, end time.Time, direction model.Direction, includeLoopback bool, sortBy, sortOrder string, limit, offset int, includeTotal bool) ([]model.RemoteSummary, int, string, error) {
-	parts := s.usageSummaryParts(start, end)
-	dataSource := usageSummaryDataLabel(parts)
-	pageSize := clampPageSize(limit)
-	pageOffset := offset
-	if pageOffset < 0 {
-		pageOffset = 0
-	}
+type remoteSummarySource struct {
+	dataSource string
+	partSQL    string
+	args       []any
+	filterSQL  string
+	filterArgs []any
+}
 
-	partSQL, args := buildSummaryUnion(
+func (s *Store) buildRemoteSummarySource(start, end time.Time, direction model.Direction, includeLoopback bool) remoteSummarySource {
+	parts := s.usageSummaryParts(start, end)
+	source := remoteSummarySource{dataSource: usageSummaryDataLabel(parts)}
+	source.partSQL, source.args = buildSummaryUnion(
 		parts,
 		`SELECT '' AS direction, '' AS remote_ip, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count WHERE 0`,
 		func(part summaryPart) string {
@@ -1299,20 +1651,30 @@ FROM %[1]s
 WHERE %[2]s >= ? AND %[2]s < ?`, part.info.Table, part.info.TimeCol)
 		},
 	)
-
 	filterBuilder := strings.Builder{}
-	filterArgs := make([]any, 0, 1)
 	filterBuilder.WriteString("WHERE 1=1")
 	if direction != "" {
 		filterBuilder.WriteString(" AND direction = ?")
-		filterArgs = append(filterArgs, direction)
+		source.filterArgs = append(source.filterArgs, direction)
 	}
 	if !includeLoopback {
 		filterBuilder.WriteString(" AND remote_ip <> '' AND remote_ip NOT LIKE '127.%' AND remote_ip <> '::1'")
 	}
+	source.filterSQL = filterBuilder.String()
+	return source
+}
+
+func (s *Store) QueryTopRemotesSummary(ctx context.Context, start, end time.Time, direction model.Direction, includeLoopback bool, sortBy, sortOrder string, limit, offset int, includeTotal bool) ([]model.RemoteSummary, int, string, error) {
+	source := s.buildRemoteSummarySource(start, end, direction, includeLoopback)
+	pageSize := clampPageSize(limit)
+	pageOffset := offset
+	if pageOffset < 0 {
+		pageOffset = 0
+	}
+
 	cte := `
 WITH summary_usage AS (
-` + partSQL + `
+` + source.partSQL + `
 )`
 	countSQL := fmt.Sprintf(`
 %s
@@ -1321,11 +1683,11 @@ SELECT COUNT(*) FROM (
     FROM summary_usage
     %s
     GROUP BY direction, remote_ip
-)`, cte, filterBuilder.String())
+)`, cte, source.filterSQL)
 
 	db := s.queryDB()
 	var totalRows int
-	countArgs := append(append([]any{}, args...), filterArgs...)
+	countArgs := append(append([]any{}, source.args...), source.filterArgs...)
 	if includeTotal {
 		if err := db.QueryRowContext(ctx, countSQL, countArgs...).Scan(&totalRows); err != nil {
 			return nil, 0, "", fmt.Errorf("count top remote summary: %w", err)
@@ -1340,10 +1702,10 @@ SELECT direction, remote_ip, COALESCE(SUM(bytes_up), 0), COALESCE(SUM(bytes_down
 FROM summary_usage
 %s
 GROUP BY direction, remote_ip
-ORDER BY %s %s, remote_ip ASC
+ORDER BY %s %s, remote_ip ASC, direction ASC
 LIMIT ? OFFSET ?
-`, cte, filterBuilder.String(), sortExpr, order)
-	queryArgs := append(append(append([]any{}, args...), filterArgs...), pageSize+boolInt(!includeTotal), pageOffset)
+`, cte, source.filterSQL, sortExpr, order)
+	queryArgs := append(append(append([]any{}, source.args...), source.filterArgs...), pageSize+boolInt(!includeTotal), pageOffset)
 	rows, err := db.QueryContext(ctx, querySQL, queryArgs...)
 	if err != nil {
 		return nil, 0, "", fmt.Errorf("query top remote summary: %w", err)
@@ -1353,7 +1715,7 @@ LIMIT ? OFFSET ?
 	var entries []model.RemoteSummary
 	for rows.Next() {
 		var entry model.RemoteSummary
-		entry.DataSource = dataSource
+		entry.DataSource = source.dataSource
 		if err := rows.Scan(&entry.Direction, &entry.RemoteIP, &entry.BytesUp, &entry.BytesDown, &entry.FlowCount); err != nil {
 			return nil, 0, "", fmt.Errorf("scan top remote summary: %w", err)
 		}
@@ -1365,34 +1727,13 @@ LIMIT ? OFFSET ?
 	if !includeTotal {
 		entries, totalRows = trimOffsetPage(entries, 1+(pageOffset/pageSize), pageSize)
 	}
-	return entries, totalRows, dataSource, nil
+	return entries, totalRows, source.dataSource, nil
 }
 
-func (s *Store) QueryTopRemotesSummaryAll(ctx context.Context, start, end time.Time, direction model.Direction, includeLoopback bool) ([]model.RemoteSummary, string, error) {
-	parts := s.usageSummaryParts(start, end)
-	dataSource := usageSummaryDataLabel(parts)
-	partSQL, args := buildSummaryUnion(
-		parts,
-		`SELECT '' AS direction, '' AS remote_ip, 0 AS bytes_up, 0 AS bytes_down, 0 AS flow_count WHERE 0`,
-		func(part summaryPart) string {
-			return fmt.Sprintf(`
-SELECT direction, remote_ip, bytes_up, bytes_down, flow_count
-FROM %[1]s
-WHERE %[2]s >= ? AND %[2]s < ?`, part.info.Table, part.info.TimeCol)
-		},
-	)
-	filterBuilder := strings.Builder{}
-	filterArgs := make([]any, 0, 1)
-	filterBuilder.WriteString("WHERE 1=1")
-	if direction != "" {
-		filterBuilder.WriteString(" AND direction = ?")
-		filterArgs = append(filterArgs, direction)
-	}
-	if !includeLoopback {
-		filterBuilder.WriteString(" AND remote_ip <> '' AND remote_ip NOT LIKE '127.%' AND remote_ip <> '::1'")
-	}
-	queryArgs := append(append([]any{}, args...), filterArgs...)
-	rows, err := s.queryDB().QueryContext(ctx, fmt.Sprintf(`
+func (s *Store) QueryTopRemotesSummaryAllLimited(ctx context.Context, start, end time.Time, direction model.Direction, includeLoopback bool, limit int) ([]model.RemoteSummary, string, error) {
+	source := s.buildRemoteSummarySource(start, end, direction, includeLoopback)
+	queryArgs := append(append([]any{}, source.args...), source.filterArgs...)
+	statement := fmt.Sprintf(`
 WITH summary_usage AS (
 %s
 )
@@ -1400,13 +1741,18 @@ SELECT direction, remote_ip, COALESCE(SUM(bytes_up), 0), COALESCE(SUM(bytes_down
 FROM summary_usage
 %s
 GROUP BY direction, remote_ip
-`, partSQL, filterBuilder.String()), queryArgs...)
+`, source.partSQL, source.filterSQL)
+	if limit > 0 {
+		statement += " LIMIT ?"
+		queryArgs = append(queryArgs, limit)
+	}
+	rows, err := s.queryDB().QueryContext(ctx, statement, queryArgs...)
 	if err != nil {
 		return nil, "", fmt.Errorf("query all top remote summary: %w", err)
 	}
 	defer rows.Close()
-	entries, err := scanRemoteSummaries(rows, dataSource)
-	return entries, dataSource, err
+	entries, err := scanRemoteSummaries(rows, source.dataSource)
+	return entries, source.dataSource, err
 }
 
 func (s *Store) QueryTopPorts(ctx context.Context, start, end time.Time, source string, orderBy string) ([]model.TopEntry, error) {
@@ -1588,6 +1934,119 @@ WHERE %s >= ? AND %s < ?
 		return record.RowID
 	})
 	return records, nextCursor, 0, nil
+}
+
+func buildForwardSummaryRows(parts []summaryPart, query model.ForwardQuery) (string, []any) {
+	selects := make([]string, 0, len(parts))
+	args := make([]any, 0, len(parts)*4)
+	for _, part := range parts {
+		var builder strings.Builder
+		builder.WriteString(fmt.Sprintf(`
+SELECT rowid AS row_id, %[1]s AS time_bucket, proto, orig_src_ip, orig_dst_ip,
+       orig_sport, orig_dport, bytes_orig, bytes_reply, pkts_orig, pkts_reply,
+       flow_count, '%[3]s' AS data_source
+FROM %[2]s
+WHERE %[1]s >= ? AND %[1]s < ?
+`, part.info.TimeCol, part.info.Table, part.info.DataLabel))
+		partArgs := []any{part.start, part.end}
+		if query.Proto != "" {
+			builder.WriteString(" AND proto = ?")
+			partArgs = append(partArgs, query.Proto)
+		}
+		if query.OrigSrcIP != "" {
+			builder.WriteString(" AND orig_src_ip = ?")
+			partArgs = append(partArgs, query.OrigSrcIP)
+		}
+		if query.OrigDstIP != "" {
+			builder.WriteString(" AND orig_dst_ip = ?")
+			partArgs = append(partArgs, query.OrigDstIP)
+		}
+		selects = append(selects, builder.String())
+		args = append(args, partArgs...)
+	}
+	if len(selects) == 0 {
+		return `SELECT 0 AS row_id, 0 AS time_bucket, '' AS proto, '' AS orig_src_ip,
+'' AS orig_dst_ip, 0 AS orig_sport, 0 AS orig_dport, 0 AS bytes_orig,
+0 AS bytes_reply, 0 AS pkts_orig, 0 AS pkts_reply, 0 AS flow_count,
+'' AS data_source WHERE 0`, nil
+	}
+	return strings.Join(selects, "\nUNION ALL\n"), args
+}
+
+func forwardSummaryOrderClause(sortBy, sortOrder string) string {
+	order := normalizeSortOrder(sortOrder)
+	switch sortBy {
+	case "bytes_orig":
+		return fmt.Sprintf(" ORDER BY bytes_orig %s, time_bucket DESC, row_id DESC", order)
+	case "bytes_reply":
+		return fmt.Sprintf(" ORDER BY bytes_reply %s, time_bucket DESC, row_id DESC", order)
+	case "bytes_total":
+		return fmt.Sprintf(" ORDER BY (bytes_orig + bytes_reply) %s, time_bucket DESC, row_id DESC", order)
+	case "flow_count":
+		return fmt.Sprintf(" ORDER BY flow_count %s, time_bucket DESC, row_id DESC", order)
+	case "orig_src_ip":
+		return fmt.Sprintf(" ORDER BY orig_src_ip %s, time_bucket DESC, row_id DESC", order)
+	case "orig_dst_ip":
+		return fmt.Sprintf(" ORDER BY orig_dst_ip %s, time_bucket DESC, row_id DESC", order)
+	default:
+		return fmt.Sprintf(" ORDER BY time_bucket %s, row_id %s", order, order)
+	}
+}
+
+func (s *Store) QueryForwardUsageSummaryCount(ctx context.Context, query model.ForwardQuery) (int, string, error) {
+	parts := s.forwardSummaryParts(query.Start, query.End)
+	unionSQL, args := buildForwardSummaryRows(parts, query)
+	total, err := countRows(ctx, s.queryDB(), "SELECT COUNT(*) FROM ("+unionSQL+") AS summary_forward", args, "forward usage summary")
+	return total, forwardSummaryDataLabel(parts), err
+}
+
+func (s *Store) QueryForwardUsageSummary(ctx context.Context, query model.ForwardQuery) ([]model.ForwardUsageRecord, string, int, string, error) {
+	parts := s.forwardSummaryParts(query.Start, query.End)
+	dataSource := forwardSummaryDataLabel(parts)
+	unionSQL, args := buildForwardSummaryRows(parts, query)
+	var builder strings.Builder
+	builder.WriteString("SELECT * FROM (" + unionSQL + ") AS summary_forward")
+	var totalRows int
+	var err error
+	if query.UsePage && query.IncludeTotal {
+		totalRows, _, err = s.QueryForwardUsageSummaryCount(ctx, query)
+		if err != nil {
+			return nil, "", 0, "", err
+		}
+	}
+	appendSummaryPagination(&builder, &args, forwardSummaryOrderClause(query.SortBy, query.SortOrder), query.UsePage, query.IncludeTotal, query.Page, query.PageSize, query.CursorTS, query.CursorRowID, query.Limit)
+	rows, err := s.queryDB().QueryContext(ctx, builder.String(), args...)
+	if err != nil {
+		return nil, "", 0, "", fmt.Errorf("query forward usage summary: %w", err)
+	}
+	defer rows.Close()
+	records, err := scanForwardSummaryRows(rows)
+	if err != nil {
+		return nil, "", 0, "", err
+	}
+	if query.UsePage {
+		if !query.IncludeTotal {
+			records, totalRows = trimOffsetPage(records, query.Page, query.PageSize)
+		}
+		return records, "", totalRows, dataSource, nil
+	}
+	records, nextCursor := trimPage(records, clampLimit(query.Limit), func(record model.ForwardUsageRecord) int64 { return record.TimeBucket }, func(record model.ForwardUsageRecord) int64 { return record.RowID })
+	return records, nextCursor, 0, dataSource, nil
+}
+
+func scanForwardSummaryRows(rows *sql.Rows) ([]model.ForwardUsageRecord, error) {
+	records := make([]model.ForwardUsageRecord, 0)
+	for rows.Next() {
+		var record model.ForwardUsageRecord
+		if err := rows.Scan(&record.RowID, &record.TimeBucket, &record.Proto, &record.OrigSrcIP,
+			&record.OrigDstIP, &record.OrigSPort, &record.OrigDPort, &record.BytesOrig,
+			&record.BytesReply, &record.PktsOrig, &record.PktsReply, &record.FlowCount,
+			&record.DataSource); err != nil {
+			return nil, fmt.Errorf("scan forward usage summary: %w", err)
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
 }
 
 func scanForwardRows(rows *sql.Rows, dataSource string) ([]model.ForwardUsageRecord, error) {

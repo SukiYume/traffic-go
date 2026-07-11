@@ -15,31 +15,36 @@ const (
 	defaultPositiveCacheTTL = 30 * time.Second
 	defaultNegativeCacheTTL = 10 * time.Second
 	defaultScanCooldown     = 5 * time.Second
+	defaultOwnershipTTL     = 5 * time.Second
 )
 
 type processResolver struct {
-	procFS        string
-	now           func() time.Time
-	scan          func(context.Context) (map[uint64]model.ProcessInfo, bool)
-	pidSockets    func(int) (map[uint64]struct{}, bool)
-	positiveTTL   time.Duration
-	negativeTTL   time.Duration
-	scanCooldown  time.Duration
-	lastFullScan  time.Time
-	lastMissScan  time.Time
-	cache         map[uint64]model.ProcessInfo
-	negativeCache map[uint64]time.Time
+	procFS         string
+	now            func() time.Time
+	scan           func(context.Context) (map[uint64]model.ProcessInfo, bool)
+	pidSockets     func(int) (map[uint64]struct{}, bool)
+	positiveTTL    time.Duration
+	negativeTTL    time.Duration
+	scanCooldown   time.Duration
+	ownershipTTL   time.Duration
+	lastFullScan   time.Time
+	lastMissScan   time.Time
+	cache          map[uint64]model.ProcessInfo
+	negativeCache  map[uint64]time.Time
+	validatedUntil map[uint64]time.Time
 }
 
 func newProcessResolver(procFS string) *processResolver {
 	return &processResolver{
-		procFS:        procFS,
-		now:           time.Now,
-		positiveTTL:   defaultPositiveCacheTTL,
-		negativeTTL:   defaultNegativeCacheTTL,
-		scanCooldown:  defaultScanCooldown,
-		cache:         make(map[uint64]model.ProcessInfo),
-		negativeCache: make(map[uint64]time.Time),
+		procFS:         procFS,
+		now:            time.Now,
+		positiveTTL:    defaultPositiveCacheTTL,
+		negativeTTL:    defaultNegativeCacheTTL,
+		scanCooldown:   defaultScanCooldown,
+		ownershipTTL:   defaultOwnershipTTL,
+		cache:          make(map[uint64]model.ProcessInfo),
+		negativeCache:  make(map[uint64]time.Time),
+		validatedUntil: make(map[uint64]time.Time),
 	}
 }
 
@@ -58,15 +63,21 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 	for inode := range requested {
 		if !scanDue {
 			if cached, ok := r.cache[inode]; ok {
-				// Confirm the cached PID still owns the socket inode before we
-				// trust a stale positive-cache hit. Linux can recycle socket
-				// inodes quickly, and using the old mapping would misattribute
-				// short-lived connections to the wrong process.
-				if r.cachedOwnershipValid(ownedSockets, ownedSocketsLoaded, cached.PID, inode) {
+				if r.validatedUntil[inode].After(now) {
 					resolved[inode] = cached
 					continue
 				}
+				// Confirm the cached PID still owns the socket inode before we
+				// renew a bounded ownership lease. This avoids enumerating the
+				// same PID's FD directory on every collector tick while retaining
+				// periodic protection against Linux socket-inode reuse.
+				if r.cachedOwnershipValid(ownedSockets, ownedSocketsLoaded, cached.PID, inode) {
+					resolved[inode] = cached
+					r.validatedUntil[inode] = now.Add(r.ownershipTTL)
+					continue
+				}
 				delete(r.cache, inode)
+				delete(r.validatedUntil, inode)
 			}
 		}
 		if expiry, ok := r.negativeCache[inode]; ok && expiry.After(now) {
@@ -92,6 +103,10 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 	scanned, scanOK := scanFn(ctx)
 	if scanOK {
 		r.cache = scanned
+		r.validatedUntil = make(map[uint64]time.Time, len(scanned))
+		for inode := range scanned {
+			r.validatedUntil[inode] = now.Add(r.ownershipTTL)
+		}
 		r.lastFullScan = now
 		r.lastMissScan = now
 		for inode := range scanned {
@@ -101,8 +116,15 @@ func (r *processResolver) Resolve(ctx context.Context, requested map[uint64]stru
 
 	for inode := range missing {
 		if cached, ok := r.cache[inode]; ok {
-			resolved[inode] = cached
-			continue
+			if scanOK || r.validatedUntil[inode].After(now) || r.cachedOwnershipValid(ownedSockets, ownedSocketsLoaded, cached.PID, inode) {
+				resolved[inode] = cached
+				if !scanOK {
+					r.validatedUntil[inode] = now.Add(r.ownershipTTL)
+				}
+				continue
+			}
+			delete(r.cache, inode)
+			delete(r.validatedUntil, inode)
 		}
 		if !scanOK {
 			continue

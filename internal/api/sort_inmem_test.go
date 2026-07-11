@@ -1,6 +1,7 @@
 package api
 
 import (
+	"math"
 	"testing"
 
 	"traffic-go/internal/model"
@@ -37,6 +38,20 @@ func TestSortProcessSummariesByPIDAsc(t *testing.T) {
 	}
 }
 
+func TestSortProcessSummariesUsesCompleteGroupTieBreaker(t *testing.T) {
+	exeA := "/a"
+	exeB := "/b"
+	rows := []model.ProcessSummary{
+		{PID: intPtr(7), Comm: "curl", Exe: &exeB, BytesUp: 1},
+		{PID: intPtr(7), Comm: "curl", Exe: &exeA, BytesUp: 1},
+		{PID: intPtr(6), Comm: "Curl", Exe: &exeB, BytesUp: 1},
+	}
+	sorted := sortProcessSummaries(rows, "bytes_up", "desc")
+	if sorted[0].Comm != "Curl" || *sorted[1].Exe != exeA || *sorted[2].Exe != exeB {
+		t.Fatalf("unexpected complete tie-break order: %+v", sorted)
+	}
+}
+
 func TestPageSlice(t *testing.T) {
 	rows := []model.ProcessSummary{{Comm: "a"}, {Comm: "b"}, {Comm: "c"}}
 	got := pageSlice(rows, 2, 2)
@@ -50,6 +65,10 @@ func TestPageSlice(t *testing.T) {
 	got = pageSlice(rows, 1, 1)
 	if len(got) != 1 || got[0].Comm != "a" {
 		t.Fatalf("expected [a], got %+v", got)
+	}
+	got = pageSlice(rows, math.MaxInt, 200)
+	if len(got) != 0 {
+		t.Fatalf("overflowing page must return an empty slice, got %+v", got)
 	}
 }
 

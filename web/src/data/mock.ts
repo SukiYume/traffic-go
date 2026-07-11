@@ -24,9 +24,9 @@ import type {
   MonthlyUsageResponse,
   ProcessOption,
   UsageExplain,
-} from '../types';
-import { RANGE_TO_BUCKET } from '../ranges';
-import { executableName, formatBucketTimeLabel, isLoopbackIp } from '../utils';
+} from "../types";
+import { RANGE_TO_BUCKET } from "../ranges";
+import { executableName, formatBucketTimeLabel, isLoopbackIp } from "../utils";
 
 const BASE_TS = 1_735_689_600;
 const MINUTE = 60;
@@ -34,16 +34,32 @@ const MINUTE = 60;
 type MockProcessSeed = ProcessOption & { totalBytes: number };
 
 const PROCESSES: MockProcessSeed[] = [
-  { pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', totalBytes: 842_731_520 },
-  { pid: 2041, comm: 'v2ray', exe: '/opt/v2ray/v2ray', totalBytes: 631_320_128 },
-  { pid: 3312, comm: 'nginx', exe: '/usr/sbin/nginx', totalBytes: 188_220_416 },
-  { pid: 4920, comm: 'dockerd', exe: '/usr/bin/dockerd', totalBytes: 93_114_880 },
-  { pid: 0, comm: 'unknown', exe: '', totalBytes: 41_562_112 },
+  {
+    pid: 1088,
+    comm: "ss-server",
+    exe: "/usr/bin/ss-server",
+    totalBytes: 842_731_520,
+  },
+  {
+    pid: 2041,
+    comm: "v2ray",
+    exe: "/opt/v2ray/v2ray",
+    totalBytes: 631_320_128,
+  },
+  { pid: 3312, comm: "nginx", exe: "/usr/sbin/nginx", totalBytes: 188_220_416 },
+  {
+    pid: 4920,
+    comm: "dockerd",
+    exe: "/usr/bin/dockerd",
+    totalBytes: 93_114_880,
+  },
+  { pid: 0, comm: "unknown", exe: "", totalBytes: 41_562_112 },
 ];
 
-const monthTs = (year: number, month: number) => Date.UTC(year, month - 1, 1) / 1000;
+const monthTs = (year: number, month: number) =>
+  Date.UTC(year, month - 1, 1) / 1000;
 
-const MONTHLY_ROWS: MonthlyUsageResponse['rows'] = [
+const MONTHLY_ROWS: MonthlyUsageResponse["rows"] = [
   {
     monthTs: monthTs(2026, 4),
     bytesUp: 1_208_742_000,
@@ -57,7 +73,7 @@ const MONTHLY_ROWS: MonthlyUsageResponse['rows'] = [
     updatedAt: BASE_TS,
     archived: false,
     detailAvailable: true,
-    detailRange: 'this_month',
+    detailRange: "this_month",
     totalBytes: 5_044_648_000,
     forwardTotalBytes: 1_122_751_000,
   },
@@ -74,7 +90,7 @@ const MONTHLY_ROWS: MonthlyUsageResponse['rows'] = [
     updatedAt: BASE_TS - 1_800,
     archived: false,
     detailAvailable: true,
-    detailRange: 'last_month',
+    detailRange: "last_month",
     totalBytes: 17_242_650_000,
     forwardTotalBytes: 6_336_308_000,
   },
@@ -91,7 +107,7 @@ const MONTHLY_ROWS: MonthlyUsageResponse['rows'] = [
     updatedAt: BASE_TS - 3_600,
     archived: false,
     detailAvailable: true,
-    detailRange: 'two_months_ago',
+    detailRange: "two_months_ago",
     totalBytes: 14_092_818_000,
     forwardTotalBytes: 5_313_323_000,
   },
@@ -115,26 +131,178 @@ const MONTHLY_ROWS: MonthlyUsageResponse['rows'] = [
 ];
 
 const USAGE_ROWS: UsageRow[] = [
-  { minuteTs: BASE_TS - 720, proto: 'tcp', direction: 'in', pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', localPort: 8388, remoteIp: '203.0.113.24', remotePort: 52144, attribution: 'exact', bytesUp: 182_000, bytesDown: 1_240_000, pktsUp: 320, pktsDown: 960, flowCount: 3 },
-  { minuteTs: BASE_TS - 660, proto: 'tcp', direction: 'out', pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', localPort: 47920, remoteIp: '198.51.100.44', remotePort: 443, attribution: 'exact', bytesUp: 1_918_000, bytesDown: 6_144_000, pktsUp: 980, pktsDown: 1_620, flowCount: 4 },
-  { minuteTs: BASE_TS - 600, proto: 'udp', direction: 'out', pid: null, comm: null, exe: null, localPort: 53011, remoteIp: '203.0.113.53', remotePort: 53, attribution: 'unknown', bytesUp: 18_432, bytesDown: 32_768, pktsUp: 20, pktsDown: 24, flowCount: 1 },
-  { minuteTs: BASE_TS - 540, proto: 'tcp', direction: 'out', pid: 2041, comm: 'v2ray', exe: '/opt/v2ray/v2ray', localPort: 55712, remoteIp: '192.0.2.25', remotePort: 443, attribution: 'exact', bytesUp: 4_230_144, bytesDown: 14_742_528, pktsUp: 1_024, pktsDown: 2_448, flowCount: 2 },
-  { minuteTs: BASE_TS - 480, proto: 'tcp', direction: 'in', pid: 3312, comm: 'nginx', exe: '/usr/sbin/nginx', localPort: 80, remoteIp: '198.51.100.17', remotePort: 41220, attribution: 'exact', bytesUp: 122_880, bytesDown: 896_000, pktsUp: 250, pktsDown: 530, flowCount: 5 },
-  { minuteTs: BASE_TS - 420, proto: 'tcp', direction: 'out', pid: 4920, comm: 'dockerd', exe: '/usr/bin/dockerd', localPort: 41688, remoteIp: '203.0.113.88', remotePort: 443, attribution: 'exact', bytesUp: 512_000, bytesDown: 1_024_000, pktsUp: 400, pktsDown: 420, flowCount: 1 },
-  { minuteTs: BASE_TS - 360, proto: 'udp', direction: 'out', pid: null, comm: null, exe: null, localPort: 5353, remoteIp: '192.0.2.53', remotePort: 443, attribution: 'unknown', bytesUp: 91_136, bytesDown: 142_336, pktsUp: 88, pktsDown: 96, flowCount: 2 },
-  { minuteTs: BASE_TS - 300, proto: 'tcp', direction: 'out', pid: 1088, comm: 'ss-server', exe: '/usr/bin/ss-server', localPort: 51234, remoteIp: '198.51.100.118', remotePort: 443, attribution: 'exact', bytesUp: 2_987_520, bytesDown: 9_437_184, pktsUp: 1_420, pktsDown: 2_928, flowCount: 5 },
+  {
+    minuteTs: BASE_TS - 720,
+    proto: "tcp",
+    direction: "in",
+    pid: 1088,
+    comm: "ss-server",
+    exe: "/usr/bin/ss-server",
+    localPort: 8388,
+    remoteIp: "203.0.113.24",
+    remotePort: 52144,
+    attribution: "exact",
+    bytesUp: 182_000,
+    bytesDown: 1_240_000,
+    pktsUp: 320,
+    pktsDown: 960,
+    flowCount: 3,
+  },
+  {
+    minuteTs: BASE_TS - 660,
+    proto: "tcp",
+    direction: "out",
+    pid: 1088,
+    comm: "ss-server",
+    exe: "/usr/bin/ss-server",
+    localPort: 47920,
+    remoteIp: "198.51.100.44",
+    remotePort: 443,
+    attribution: "exact",
+    bytesUp: 1_918_000,
+    bytesDown: 6_144_000,
+    pktsUp: 980,
+    pktsDown: 1_620,
+    flowCount: 4,
+  },
+  {
+    minuteTs: BASE_TS - 600,
+    proto: "udp",
+    direction: "out",
+    pid: null,
+    comm: null,
+    exe: null,
+    localPort: 53011,
+    remoteIp: "203.0.113.53",
+    remotePort: 53,
+    attribution: "unknown",
+    bytesUp: 18_432,
+    bytesDown: 32_768,
+    pktsUp: 20,
+    pktsDown: 24,
+    flowCount: 1,
+  },
+  {
+    minuteTs: BASE_TS - 540,
+    proto: "tcp",
+    direction: "out",
+    pid: 2041,
+    comm: "v2ray",
+    exe: "/opt/v2ray/v2ray",
+    localPort: 55712,
+    remoteIp: "192.0.2.25",
+    remotePort: 443,
+    attribution: "exact",
+    bytesUp: 4_230_144,
+    bytesDown: 14_742_528,
+    pktsUp: 1_024,
+    pktsDown: 2_448,
+    flowCount: 2,
+  },
+  {
+    minuteTs: BASE_TS - 480,
+    proto: "tcp",
+    direction: "in",
+    pid: 3312,
+    comm: "nginx",
+    exe: "/usr/sbin/nginx",
+    localPort: 80,
+    remoteIp: "198.51.100.17",
+    remotePort: 41220,
+    attribution: "exact",
+    bytesUp: 122_880,
+    bytesDown: 896_000,
+    pktsUp: 250,
+    pktsDown: 530,
+    flowCount: 5,
+  },
+  {
+    minuteTs: BASE_TS - 420,
+    proto: "tcp",
+    direction: "out",
+    pid: 4920,
+    comm: "dockerd",
+    exe: "/usr/bin/dockerd",
+    localPort: 41688,
+    remoteIp: "203.0.113.88",
+    remotePort: 443,
+    attribution: "exact",
+    bytesUp: 512_000,
+    bytesDown: 1_024_000,
+    pktsUp: 400,
+    pktsDown: 420,
+    flowCount: 1,
+  },
+  {
+    minuteTs: BASE_TS - 360,
+    proto: "udp",
+    direction: "out",
+    pid: null,
+    comm: null,
+    exe: null,
+    localPort: 5353,
+    remoteIp: "192.0.2.53",
+    remotePort: 443,
+    attribution: "unknown",
+    bytesUp: 91_136,
+    bytesDown: 142_336,
+    pktsUp: 88,
+    pktsDown: 96,
+    flowCount: 2,
+  },
+  {
+    minuteTs: BASE_TS - 300,
+    proto: "tcp",
+    direction: "out",
+    pid: 1088,
+    comm: "ss-server",
+    exe: "/usr/bin/ss-server",
+    localPort: 51234,
+    remoteIp: "198.51.100.118",
+    remotePort: 443,
+    attribution: "exact",
+    bytesUp: 2_987_520,
+    bytesDown: 9_437_184,
+    pktsUp: 1_420,
+    pktsDown: 2_928,
+    flowCount: 5,
+  },
 ];
 
 const FORWARD_ROWS: ForwardUsageRow[] = [
-  { minuteTs: BASE_TS - 600, proto: 'tcp', origSrc: '10.0.0.2', origDst: '198.51.100.53', origSport: 51122, origDport: 443, bytesOrig: 4_096_000, bytesReply: 11_468_800, pktsOrig: 1_120, pktsReply: 1_980, flowCount: 2 },
-  { minuteTs: BASE_TS - 420, proto: 'tcp', origSrc: '10.0.0.3', origDst: '203.0.113.53', origSport: 53201, origDport: 443, bytesOrig: 2_457_600, bytesReply: 7_782_400, pktsOrig: 640, pktsReply: 1_220, flowCount: 1 },
+  {
+    minuteTs: BASE_TS - 600,
+    proto: "tcp",
+    origSrc: "10.0.0.2",
+    origDst: "198.51.100.53",
+    origSport: 51122,
+    origDport: 443,
+    bytesOrig: 4_096_000,
+    bytesReply: 11_468_800,
+    pktsOrig: 1_120,
+    pktsReply: 1_980,
+    flowCount: 2,
+  },
+  {
+    minuteTs: BASE_TS - 420,
+    proto: "tcp",
+    origSrc: "10.0.0.3",
+    origDst: "203.0.113.53",
+    origSport: 53201,
+    origDport: 443,
+    bytesOrig: 2_457_600,
+    bytesReply: 7_782_400,
+    pktsOrig: 640,
+    pktsReply: 1_220,
+    flowCount: 1,
+  },
 ];
 
 function rangeToMinutes(range: RangeKey) {
   return {
-    '1h': 60,
-    '24h': 24 * 60,
-    '7d': 7 * 24 * 60,
+    "1h": 60,
+    "24h": 24 * 60,
+    "7d": 7 * 24 * 60,
     this_month: 31 * 24 * 60,
     last_month: 30 * 24 * 60,
     two_months_ago: 28 * 24 * 60,
@@ -142,7 +310,7 @@ function rangeToMinutes(range: RangeKey) {
 }
 
 function bucketMinutes(bucket: string) {
-  return { '1m': 1, '5m': 5, '1h': 60, '6h': 360, '1d': 1440 }[bucket] ?? 1;
+  return { "1m": 1, "5m": 5, "1h": 60, "6h": 360, "1d": 1440 }[bucket] ?? 1;
 }
 
 function aggregateSeries(range: RangeKey, bucket: string): TimeSeriesPoint[] {
@@ -162,11 +330,14 @@ function aggregateSeries(range: RangeKey, bucket: string): TimeSeriesPoint[] {
   });
 }
 
-function buildGroupedSeries(points: TimeSeriesPoint[], groupBy: 'direction' | 'comm' | 'remote_ip') {
-  if (groupBy === 'direction') {
+function buildGroupedSeries(
+  points: TimeSeriesPoint[],
+  groupBy: "direction" | "comm" | "remote_ip",
+) {
+  if (groupBy === "direction") {
     return [
       {
-        key: 'in',
+        key: "in",
         points: points.map((point, index) => {
           const inboundShare = 0.34 + (index % 3) * 0.07;
           const bytesTotal = point.up + point.down;
@@ -179,7 +350,7 @@ function buildGroupedSeries(points: TimeSeriesPoint[], groupBy: 'direction' | 'c
         }),
       },
       {
-        key: 'out',
+        key: "out",
         points: points.map((point, index) => {
           const inboundShare = 0.34 + (index % 3) * 0.07;
           const outboundShare = 1 - inboundShare;
@@ -188,26 +359,36 @@ function buildGroupedSeries(points: TimeSeriesPoint[], groupBy: 'direction' | 'c
             ...point,
             up: Math.round(bytesTotal * outboundShare * 0.36),
             down: Math.round(bytesTotal * outboundShare * 0.64),
-            flowCount: Math.max(1, point.flowCount - Math.round(point.flowCount * inboundShare)),
+            flowCount: Math.max(
+              1,
+              point.flowCount - Math.round(point.flowCount * inboundShare),
+            ),
           };
         }),
       },
     ];
   }
 
-  const key = groupBy === 'comm' ? 'process' : 'remote';
+  const key = groupBy === "comm" ? "process" : "remote";
   return [{ key, points }];
 }
 
 function overviewFor(range: RangeKey): OverviewStats {
-  const factor = { '1h': 1, '24h': 6, '7d': 18, this_month: 42, last_month: 40, two_months_ago: 37 }[range];
+  const factor = {
+    "1h": 1,
+    "24h": 6,
+    "7d": 18,
+    this_month: 42,
+    last_month: 40,
+    two_months_ago: 37,
+  }[range];
   return {
     bytesUp: 28_742_314 * factor,
     bytesDown: 91_331_120 * factor,
     flowCount: 128 * factor,
     activeConnections: Math.max(12, Math.round((48 * factor) / 6)),
     activeProcesses: PROCESSES.filter((p) => p.pid > 0).length,
-    dataSource: 'usage_1m',
+    dataSource: "usage_1m",
     range,
   };
 }
@@ -218,16 +399,21 @@ function filterUsage(query: UsageQuery, rows: UsageRow[]) {
     if (query.pid && row.pid !== Number(query.pid)) return false;
     if (query.exe) {
       const filter = query.exe.trim();
-      const rowExe = row.exe?.trim() ?? '';
-      if (rowExe !== filter && executableName(rowExe) !== executableName(filter)) {
+      const rowExe = row.exe?.trim() ?? "";
+      if (
+        rowExe !== filter &&
+        executableName(rowExe) !== executableName(filter)
+      ) {
         return false;
       }
     }
     if (query.remoteIp && row.remoteIp !== query.remoteIp) return false;
-    if (query.localPort && row.localPort !== Number(query.localPort)) return false;
+    if (query.localPort && row.localPort !== Number(query.localPort))
+      return false;
     if (query.direction && row.direction !== query.direction) return false;
     if (query.proto && row.proto !== query.proto) return false;
-    if (query.attribution && row.attribution !== query.attribution) return false;
+    if (query.attribution && row.attribution !== query.attribution)
+      return false;
     return true;
   });
 }
@@ -241,59 +427,72 @@ function filterForward(query: ForwardUsageQuery, rows: ForwardUsageRow[]) {
   });
 }
 
-function compareText(left: string | null | undefined, right: string | null | undefined) {
-  return (left ?? '').localeCompare(right ?? '', 'zh-CN');
+function compareText(
+  left: string | null | undefined,
+  right: string | null | undefined,
+) {
+  return (left ?? "").localeCompare(right ?? "", "zh-CN");
 }
 
-function compareNumber(left: number | null | undefined, right: number | null | undefined) {
+function compareNumber(
+  left: number | null | undefined,
+  right: number | null | undefined,
+) {
   return (left ?? 0) - (right ?? 0);
 }
 
 function normalizeSortOrder(sortOrder?: SortOrder): SortOrder {
-  return sortOrder === 'asc' ? 'asc' : 'desc';
+  return sortOrder === "asc" ? "asc" : "desc";
 }
 
 function applyOrder(value: number, sortOrder: SortOrder) {
-  return sortOrder === 'asc' ? value : -value;
+  return sortOrder === "asc" ? value : -value;
 }
 
-function sortUsageRows(rows: UsageRow[], sortBy?: UsageSortKey, sortOrder?: SortOrder) {
-  const key = sortBy ?? 'minuteTs';
+function sortUsageRows(
+  rows: UsageRow[],
+  sortBy?: UsageSortKey,
+  sortOrder?: SortOrder,
+) {
+  const key = sortBy ?? "minuteTs";
   const order = normalizeSortOrder(sortOrder);
   return [...rows].sort((left, right) => {
     let result = 0;
     switch (key) {
-      case 'bytesUp':
+      case "bytesUp":
         result = compareNumber(left.bytesUp, right.bytesUp);
         break;
-      case 'bytesDown':
+      case "bytesDown":
         result = compareNumber(left.bytesDown, right.bytesDown);
         break;
-      case 'bytesTotal':
-        result = compareNumber(left.bytesUp + left.bytesDown, right.bytesUp + right.bytesDown);
+      case "bytesTotal":
+        result = compareNumber(
+          left.bytesUp + left.bytesDown,
+          right.bytesUp + right.bytesDown,
+        );
         break;
-      case 'flowCount':
+      case "flowCount":
         result = compareNumber(left.flowCount, right.flowCount);
         break;
-      case 'remoteIp':
+      case "remoteIp":
         result = compareText(left.remoteIp, right.remoteIp);
         break;
-      case 'direction':
+      case "direction":
         result = compareText(left.direction, right.direction);
         break;
-      case 'proto':
+      case "proto":
         result = compareText(left.proto, right.proto);
         break;
-      case 'localPort':
+      case "localPort":
         result = compareNumber(left.localPort, right.localPort);
         break;
-      case 'comm':
+      case "comm":
         result = compareText(left.comm, right.comm);
         break;
-      case 'pid':
+      case "pid":
         result = compareNumber(left.pid, right.pid);
         break;
-      case 'minuteTs':
+      case "minuteTs":
       default:
         result = compareNumber(left.minuteTs, right.minuteTs);
         break;
@@ -306,31 +505,38 @@ function sortUsageRows(rows: UsageRow[], sortBy?: UsageSortKey, sortOrder?: Sort
   });
 }
 
-function sortForwardRows(rows: ForwardUsageRow[], sortBy?: ForwardSortKey, sortOrder?: SortOrder) {
-  const key = sortBy ?? 'minuteTs';
+function sortForwardRows(
+  rows: ForwardUsageRow[],
+  sortBy?: ForwardSortKey,
+  sortOrder?: SortOrder,
+) {
+  const key = sortBy ?? "minuteTs";
   const order = normalizeSortOrder(sortOrder);
   return [...rows].sort((left, right) => {
     let result = 0;
     switch (key) {
-      case 'bytesOrig':
+      case "bytesOrig":
         result = compareNumber(left.bytesOrig, right.bytesOrig);
         break;
-      case 'bytesReply':
+      case "bytesReply":
         result = compareNumber(left.bytesReply, right.bytesReply);
         break;
-      case 'bytesTotal':
-        result = compareNumber(left.bytesOrig + left.bytesReply, right.bytesOrig + right.bytesReply);
+      case "bytesTotal":
+        result = compareNumber(
+          left.bytesOrig + left.bytesReply,
+          right.bytesOrig + right.bytesReply,
+        );
         break;
-      case 'flowCount':
+      case "flowCount":
         result = compareNumber(left.flowCount, right.flowCount);
         break;
-      case 'origSrc':
+      case "origSrc":
         result = compareText(left.origSrc, right.origSrc);
         break;
-      case 'origDst':
+      case "origDst":
         result = compareText(left.origDst, right.origDst);
         break;
-      case 'minuteTs':
+      case "minuteTs":
       default:
         result = compareNumber(left.minuteTs, right.minuteTs);
         break;
@@ -357,32 +563,32 @@ function sortProcessRows(
   sortOrder?: SortOrder,
   allowPID = true,
 ) {
-  const key = sortBy ?? 'bytesTotal';
+  const key = sortBy ?? "bytesTotal";
   const order = normalizeSortOrder(sortOrder);
 
   return [...rows].sort((left, right) => {
     let result = 0;
     switch (key) {
-      case 'comm':
+      case "comm":
         result = compareText(left.comm, right.comm);
         break;
-      case 'pid':
+      case "pid":
         if (allowPID) {
           result = compareNumber(left.pid, right.pid);
           break;
         }
         result = compareNumber(left.totalBytes, right.totalBytes);
         break;
-      case 'bytesUp':
+      case "bytesUp":
         result = compareNumber(left.bytesUp, right.bytesUp);
         break;
-      case 'bytesDown':
+      case "bytesDown":
         result = compareNumber(left.bytesDown, right.bytesDown);
         break;
-      case 'flowCount':
+      case "flowCount":
         result = compareNumber(left.flowCount, right.flowCount);
         break;
-      case 'bytesTotal':
+      case "bytesTotal":
       default:
         result = compareNumber(left.totalBytes, right.totalBytes);
         break;
@@ -397,7 +603,7 @@ function sortProcessRows(
 
 function sortRemoteRows(
   rows: Array<{
-    direction: 'in' | 'out';
+    direction: "in" | "out";
     remoteIp: string;
     bytesUp: number;
     bytesDown: number;
@@ -407,28 +613,28 @@ function sortRemoteRows(
   sortBy?: RemoteSortKey,
   sortOrder?: SortOrder,
 ) {
-  const key = sortBy ?? 'bytesTotal';
+  const key = sortBy ?? "bytesTotal";
   const order = normalizeSortOrder(sortOrder);
 
   return [...rows].sort((left, right) => {
     let result = 0;
     switch (key) {
-      case 'remoteIp':
+      case "remoteIp":
         result = compareText(left.remoteIp, right.remoteIp);
         break;
-      case 'direction':
+      case "direction":
         result = compareText(left.direction, right.direction);
         break;
-      case 'bytesUp':
+      case "bytesUp":
         result = compareNumber(left.bytesUp, right.bytesUp);
         break;
-      case 'bytesDown':
+      case "bytesDown":
         result = compareNumber(left.bytesDown, right.bytesDown);
         break;
-      case 'flowCount':
+      case "flowCount":
         result = compareNumber(left.flowCount, right.flowCount);
         break;
-      case 'bytesTotal':
+      case "bytesTotal":
       default:
         result = compareNumber(left.totalBytes, right.totalBytes);
         break;
@@ -454,7 +660,11 @@ function paginate<T>(rows: T[], page = 1, pageSize = 50) {
 }
 
 function createFilteredUsage(query: UsageQuery) {
-  return sortUsageRows(filterUsage(query, USAGE_ROWS), query.sortBy, query.sortOrder);
+  return sortUsageRows(
+    filterUsage(query, USAGE_ROWS),
+    query.sortBy,
+    query.sortOrder,
+  );
 }
 
 function normalizeUsageRows(range: RangeKey, rows: UsageRow[]) {
@@ -463,7 +673,11 @@ function normalizeUsageRows(range: RangeKey, rows: UsageRow[]) {
 }
 
 function createFilteredForward(query: ForwardUsageQuery) {
-  return sortForwardRows(filterForward(query, FORWARD_ROWS), query.sortBy, query.sortOrder);
+  return sortForwardRows(
+    filterForward(query, FORWARD_ROWS),
+    query.sortBy,
+    query.sortOrder,
+  );
 }
 
 function createRelatedRowsForExplain(row: UsageRow) {
@@ -473,12 +687,20 @@ function createRelatedRowsForExplain(row: UsageRow) {
     if (row.pid != null && row.pid > 0) return candidate.pid === row.pid;
     if (row.comm) return candidate.comm === row.comm;
     if (row.exe) return candidate.exe === row.exe;
-    return candidate.direction === row.direction && candidate.remoteIp === row.remoteIp;
+    return (
+      candidate.direction === row.direction &&
+      candidate.remoteIp === row.remoteIp
+    );
   });
   if (byIdentity.length) {
     return byIdentity;
   }
-  return USAGE_ROWS.filter((candidate) => candidate.proto === row.proto && candidate.direction === row.direction && candidate.remoteIp === row.remoteIp);
+  return USAGE_ROWS.filter(
+    (candidate) =>
+      candidate.proto === row.proto &&
+      candidate.direction === row.direction &&
+      candidate.remoteIp === row.remoteIp,
+  );
 }
 
 function sortIpsByWeight(weights: Map<string, number>) {
@@ -491,37 +713,60 @@ function sortIpsByWeight(weights: Map<string, number>) {
     .slice(0, 6);
 }
 
-function inferExplainConfidence(payload: Omit<UsageExplain, 'confidence' | 'process'>): UsageExplain['confidence'] {
-  if (payload.nginxRequests.length) return 'high';
-  if (payload.chains.length) return 'high';
-  if (payload.sourceIps.length && payload.targetIps.length) return 'high';
-  if (payload.sourceIps.length || payload.targetIps.length) return 'medium';
-  return 'low';
+function inferExplainConfidence(
+  payload: Omit<UsageExplain, "confidence" | "process">,
+): UsageExplain["confidence"] {
+  if (payload.nginxRequests.length) return "high";
+  if (payload.chains.length) return "high";
+  if (payload.sourceIps.length && payload.targetIps.length) return "high";
+  if (payload.sourceIps.length || payload.targetIps.length) return "medium";
+  return "low";
 }
 
 function isShadowsocksRow(row: UsageRow) {
-  const text = `${row.comm ?? ''} ${row.exe ?? ''}`.toLowerCase();
-  return text.includes('ss-') || text.includes('shadowsocks');
+  const text = `${row.comm ?? ""} ${row.exe ?? ""}`.toLowerCase();
+  return text.includes("ss-") || text.includes("shadowsocks");
 }
 
 function isNginxRow(row: UsageRow) {
-  const text = `${row.comm ?? ''} ${row.exe ?? ''}`.toLowerCase();
-  return text.includes('nginx') || text.includes('openresty') || text.includes('apache') || text.includes('caddy');
+  const text = `${row.comm ?? ""} ${row.exe ?? ""}`.toLowerCase();
+  return (
+    text.includes("nginx") ||
+    text.includes("openresty") ||
+    text.includes("apache") ||
+    text.includes("caddy")
+  );
 }
 
 function buildMockUsageExplain(row: UsageRow): UsageExplain {
   const relatedRows = createRelatedRowsForExplain(row);
   const sourceWeights = new Map<string, number>();
   const targetWeights = new Map<string, number>();
-  const relatedPeersMap = new Map<string, { direction: UsageRow['direction']; remoteIp: string; remotePort: number | null; localPort: number | null; bytesTotal: number; flowCount: number }>();
+  const relatedPeersMap = new Map<
+    string,
+    {
+      direction: UsageRow["direction"];
+      remoteIp: string;
+      remotePort: number | null;
+      localPort: number | null;
+      bytesTotal: number;
+      flowCount: number;
+    }
+  >();
 
   for (const related of relatedRows) {
     if (!related.remoteIp) continue;
     const bytesTotal = related.bytesUp + related.bytesDown;
-    if (related.direction === 'in') {
-      sourceWeights.set(related.remoteIp, (sourceWeights.get(related.remoteIp) ?? 0) + bytesTotal);
+    if (related.direction === "in") {
+      sourceWeights.set(
+        related.remoteIp,
+        (sourceWeights.get(related.remoteIp) ?? 0) + bytesTotal,
+      );
     } else {
-      targetWeights.set(related.remoteIp, (targetWeights.get(related.remoteIp) ?? 0) + bytesTotal);
+      targetWeights.set(
+        related.remoteIp,
+        (targetWeights.get(related.remoteIp) ?? 0) + bytesTotal,
+      );
     }
     const key = `${related.direction}:${related.remoteIp}:${related.localPort ?? 0}:${related.remotePort ?? 0}`;
     const current = relatedPeersMap.get(key) ?? {
@@ -538,31 +783,36 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
   }
 
   const nginxRequests =
-    isNginxRow(row) && row.direction === 'in' && row.remoteIp
+    isNginxRow(row) && row.direction === "in" && row.remoteIp
       ? [
           {
             time: row.minuteTs + 12,
-            method: 'GET',
-            host: 'example.com',
-            path: '/traffic/usage',
+            method: "GET",
+            host: "example.com",
+            path: "/traffic/usage",
             status: 200,
             count: 3,
-            referer: 'https://example.com/sitemap.xml',
-            userAgent: 'Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)',
-            bot: 'GPTBot',
+            referer: "https://example.com/sitemap.xml",
+            userAgent:
+              "Mozilla/5.0 (compatible; GPTBot/1.3; +https://openai.com/gptbot)",
+            bot: "GPTBot",
           },
         ]
       : [];
 
   const notes: string[] = [];
   if (isShadowsocksRow(row)) {
-    notes.push('Shadowsocks 只能做同进程同时间窗关联，无法保证来源 IP 与目标 IP 一一对应。');
+    notes.push(
+      "Shadowsocks 只能做同进程同时间窗关联，无法保证来源 IP 与目标 IP 一一对应。",
+    );
   }
   if (isNginxRow(row)) {
-    notes.push('网页路径依赖 access.log 关联，conntrack 本身无法直接给出 URI。');
+    notes.push(
+      "网页路径依赖 access.log 关联，conntrack 本身无法直接给出 URI。",
+    );
   }
   if (!sourceWeights.size && !targetWeights.size) {
-    notes.push('未找到可用的关联流量样本。');
+    notes.push("未找到可用的关联流量样本。");
   }
 
   const sourceIps = sortIpsByWeight(sourceWeights);
@@ -573,14 +823,16 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
           {
             sourceIp: sourceIps[0] ?? null,
             targetIp: targetIps[0] ?? null,
-            targetHost: row.remotePort === 443 ? 'api.example.test' : null,
+            targetHost: row.remotePort === 443 ? "api.example.test" : null,
             targetPort: row.remotePort ?? null,
             localPort: row.localPort ?? null,
             bytesTotal: row.bytesUp + row.bytesDown,
             flowCount: row.flowCount,
             evidenceCount: Math.max(1, row.flowCount),
-            evidence: 'ss-log',
-            confidence: (targetIps.length && sourceIps.length ? 'high' : 'medium') as UsageExplain['confidence'],
+            evidence: "ss-log",
+            confidence: (targetIps.length && sourceIps.length
+              ? "high"
+              : "medium") as UsageExplain["confidence"],
           },
         ]
       : [];
@@ -591,7 +843,8 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
     chains,
     relatedPeers: [...relatedPeersMap.values()]
       .sort((left, right) => {
-        if (left.bytesTotal === right.bytesTotal) return right.flowCount - left.flowCount;
+        if (left.bytesTotal === right.bytesTotal)
+          return right.flowCount - left.flowCount;
         return right.bytesTotal - left.bytesTotal;
       })
       .slice(0, 8),
@@ -600,7 +853,11 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
   };
 
   return {
-    process: row.comm ? (row.exe ? `${row.comm} (${row.exe})` : row.comm) : 'unknown',
+    process: row.comm
+      ? row.exe
+        ? `${row.comm} (${row.exe})`
+        : row.comm
+      : "unknown",
     confidence: inferExplainConfidence(basePayload),
     ...basePayload,
   };
@@ -608,12 +865,19 @@ function buildMockUsageExplain(row: UsageRow): UsageExplain {
 
 function processSummaries(
   range: RangeKey,
-  query?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean },
+  query?: {
+    page?: number;
+    pageSize?: number;
+    sortBy?: ProcessSortKey;
+    sortOrder?: SortOrder;
+    groupBy?: ProcessGroupBy;
+    includeTotal?: boolean;
+  },
 ): ProcessSummaryResponse {
   void range;
-  const effectiveGroupBy: ProcessGroupBy = query?.groupBy ?? 'pid';
+  const effectiveGroupBy: ProcessGroupBy = query?.groupBy ?? "pid";
 
-  const baseRows: ProcessSummaryResponse['rows'] = PROCESSES.map((process) => ({
+  const baseRows: ProcessSummaryResponse["rows"] = PROCESSES.map((process) => ({
     pid: process.pid,
     comm: process.comm,
     exe: process.exe,
@@ -623,50 +887,77 @@ function processSummaries(
     totalBytes: process.totalBytes,
   }));
 
-  const groupedRows = effectiveGroupBy === 'comm'
-    ? (() => {
-        const map = new Map<string, (typeof baseRows)[number]>();
-        for (const row of baseRows) {
-          const key = row.comm ?? '未知';
-          const existing = map.get(key);
-          if (!existing) {
-            map.set(key, { ...row, pid: null, exe: null });
-            continue;
+  const groupedRows =
+    effectiveGroupBy === "comm"
+      ? (() => {
+          const map = new Map<string, (typeof baseRows)[number]>();
+          for (const row of baseRows) {
+            const key = row.comm ?? "未知";
+            const existing = map.get(key);
+            if (!existing) {
+              map.set(key, { ...row, pid: null, exe: null });
+              continue;
+            }
+            existing.bytesUp += row.bytesUp;
+            existing.bytesDown += row.bytesDown;
+            existing.flowCount += row.flowCount;
+            existing.totalBytes += row.totalBytes;
           }
-          existing.bytesUp += row.bytesUp;
-          existing.bytesDown += row.bytesDown;
-          existing.flowCount += row.flowCount;
-          existing.totalBytes += row.totalBytes;
-        }
-        return [...map.values()];
-      })()
-    : baseRows;
+          return [...map.values()];
+        })()
+      : baseRows;
 
-  const sortedRows = sortProcessRows(groupedRows, query?.sortBy, query?.sortOrder, effectiveGroupBy === 'pid');
+  const sortedRows = sortProcessRows(
+    groupedRows,
+    query?.sortBy,
+    query?.sortOrder,
+    effectiveGroupBy === "pid",
+  );
   const page = paginate(sortedRows, query?.page ?? 1, query?.pageSize ?? 25);
+  const hasMore = page.page * page.pageSize < page.totalRows;
+  const lowerBoundTotal =
+    (page.page - 1) * page.pageSize + page.rows.length + (hasMore ? 1 : 0);
   return {
-    dataSource: 'usage_1m',
+    dataSource: "usage_1m",
     rows: page.rows,
     page: page.page,
     pageSize: page.pageSize,
-    totalRows: page.totalRows,
-    hasMore: page.page * page.pageSize < page.totalRows,
-    totalRowsExact: true,
+    totalRows: query?.includeTotal ? page.totalRows : lowerBoundTotal,
+    hasMore,
+    totalRowsExact: Boolean(query?.includeTotal),
   };
 }
 
 function remoteSummaries(
   range: RangeKey,
-  options?: { page?: number; pageSize?: number; direction?: 'in' | 'out'; includeLoopback?: boolean; sortBy?: RemoteSortKey; sortOrder?: SortOrder; includeTotal?: boolean },
+  options?: {
+    page?: number;
+    pageSize?: number;
+    direction?: "in" | "out";
+    includeLoopback?: boolean;
+    sortBy?: RemoteSortKey;
+    sortOrder?: SortOrder;
+    includeTotal?: boolean;
+  },
 ): RemoteSummaryResponse {
-  const grouped = new Map<string, { direction: 'in' | 'out'; remoteIp: string; bytesUp: number; bytesDown: number; flowCount: number }>();
+  const grouped = new Map<
+    string,
+    {
+      direction: "in" | "out";
+      remoteIp: string;
+      bytesUp: number;
+      bytesDown: number;
+      flowCount: number;
+    }
+  >();
   for (const row of createFilteredUsage({ range })) {
     if (options?.direction && row.direction !== options.direction) continue;
-    if (options?.includeLoopback === false && isLoopbackIp(row.remoteIp)) continue;
+    if (options?.includeLoopback === false && isLoopbackIp(row.remoteIp))
+      continue;
     const key = `${row.direction}:${row.remoteIp}`;
     const current = grouped.get(key) ?? {
       direction: row.direction,
-      remoteIp: row.remoteIp ?? 'unknown',
+      remoteIp: row.remoteIp ?? "unknown",
       bytesUp: 0,
       bytesDown: 0,
       flowCount: 0,
@@ -676,25 +967,45 @@ function remoteSummaries(
     current.flowCount += row.flowCount;
     grouped.set(key, current);
   }
-  const rows = [...grouped.values()].map((row) => ({ ...row, totalBytes: row.bytesUp + row.bytesDown }));
+  const rows = [...grouped.values()].map((row) => ({
+    ...row,
+    totalBytes: row.bytesUp + row.bytesDown,
+  }));
   const sortedRows = sortRemoteRows(rows, options?.sortBy, options?.sortOrder);
-  const page = paginate(sortedRows, options?.page ?? 1, options?.pageSize ?? 25);
+  const page = paginate(
+    sortedRows,
+    options?.page ?? 1,
+    options?.pageSize ?? 25,
+  );
+  const hasMore = page.page * page.pageSize < page.totalRows;
+  const lowerBoundTotal =
+    (page.page - 1) * page.pageSize + page.rows.length + (hasMore ? 1 : 0);
   return {
-    dataSource: 'usage_1m',
+    dataSource: "usage_1m",
     rows: page.rows,
     page: page.page,
     pageSize: page.pageSize,
-    totalRows: page.totalRows,
-    hasMore: page.page * page.pageSize < page.totalRows,
-    totalRowsExact: true,
+    totalRows: options?.includeTotal ? page.totalRows : lowerBoundTotal,
+    hasMore,
+    totalRowsExact: Boolean(options?.includeTotal),
   };
 }
 
-function topRowsFromUsage(rows: UsageRow[], accessor: (row: UsageRow) => string | number | null) {
-  const grouped = new Map<string, { label: string; bytesUp: number; bytesDown: number }>();
+function topRowsFromUsage(
+  rows: UsageRow[],
+  accessor: (row: UsageRow) => string | number | null,
+) {
+  const grouped = new Map<
+    string,
+    { label: string; bytesUp: number; bytesDown: number }
+  >();
   for (const row of rows) {
-    const key = String(accessor(row) ?? 'unknown');
-    const current = grouped.get(key) ?? { label: key, bytesUp: 0, bytesDown: 0 };
+    const key = String(accessor(row) ?? "unknown");
+    const current = grouped.get(key) ?? {
+      label: key,
+      bytesUp: 0,
+      bytesDown: 0,
+    };
     current.bytesUp += row.bytesUp;
     current.bytesDown += row.bytesDown;
     grouped.set(key, current);
@@ -717,20 +1028,32 @@ export function createMockApiClient(): TrafficApiClient {
     async getMonthlyUsage() {
       return { rows: MONTHLY_ROWS };
     },
-    async getTimeSeries(range, groupBy = 'direction', filters?: TimeSeriesFilters) {
-      const basePoints = aggregateSeries(range, RANGE_TO_BUCKET[range]).map((point, index) => {
-        const filterModifier = filters?.comm ? 1.18 : filters?.remoteIp ? 1.08 : 1;
-        const modifier = (groupBy === 'comm' ? 1.4 : groupBy === 'remote_ip' ? 1.1 : 1) * filterModifier;
-        return {
-          ...point,
-          up: Math.round(point.up * modifier + (index % 3) * 110_000),
-          down: Math.round(point.down * modifier + (index % 4) * 160_000),
-          flowCount: Math.max(1, Math.round(point.flowCount * modifier)),
-        };
-      });
+    async getTimeSeries(
+      range,
+      groupBy = "direction",
+      filters?: TimeSeriesFilters,
+    ) {
+      const basePoints = aggregateSeries(range, RANGE_TO_BUCKET[range]).map(
+        (point, index) => {
+          const filterModifier = filters?.comm
+            ? 1.18
+            : filters?.remoteIp
+              ? 1.08
+              : 1;
+          const modifier =
+            (groupBy === "comm" ? 1.4 : groupBy === "remote_ip" ? 1.1 : 1) *
+            filterModifier;
+          return {
+            ...point,
+            up: Math.round(point.up * modifier + (index % 3) * 110_000),
+            down: Math.round(point.down * modifier + (index % 4) * 160_000),
+            flowCount: Math.max(1, Math.round(point.flowCount * modifier)),
+          };
+        },
+      );
       const groups = buildGroupedSeries(basePoints, groupBy);
       return {
-        dataSource: 'usage_1m',
+        dataSource: "usage_1m",
         bucket: RANGE_TO_BUCKET[range],
         groupBy,
         points: basePoints,
@@ -738,18 +1061,22 @@ export function createMockApiClient(): TrafficApiClient {
       };
     },
     async getNetworkTimeSeries(range) {
-      const points = aggregateSeries(range, RANGE_TO_BUCKET[range]).map((point, index) => ({
-        ...point,
-        up: Math.round(point.up * 0.86 + (index % 3) * 70_000),
-        down: Math.round(point.down * 0.92 + (index % 4) * 95_000),
-        flowCount: 0,
-      }));
+      const points = aggregateSeries(range, RANGE_TO_BUCKET[range]).map(
+        (point, index) => ({
+          ...point,
+          up: Math.round(point.up * 0.86 + (index % 3) * 70_000),
+          down: Math.round(point.down * 0.92 + (index % 4) * 95_000),
+          flowCount: 0,
+        }),
+      );
       const dataSource =
-        range === 'this_month' || range === 'last_month' || range === 'two_months_ago'
-          ? 'interface_1d'
-          : range === '7d'
-            ? 'interface_1h'
-            : 'interface_1m';
+        range === "this_month" ||
+        range === "last_month" ||
+        range === "two_months_ago"
+          ? "interface_1d"
+          : range === "7d"
+            ? "interface_1h"
+            : "interface_1m";
       return {
         dataSource,
         bucket: RANGE_TO_BUCKET[range],
@@ -757,7 +1084,7 @@ export function createMockApiClient(): TrafficApiClient {
       };
     },
     async getUsage(query) {
-      const range = query.range ?? '24h';
+      const range = query.range ?? "24h";
       const rows = normalizeUsageRows(range, createFilteredUsage(query));
       const safePage = Math.max(query.page ?? 1, 1);
       const safePageSize = Math.min(Math.max(1, query.pageSize ?? 25), 200);
@@ -765,12 +1092,16 @@ export function createMockApiClient(): TrafficApiClient {
       const windowRows = rows.slice(offset, offset + safePageSize + 1);
       const hasMore = windowRows.length > safePageSize;
       return {
-        dataSource: 'usage_1m',
+        dataSource: "usage_1m",
         rows: windowRows.slice(0, safePageSize),
         nextCursor: null,
         page: safePage,
         pageSize: safePageSize,
-        totalRows: query.includeTotal ? rows.length : offset + Math.min(windowRows.length, safePageSize) + (hasMore ? 1 : 0),
+        totalRows: query.includeTotal
+          ? rows.length
+          : offset +
+            Math.min(windowRows.length, safePageSize) +
+            (hasMore ? 1 : 0),
         hasMore,
         totalRowsExact: Boolean(query.includeTotal),
       };
@@ -786,27 +1117,35 @@ export function createMockApiClient(): TrafficApiClient {
     },
     async getTopPorts(range) {
       return {
-        dataSource: 'usage_1m',
-        rows: topRowsFromUsage(createFilteredUsage({ range }), (row) => row.localPort ?? 'unknown').slice(0, 5),
+        dataSource: "usage_1m",
+        rows: topRowsFromUsage(
+          createFilteredUsage({ range }),
+          (row) => row.localPort ?? "unknown",
+        ).slice(0, 5),
       };
     },
     async getProcesses() {
       return {
-        processes: PROCESSES.map(({ totalBytes: _totalBytes, ...process }) => process),
+        processes: PROCESSES.map(
+          ({ totalBytes: _totalBytes, ...process }) => process,
+        ),
       };
     },
     async getForwardUsage(query) {
       const rows = createFilteredForward(query);
       const page = paginate(rows, query.page ?? 1, query.pageSize ?? 25);
+      const hasMore = page.page * page.pageSize < page.totalRows;
+      const lowerBoundTotal =
+        (page.page - 1) * page.pageSize + page.rows.length + (hasMore ? 1 : 0);
       return {
-        dataSource: 'usage_1m_forward',
+        dataSource: "usage_1m_forward",
         rows: page.rows,
         nextCursor: null,
         page: page.page,
         pageSize: page.pageSize,
-        totalRows: page.totalRows,
-        hasMore: page.page * page.pageSize < page.totalRows,
-        totalRowsExact: true,
+        totalRows: query.includeTotal ? page.totalRows : lowerBoundTotal,
+        hasMore,
+        totalRowsExact: Boolean(query.includeTotal),
       };
     },
   };

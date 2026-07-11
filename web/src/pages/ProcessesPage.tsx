@@ -1,30 +1,38 @@
-import { useEffect, useMemo, useState } from 'react';
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { createColumnHelper, type SortingState } from '@tanstack/react-table';
-import { ChartPanel } from '../components/ChartPanel';
-import { DataSourceBadge } from '../components/DataSourceBadge';
-import { DataTable } from '../components/DataTable';
-import { EmptyState } from '../components/EmptyState';
-import { QueryErrorState } from '../components/QueryErrorState';
-import { RangeSelect } from '../components/RangeSelect';
-import { useApiClient } from '../api-context';
-import { normalizeProcessSortKey } from '../sort-keys';
-import type { ProcessSummaryRow } from '../types';
-import { useRangeSearchParam } from '../useRangeSearchParam';
-import { useResettingPage } from '../useResettingPage';
-import { formatBytes, minuteDimensionsUnavailable, rangeLabel, safeText } from '../utils';
+import { useEffect, useMemo, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { createColumnHelper, type SortingState } from "@tanstack/react-table";
+import { ChartPanel } from "../components/ChartPanel";
+import { DataSourceBadge } from "../components/DataSourceBadge";
+import { DataTable } from "../components/DataTable";
+import { EmptyState } from "../components/EmptyState";
+import { QueryErrorState } from "../components/QueryErrorState";
+import { RangeSelect } from "../components/RangeSelect";
+import { RefreshControl } from "../components/RefreshControl";
+import { useApiClient } from "../api-context";
+import { latestSuccessfulUpdate, liveQueryOptions } from "../query-refresh";
+import { normalizeProcessSortKey } from "../sort-keys";
+import type { ProcessSummaryRow } from "../types";
+import { useRangeSearchParam } from "../useRangeSearchParam";
+import { useResettingPage } from "../useResettingPage";
+import { useExactTotal } from "../useExactTotal";
+import {
+  formatBytes,
+  minuteDimensionsUnavailable,
+  rangeLabel,
+  safeText,
+} from "../utils";
 
 const pageSize = 25;
 const columnHelper = createColumnHelper<ProcessSummaryRow>();
 
-type ProcessTableSection = 'pid' | 'comm';
+type ProcessTableSection = "pid" | "comm";
 type SelectedProcessState = {
   section: ProcessTableSection;
   key: string;
 };
 
-function processRowKey(row: Pick<ProcessSummaryRow, 'pid' | 'comm' | 'exe'>) {
-  return `${row.pid ?? 'none'}-${row.comm ?? ''}-${row.exe ?? ''}`;
+function processRowKey(row: Pick<ProcessSummaryRow, "pid" | "comm" | "exe">) {
+  return `${row.pid ?? "none"}-${row.comm ?? ""}-${row.exe ?? ""}`;
 }
 
 function buildProcessSeriesFilters(row: ProcessSummaryRow | null) {
@@ -48,7 +56,11 @@ function buildProcessSeriesFilters(row: ProcessSummaryRow | null) {
   return Object.keys(filters).length ? filters : undefined;
 }
 
-function findSelectedRow(rows: ProcessSummaryRow[], selected: SelectedProcessState | null, section: ProcessTableSection) {
+function findSelectedRow(
+  rows: ProcessSummaryRow[],
+  selected: SelectedProcessState | null,
+  section: ProcessTableSection,
+) {
   if (!selected || selected.section !== section) {
     return null;
   }
@@ -58,133 +70,209 @@ function findSelectedRow(rows: ProcessSummaryRow[], selected: SelectedProcessSta
 export function ProcessesPage() {
   const api = useApiClient();
   const { range, setRange } = useRangeSearchParam();
-  const [pidSorting, setPidSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
-  const [commSorting, setCommSorting] = useState<SortingState>([{ id: 'totalBytes', desc: true }]);
+  const [pidSorting, setPidSorting] = useState<SortingState>([
+    { id: "totalBytes", desc: true },
+  ]);
+  const [commSorting, setCommSorting] = useState<SortingState>([
+    { id: "totalBytes", desc: true },
+  ]);
   const [selected, setSelected] = useState<SelectedProcessState | null>(null);
 
   const currentPIDSort = pidSorting[0];
   const currentCommSort = commSorting[0];
-  const pidResetKey = JSON.stringify([range, currentPIDSort?.id ?? null, currentPIDSort?.desc ?? null]);
-  const commResetKey = JSON.stringify([range, currentCommSort?.id ?? null, currentCommSort?.desc ?? null]);
+  const pidResetKey = JSON.stringify([
+    range,
+    currentPIDSort?.id ?? null,
+    currentPIDSort?.desc ?? null,
+  ]);
+  const commResetKey = JSON.stringify([
+    range,
+    currentCommSort?.id ?? null,
+    currentCommSort?.desc ?? null,
+  ]);
   const [pidPage, setPidPage] = useResettingPage(pidResetKey);
   const [commPage, setCommPage] = useResettingPage(commResetKey);
+  const pidTotal = useExactTotal(pidResetKey);
+  const commTotal = useExactTotal(commResetKey);
 
   const pidQuery = useQuery({
-    queryKey: ['process-summaries', range, 'pid', pidPage, currentPIDSort?.id, currentPIDSort?.desc],
+    queryKey: [
+      "process-summaries",
+      range,
+      "pid",
+      pidPage,
+      currentPIDSort?.id,
+      currentPIDSort?.desc,
+      pidTotal.includeTotal,
+    ],
     queryFn: ({ signal }) =>
-      api.getTopProcesses(range, {
-        page: pidPage,
-        pageSize,
-        groupBy: 'pid',
-        sortBy: normalizeProcessSortKey(currentPIDSort?.id),
-        sortOrder: currentPIDSort?.desc ? 'desc' : 'asc',
-        includeTotal: true,
-      }, { signal }),
+      api.getTopProcesses(
+        range,
+        {
+          page: pidPage,
+          pageSize,
+          groupBy: "pid",
+          sortBy: normalizeProcessSortKey(currentPIDSort?.id),
+          sortOrder: currentPIDSort?.desc ? "desc" : "asc",
+          includeTotal: pidTotal.includeTotal,
+        },
+        { signal },
+      ),
     placeholderData: keepPreviousData,
+    ...liveQueryOptions,
   });
 
   const commQuery = useQuery({
-    queryKey: ['process-summaries', range, 'comm', commPage, currentCommSort?.id, currentCommSort?.desc],
+    queryKey: [
+      "process-summaries",
+      range,
+      "comm",
+      commPage,
+      currentCommSort?.id,
+      currentCommSort?.desc,
+      commTotal.includeTotal,
+    ],
     queryFn: ({ signal }) =>
-      api.getTopProcesses(range, {
-        page: commPage,
-        pageSize,
-        groupBy: 'comm',
-        sortBy: normalizeProcessSortKey(currentCommSort?.id),
-        sortOrder: currentCommSort?.desc ? 'desc' : 'asc',
-        includeTotal: true,
-      }, { signal }),
+      api.getTopProcesses(
+        range,
+        {
+          page: commPage,
+          pageSize,
+          groupBy: "comm",
+          sortBy: normalizeProcessSortKey(currentCommSort?.id),
+          sortOrder: currentCommSort?.desc ? "desc" : "asc",
+          includeTotal: commTotal.includeTotal,
+        },
+        { signal },
+      ),
     placeholderData: keepPreviousData,
+    ...liveQueryOptions,
   });
 
-  const activeDataSource = pidQuery.data?.dataSource ?? commQuery.data?.dataSource;
+  const pidData = pidQuery.isPlaceholderData ? undefined : pidQuery.data;
+  const commData = commQuery.isPlaceholderData ? undefined : commQuery.data;
+  const activeDataSource = pidData?.dataSource ?? commData?.dataSource;
   const pidDimensionUnavailable =
-    minuteDimensionsUnavailable(pidQuery.data?.dataSource ?? null) ||
-    minuteDimensionsUnavailable(commQuery.data?.dataSource ?? null);
+    minuteDimensionsUnavailable(pidData?.dataSource ?? null) ||
+    minuteDimensionsUnavailable(commData?.dataSource ?? null);
 
-  const pidRows = pidDimensionUnavailable ? [] : (pidQuery.data?.rows ?? []);
-  const commRows = commQuery.data?.rows ?? [];
+  const pidRows = pidDimensionUnavailable ? [] : (pidData?.rows ?? []);
+  const commRows = commData?.rows ?? [];
 
-  const selectedPIDRow = useMemo(() => findSelectedRow(pidRows, selected, 'pid'), [pidRows, selected]);
-  const selectedCommRow = useMemo(() => findSelectedRow(commRows, selected, 'comm'), [commRows, selected]);
+  const selectedPIDRow = useMemo(
+    () => findSelectedRow(pidRows, selected, "pid"),
+    [pidRows, selected],
+  );
+  const selectedCommRow = useMemo(
+    () => findSelectedRow(commRows, selected, "comm"),
+    [commRows, selected],
+  );
   const selectedProcess = selectedPIDRow ?? selectedCommRow;
 
   useEffect(() => {
+    if (pidQuery.isPlaceholderData || commQuery.isPlaceholderData) {
+      return;
+    }
     if (selectedPIDRow || selectedCommRow) {
       return;
     }
-    if (selected?.section === 'comm' && commRows.length) {
-      setSelected({ section: 'comm', key: processRowKey(commRows[0]) });
+    if (selected?.section === "comm" && commRows.length) {
+      setSelected({ section: "comm", key: processRowKey(commRows[0]) });
       return;
     }
-    if (selected?.section === 'pid' && pidRows.length) {
-      setSelected({ section: 'pid', key: processRowKey(pidRows[0]) });
+    if (selected?.section === "pid" && pidRows.length) {
+      setSelected({ section: "pid", key: processRowKey(pidRows[0]) });
       return;
     }
     if (!selected && pidRows.length) {
-      setSelected({ section: 'pid', key: processRowKey(pidRows[0]) });
+      setSelected({ section: "pid", key: processRowKey(pidRows[0]) });
       return;
     }
     if (!selected && commRows.length) {
-      setSelected({ section: 'comm', key: processRowKey(commRows[0]) });
+      setSelected({ section: "comm", key: processRowKey(commRows[0]) });
       return;
     }
     if (commRows.length) {
-      setSelected({ section: 'comm', key: processRowKey(commRows[0]) });
+      setSelected({ section: "comm", key: processRowKey(commRows[0]) });
       return;
     }
     if (pidRows.length) {
-      setSelected({ section: 'pid', key: processRowKey(pidRows[0]) });
+      setSelected({ section: "pid", key: processRowKey(pidRows[0]) });
       return;
     }
     setSelected(null);
-  }, [commRows, pidRows, selected, selectedCommRow, selectedPIDRow]);
+  }, [
+    commQuery.isPlaceholderData,
+    commRows,
+    pidQuery.isPlaceholderData,
+    pidRows,
+    selected,
+    selectedCommRow,
+    selectedPIDRow,
+  ]);
 
-  const selectedSeriesFilters = useMemo(() => buildProcessSeriesFilters(selectedProcess), [selectedProcess]);
+  const selectedSeriesFilters = useMemo(
+    () => buildProcessSeriesFilters(selectedProcess),
+    [selectedProcess],
+  );
   const canQuerySeries = Boolean(selectedSeriesFilters);
 
   const series = useQuery({
-    queryKey: ['process-series', range, selected?.section ?? null, selectedProcess ? processRowKey(selectedProcess) : null],
+    queryKey: [
+      "process-series",
+      range,
+      selected?.section ?? null,
+      selectedProcess ? processRowKey(selectedProcess) : null,
+    ],
     queryFn: ({ signal }) => {
       if (!selectedSeriesFilters) {
-        throw new Error('missing process series filters');
+        throw new Error("missing process series filters");
       }
-      return api.getTimeSeries(range, 'direction', selectedSeriesFilters, { signal });
+      return api.getTimeSeries(range, "direction", selectedSeriesFilters, {
+        signal,
+      });
     },
     enabled: canQuerySeries,
+    ...liveQueryOptions,
   });
+  const activeCoverage =
+    pidData?.coverage ?? commData?.coverage ?? series.data?.coverage;
 
   const pidColumns = useMemo(
     () => [
-      columnHelper.accessor('comm', {
-        id: 'comm',
-        header: '进程',
-        meta: { className: 'col-process', nowrap: true },
+      columnHelper.accessor("comm", {
+        id: "comm",
+        header: "进程",
+        meta: { className: "col-process", nowrap: true },
         cell: (info) => safeText(info.getValue()),
       }),
-      columnHelper.accessor('pid', {
-        id: 'pid',
-        header: 'PID',
+      columnHelper.accessor("pid", {
+        id: "pid",
+        header: "PID",
         enableSorting: true,
-        meta: { className: 'col-pid', nowrap: true },
-        cell: (info) => info.getValue() ?? '未知',
+        meta: { className: "col-pid", nowrap: true },
+        cell: (info) => info.getValue() ?? "未知",
       }),
-      columnHelper.accessor('bytesUp', {
-        id: 'bytesUp',
-        header: '上行',
-        meta: { className: 'col-bytes', align: 'right', nowrap: true },
+      columnHelper.accessor("bytesUp", {
+        id: "bytesUp",
+        header: "上行",
+        meta: { className: "col-bytes", align: "right", nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
-      columnHelper.accessor('bytesDown', {
-        id: 'bytesDown',
-        header: '下行',
-        meta: { className: 'col-bytes', align: 'right', nowrap: true },
+      columnHelper.accessor("bytesDown", {
+        id: "bytesDown",
+        header: "下行",
+        meta: { className: "col-bytes", align: "right", nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
-      columnHelper.accessor('totalBytes', {
-        id: 'totalBytes',
-        header: '总流量',
-        meta: { className: 'col-bytes col-bytes-total', align: 'right', nowrap: true },
+      columnHelper.accessor("totalBytes", {
+        id: "totalBytes",
+        header: "总流量",
+        meta: {
+          className: "col-bytes col-bytes-total",
+          align: "right",
+          nowrap: true,
+        },
         cell: (info) => formatBytes(info.getValue()),
       }),
     ],
@@ -193,28 +281,32 @@ export function ProcessesPage() {
 
   const commColumns = useMemo(
     () => [
-      columnHelper.accessor('comm', {
-        id: 'comm',
-        header: '进程',
-        meta: { className: 'col-process', nowrap: true },
+      columnHelper.accessor("comm", {
+        id: "comm",
+        header: "进程",
+        meta: { className: "col-process", nowrap: true },
         cell: (info) => safeText(info.getValue()),
       }),
-      columnHelper.accessor('bytesUp', {
-        id: 'bytesUp',
-        header: '上行',
-        meta: { className: 'col-bytes', align: 'right', nowrap: true },
+      columnHelper.accessor("bytesUp", {
+        id: "bytesUp",
+        header: "上行",
+        meta: { className: "col-bytes", align: "right", nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
-      columnHelper.accessor('bytesDown', {
-        id: 'bytesDown',
-        header: '下行',
-        meta: { className: 'col-bytes', align: 'right', nowrap: true },
+      columnHelper.accessor("bytesDown", {
+        id: "bytesDown",
+        header: "下行",
+        meta: { className: "col-bytes", align: "right", nowrap: true },
         cell: (info) => formatBytes(info.getValue()),
       }),
-      columnHelper.accessor('totalBytes', {
-        id: 'totalBytes',
-        header: '总流量',
-        meta: { className: 'col-bytes col-bytes-total', align: 'right', nowrap: true },
+      columnHelper.accessor("totalBytes", {
+        id: "totalBytes",
+        header: "总流量",
+        meta: {
+          className: "col-bytes col-bytes-total",
+          align: "right",
+          nowrap: true,
+        },
         cell: (info) => formatBytes(info.getValue()),
       }),
     ],
@@ -222,9 +314,7 @@ export function ProcessesPage() {
   );
 
   const initialLoading =
-    !commQuery.data &&
-    commQuery.isPending &&
-    (!pidQuery.data || pidQuery.isPending);
+    !commData && commQuery.isPending && (!pidData || pidQuery.isPending);
 
   const initialError =
     !commRows.length &&
@@ -238,35 +328,76 @@ export function ProcessesPage() {
           <p className="eyebrow">Processes</p>
           <h2>进程聚合</h2>
           <p>
-            该页面用于回答“是谁在消耗带宽”：上方先看按 PID 聚合，定位到具体进程实例；下方再看按进程名聚合，
-            用于观察同名进程合并后的总体占比。点击任意行会在下方展示对应趋势。
+            该页面用于回答“是谁在消耗带宽”：上方先看按 PID
+            聚合，定位到具体进程实例；下方再看按进程名聚合，
+            用于观察同名进程合并后的总体占比。点击任意进程行会在下方展示对应趋势。
           </p>
           <section className="status-row">
             <div className="status-pill">
               <strong>时间范围</strong>
               <span>{rangeLabel(range)}</span>
             </div>
-            {activeDataSource ? <DataSourceBadge dataSource={activeDataSource} /> : null}
+            {activeDataSource ? (
+              <DataSourceBadge
+                dataSource={activeDataSource}
+                coverage={activeCoverage}
+              />
+            ) : null}
           </section>
         </div>
-        <RangeSelect value={range} onChange={setRange} />
+        <div className="page-head-actions">
+          <RangeSelect value={range} onChange={setRange} />
+          <RefreshControl
+            updatedAt={latestSuccessfulUpdate(
+              pidQuery.dataUpdatedAt,
+              commQuery.dataUpdatedAt,
+              canQuerySeries ? series.dataUpdatedAt : undefined,
+            )}
+            isFetching={
+              pidQuery.isFetching || commQuery.isFetching || series.isFetching
+            }
+            onRefresh={() =>
+              Promise.all([
+                pidQuery.refetch(),
+                commQuery.refetch(),
+                ...(canQuerySeries ? [series.refetch()] : []),
+              ])
+            }
+          />
+        </div>
       </header>
 
       {initialError ? (
-        <QueryErrorState error={commQuery.error ?? pidQuery.error} title="进程聚合加载失败" />
+        <QueryErrorState
+          error={commQuery.error ?? pidQuery.error}
+          title="进程聚合加载失败"
+          onRetry={() => Promise.all([pidQuery.refetch(), commQuery.refetch()])}
+          retrying={pidQuery.isFetching || commQuery.isFetching}
+        />
       ) : initialLoading ? (
-        <EmptyState title="进程聚合加载中" description="正在获取当前时间范围内的进程聚合结果。" />
+        <EmptyState
+          title="进程聚合加载中"
+          description="正在获取当前时间范围内的进程聚合结果。"
+        />
       ) : (
         <section className="processes-sections">
           <section className="processes-section">
             <div className="processes-section-head">
               <div>
                 <h3>按 PID 聚合</h3>
-                <p>区分同名进程的不同实例，更适合排查到底是哪个 PID 在消耗带宽。</p>
+                <p>
+                  区分同名进程的不同实例，更适合排查到底是哪个 PID 在消耗带宽。
+                </p>
               </div>
             </div>
             {pidQuery.isError && pidRows.length ? (
-              <QueryErrorState error={pidQuery.error} title="按 PID 聚合刷新失败，当前展示旧结果" compact />
+              <QueryErrorState
+                error={pidQuery.error}
+                title="按 PID 聚合刷新失败，当前展示上次成功结果"
+                compact
+                onRetry={pidQuery.refetch}
+                retrying={pidQuery.isFetching}
+              />
             ) : null}
             {pidDimensionUnavailable ? (
               <EmptyState
@@ -274,9 +405,18 @@ export function ProcessesPage() {
                 description="当前时间范围已回退到小时聚合历史；这里不再展示 PID 粒度，只保留下方的按进程名聚合结果。"
               />
             ) : pidQuery.isError && !pidRows.length ? (
-              <QueryErrorState error={pidQuery.error} title="按 PID 聚合加载失败" />
-            ) : pidQuery.isPending && !pidQuery.data ? (
-              <EmptyState title="按 PID 聚合加载中" description="正在获取进程实例级别的聚合结果。" />
+              <QueryErrorState
+                error={pidQuery.error}
+                title="按 PID 聚合加载失败"
+                onRetry={pidQuery.refetch}
+                retrying={pidQuery.isFetching}
+              />
+            ) : pidQuery.isPlaceholderData ||
+              (pidQuery.isPending && !pidData) ? (
+              <EmptyState
+                title="按 PID 聚合加载中"
+                description="正在获取进程实例级别的聚合结果。"
+              />
             ) : pidRows.length ? (
               <DataTable
                 columns={pidColumns}
@@ -286,20 +426,32 @@ export function ProcessesPage() {
                 sorting={pidSorting}
                 onSortingChange={setPidSorting}
                 manualSorting
-                onRowClick={(row) => setSelected({ section: 'pid', key: processRowKey(row) })}
-                isRowSelected={(row) => selected?.section === 'pid' && selected.key === processRowKey(row)}
+                busy={pidQuery.isFetching}
+                onRowClick={(row) =>
+                  setSelected({ section: "pid", key: processRowKey(row) })
+                }
+                rowActionLabel={() => "查看趋势"}
+                isRowSelected={(row) =>
+                  selected?.section === "pid" &&
+                  selected.key === processRowKey(row)
+                }
                 pagination={{
-                  page: pidQuery.data?.page ?? 1,
-                  pageSize: pidQuery.data?.pageSize ?? pageSize,
-                  totalRows: pidQuery.data?.totalRows ?? 0,
-                  hasMore: pidQuery.data?.hasMore,
-                  totalRowsExact: pidQuery.data?.totalRowsExact,
+                  page: pidData?.page ?? 1,
+                  pageSize: pidData?.pageSize ?? pageSize,
+                  totalRows: pidData?.totalRows ?? 0,
+                  hasMore: pidData?.hasMore,
+                  totalRowsExact: pidData?.totalRowsExact,
                   onPageChange: setPidPage,
+                  onRequestExactTotal: pidTotal.requestExactTotal,
+                  exactTotalBusy: pidQuery.isFetching && pidTotal.includeTotal,
                 }}
                 emptyText="当前时间范围没有按 PID 聚合结果。"
               />
             ) : (
-              <EmptyState title="暂无按 PID 聚合结果" description="当前时间范围没有可以展示的进程实例流量。" />
+              <EmptyState
+                title="暂无按 PID 聚合结果"
+                description="当前时间范围没有可以展示的进程实例流量。"
+              />
             )}
           </section>
 
@@ -307,16 +459,34 @@ export function ProcessesPage() {
             <div className="processes-section-head">
               <div>
                 <h3>按进程名聚合</h3>
-                <p>把同名 PID 合并后看整体流量占比，适合快速判断某类服务的总消耗。</p>
+                <p>
+                  把同名 PID
+                  合并后看整体流量占比，适合快速判断某类服务的总消耗。
+                </p>
               </div>
             </div>
             {commQuery.isError && commRows.length ? (
-              <QueryErrorState error={commQuery.error} title="按进程名聚合刷新失败，当前展示旧结果" compact />
+              <QueryErrorState
+                error={commQuery.error}
+                title="按进程名聚合刷新失败，当前展示上次成功结果"
+                compact
+                onRetry={commQuery.refetch}
+                retrying={commQuery.isFetching}
+              />
             ) : null}
             {commQuery.isError && !commRows.length ? (
-              <QueryErrorState error={commQuery.error} title="按进程名聚合加载失败" />
-            ) : commQuery.isPending && !commQuery.data ? (
-              <EmptyState title="按进程名聚合加载中" description="正在获取进程名级别的聚合结果。" />
+              <QueryErrorState
+                error={commQuery.error}
+                title="按进程名聚合加载失败"
+                onRetry={commQuery.refetch}
+                retrying={commQuery.isFetching}
+              />
+            ) : commQuery.isPlaceholderData ||
+              (commQuery.isPending && !commData) ? (
+              <EmptyState
+                title="按进程名聚合加载中"
+                description="正在获取进程名级别的聚合结果。"
+              />
             ) : commRows.length ? (
               <DataTable
                 columns={commColumns}
@@ -326,29 +496,50 @@ export function ProcessesPage() {
                 sorting={commSorting}
                 onSortingChange={setCommSorting}
                 manualSorting
-                onRowClick={(row) => setSelected({ section: 'comm', key: processRowKey(row) })}
-                isRowSelected={(row) => selected?.section === 'comm' && selected.key === processRowKey(row)}
+                busy={commQuery.isFetching}
+                onRowClick={(row) =>
+                  setSelected({ section: "comm", key: processRowKey(row) })
+                }
+                rowActionLabel={() => "查看趋势"}
+                isRowSelected={(row) =>
+                  selected?.section === "comm" &&
+                  selected.key === processRowKey(row)
+                }
                 pagination={{
-                  page: commQuery.data?.page ?? 1,
-                  pageSize: commQuery.data?.pageSize ?? pageSize,
-                  totalRows: commQuery.data?.totalRows ?? 0,
-                  hasMore: commQuery.data?.hasMore,
-                  totalRowsExact: commQuery.data?.totalRowsExact,
+                  page: commData?.page ?? 1,
+                  pageSize: commData?.pageSize ?? pageSize,
+                  totalRows: commData?.totalRows ?? 0,
+                  hasMore: commData?.hasMore,
+                  totalRowsExact: commData?.totalRowsExact,
                   onPageChange: setCommPage,
+                  onRequestExactTotal: commTotal.requestExactTotal,
+                  exactTotalBusy:
+                    commQuery.isFetching && commTotal.includeTotal,
                 }}
                 emptyText="当前时间范围没有按进程名聚合结果。"
               />
             ) : (
-              <EmptyState title="暂无按进程名聚合结果" description="当前时间范围没有可以展示的进程名流量。" />
+              <EmptyState
+                title="暂无按进程名聚合结果"
+                description="当前时间范围没有可以展示的进程名流量。"
+              />
             )}
           </section>
         </section>
       )}
 
       {selectedProcess && !canQuerySeries ? (
-        <EmptyState title="无法绘制趋势" description="这条记录缺少稳定进程标识，无法定位到单个进程趋势。" />
+        <EmptyState
+          title="无法绘制趋势"
+          description="这条记录缺少稳定进程标识，无法定位到单个进程趋势。"
+        />
       ) : selectedProcess && series.isError ? (
-        <QueryErrorState error={series.error} title="进程趋势加载失败" />
+        <QueryErrorState
+          error={series.error}
+          title="进程趋势加载失败"
+          onRetry={series.refetch}
+          retrying={series.isFetching}
+        />
       ) : selectedProcess && series.data ? (
         <ChartPanel
           points={series.data.points}
@@ -357,15 +548,19 @@ export function ProcessesPage() {
           range={range}
           title={`流量趋势 · ${safeText(selectedProcess.comm)}`}
           subtitle={
-            selected?.section === 'pid'
-              ? `按 PID 聚合 · PID ${selectedProcess.pid ?? '未知'} · 入站 / 出站总量`
+            selected?.section === "pid"
+              ? `按 PID 聚合 · PID ${selectedProcess.pid ?? "未知"} · 入站 / 出站总量`
               : minuteDimensionsUnavailable(activeDataSource ?? null)
-                ? '当前窗口已降级为按进程名聚合 · 入站 / 出站总量'
-                : '按进程名聚合 · 入站 / 出站总量'
+                ? "当前窗口已降级为按进程名聚合 · 入站 / 出站总量"
+                : "按进程名聚合 · 入站 / 出站总量"
           }
+          busy={series.isFetching}
         />
       ) : selectedProcess && canQuerySeries ? (
-        <EmptyState title="趋势加载中" description="正在获取该进程的时间趋势。" />
+        <EmptyState
+          title="趋势加载中"
+          description="正在获取该进程的时间趋势。"
+        />
       ) : null}
     </div>
   );

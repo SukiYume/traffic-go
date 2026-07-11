@@ -127,6 +127,7 @@ ON CONFLICT(chain_id) DO UPDATE SET
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.invalidateMonthlyCache()
 	return nil
 }
 

@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { App } from "../App";
+import { App, RouteErrorBoundary } from "../App";
 import { ApiError } from "../api";
 import { ApiProvider } from "../api-context";
 import { createMockApiClient } from "../data/mock";
@@ -27,7 +27,12 @@ function renderWithProviders(
   return render(
     <QueryClientProvider client={queryClient}>
       <ApiProvider client={client}>
-        <MemoryRouter initialEntries={[path]}>{element}</MemoryRouter>
+        <MemoryRouter
+          initialEntries={[path]}
+          future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
+        >
+          {element}
+        </MemoryRouter>
       </ApiProvider>
     </QueryClientProvider>,
   );
@@ -36,6 +41,28 @@ function renderWithProviders(
 function pendingPromise<T>() {
   return new Promise<T>(() => {});
 }
+
+it("shows a refresh fallback when a lazy route fails", () => {
+  const consoleError = vi
+    .spyOn(console, "error")
+    .mockImplementation(() => undefined);
+  const suppressWindowError = (event: ErrorEvent) => event.preventDefault();
+  window.addEventListener("error", suppressWindowError);
+  function BrokenRoute(): ReactNode {
+    throw new Error("missing route chunk");
+  }
+
+  render(
+    <RouteErrorBoundary>
+      <BrokenRoute />
+    </RouteErrorBoundary>,
+  );
+
+  expect(screen.getByRole("alert")).toHaveTextContent("页面资源加载失败");
+  expect(screen.getByRole("button", { name: "刷新页面" })).toBeInTheDocument();
+  window.removeEventListener("error", suppressWindowError);
+  consoleError.mockRestore();
+});
 
 function expectStatValue(label: string, value: string) {
   const labelElement = screen.getByText(label);
@@ -46,7 +73,9 @@ function expectStatValue(label: string, value: string) {
   expect(within(card).getByText(value)).toBeInTheDocument();
 }
 
-function createAggregatedClient(dataSource: Extract<DataSource, "usage_1h" | "usage_1d">): TrafficApiClient {
+function createAggregatedClient(
+  dataSource: Extract<DataSource, "usage_1h" | "usage_1d">,
+): TrafficApiClient {
   const base = createMockApiClient();
   return {
     ...base,
@@ -65,7 +94,11 @@ function createAggregatedClient(dataSource: Extract<DataSource, "usage_1h" | "us
       };
     },
     async getTopProcesses(range, options, requestOptions) {
-      const response = await base.getTopProcesses(range, options, requestOptions);
+      const response = await base.getTopProcesses(
+        range,
+        options,
+        requestOptions,
+      );
       return {
         ...response,
         dataSource,
@@ -80,7 +113,10 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/", <DashboardPage />);
     expect(await screen.findByText("流量总览")).toBeInTheDocument();
     expect(await screen.findByText("网卡流量趋势")).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "网卡口径" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "网卡口径" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
     expect(await screen.findByText("总上行")).toBeInTheDocument();
     expect(await screen.findByText("Top 进程")).toBeInTheDocument();
   });
@@ -124,7 +160,8 @@ describe("traffic-go web ui", () => {
     await waitFor(() => expect(networkCalls).toBeGreaterThan(0));
     expect(directionCalls).toBe(0);
 
-    await user.click(screen.getByRole("tab", { name: "连接方向" }));
+    screen.getByRole("tab", { name: "网卡口径" }).focus();
+    await user.keyboard("{ArrowRight}");
 
     expect(await screen.findByText("连接方向趋势")).toBeInTheDocument();
     await waitFor(() => expect(directionCalls).toBeGreaterThan(0));
@@ -149,7 +186,13 @@ describe("traffic-go web ui", () => {
           dataSource: "interface_1m",
           bucket: "1m",
           points: [
-            { ts: 1710000000, up: 8192, down: 16384, flowCount: 0, label: "12:00" },
+            {
+              ts: 1710000000,
+              up: 8192,
+              down: 16384,
+              flowCount: 0,
+              label: "12:00",
+            },
           ],
         };
       },
@@ -189,11 +232,17 @@ describe("traffic-go web ui", () => {
 
   it("queries dashboard top processes by pid and shows pid/exe in minute windows", async () => {
     const base = createMockApiClient();
-    const topProcessCalls: Array<{ groupBy: ProcessGroupBy; summary: boolean }> = [];
+    const topProcessCalls: Array<{
+      groupBy: ProcessGroupBy;
+      summary: boolean;
+    }> = [];
     const client: TrafficApiClient = {
       ...base,
       async getTopProcesses(range, options, requestOptions) {
-        topProcessCalls.push({ groupBy: options?.groupBy ?? 'pid', summary: !!options?.summary });
+        topProcessCalls.push({
+          groupBy: options?.groupBy ?? "pid",
+          summary: !!options?.summary,
+        });
         return base.getTopProcesses(range, options, requestOptions);
       },
     };
@@ -203,14 +252,22 @@ describe("traffic-go web ui", () => {
     expect(await screen.findByText("PID 1088")).toBeInTheDocument();
     expect(await screen.findAllByText("ss-server")).not.toHaveLength(0);
     expect(screen.queryByText("未归因 / EXE 不可用")).not.toBeInTheDocument();
-    expect(topProcessCalls).toContainEqual({ groupBy: "pid", summary: true });
+    expect(topProcessCalls).toContainEqual({ groupBy: "pid", summary: false });
   });
 
   it("keeps dashboard top processes in comm fallback when the window is hourly", async () => {
-    renderWithProviders("/?range=last_month", <DashboardPage />, createAggregatedClient("usage_1h"));
+    renderWithProviders(
+      "/?range=last_month",
+      <DashboardPage />,
+      createAggregatedClient("usage_1h"),
+    );
 
-    expect((await screen.findAllByText("当前窗口已降级为按进程名聚合")).length).toBeGreaterThan(0);
-    expect(screen.getAllByText("小时聚合 / EXE 在此视图不展示").length).toBeGreaterThan(0);
+    expect(
+      (await screen.findAllByText("当前窗口已降级为按进程名聚合")).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("小时聚合 / EXE 在此视图不展示").length,
+    ).toBeGreaterThan(0);
   });
 
   it("keeps dashboard monthly ranges on the aggregated interface trend", async () => {
@@ -232,7 +289,10 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/?range=last_month", <DashboardPage />, client);
 
     expect(await screen.findByText("网卡流量趋势")).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "网卡口径" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "网卡口径" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
     expect(screen.getByText("interface_1d")).toBeInTheDocument();
     await waitFor(() => expect(networkCalls).toBeGreaterThan(0));
     expect(directionCalls).toBe(0);
@@ -295,7 +355,11 @@ describe("traffic-go web ui", () => {
   });
 
   it("hides minute-only columns when usage data comes from the hourly source", async () => {
-    renderWithProviders("/usage?range=last_month", <UsagePage />, createAggregatedClient("usage_1h"));
+    renderWithProviders(
+      "/usage?range=last_month",
+      <UsagePage />,
+      createAggregatedClient("usage_1h"),
+    );
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
     expect(
       screen.queryByRole("columnheader", { name: "PID" }),
@@ -309,11 +373,21 @@ describe("traffic-go web ui", () => {
   });
 
   it("hides minute-only columns when usage data comes from the daily source", async () => {
-    renderWithProviders("/usage?range=this_month", <UsagePage />, createAggregatedClient("usage_1d"));
+    renderWithProviders(
+      "/usage?range=this_month",
+      <UsagePage />,
+      createAggregatedClient("usage_1d"),
+    );
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
-    expect(screen.queryByRole("columnheader", { name: "PID" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("columnheader", { name: "EXE" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("columnheader", { name: "归因" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("columnheader", { name: "PID" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("columnheader", { name: "EXE" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("columnheader", { name: "归因" }),
+    ).not.toBeInTheDocument();
   });
 
   it("replays persisted chain analysis for hourly usage rows", async () => {
@@ -332,8 +406,9 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/usage?range=last_month", <UsagePage />, client);
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
-    const rows = await screen.findAllByRole("row");
-    await user.click(rows[1]);
+    await user.click(
+      (await screen.findAllByRole("row", { name: "展开详情" }))[0],
+    );
 
     expect(await screen.findByText("访问链路候选")).toBeInTheDocument();
     expect(
@@ -343,10 +418,16 @@ describe("traffic-go web ui", () => {
 
   it("uses the real hourly bucket span when rendering average rate", async () => {
     const user = userEvent.setup();
-    renderWithProviders("/usage?range=last_month", <UsagePage />, createAggregatedClient("usage_1h"));
+    renderWithProviders(
+      "/usage?range=last_month",
+      <UsagePage />,
+      createAggregatedClient("usage_1h"),
+    );
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
-    const remoteIp = await screen.findByRole("button", { name: "203.0.113.24" });
+    const remoteIp = await screen.findByRole("button", {
+      name: "203.0.113.24",
+    });
     const row = remoteIp.closest("tr");
     if (!row) {
       throw new Error("expected hourly usage row for 203.0.113.24");
@@ -354,8 +435,8 @@ describe("traffic-go web ui", () => {
     await user.click(row);
 
     expect(
-      await screen.findByText((_, element) =>
-        element?.textContent === "↑ 51.0 B/s · ↓ 344 B/s",
+      await screen.findByText(
+        (_, element) => element?.textContent === "↑ 51.0 B/s · ↓ 344 B/s",
       ),
     ).toBeInTheDocument();
   });
@@ -386,12 +467,13 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/usage?range=this_month", <UsagePage />, client);
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
-    const rows = await screen.findAllByRole("row");
-    await user.click(rows[1]);
+    await user.click(
+      (await screen.findAllByRole("row", { name: "展开详情" }))[0],
+    );
 
     expect(
-      await screen.findByText((_, element) =>
-        element?.textContent === "↑ 1.00 B/s · ↓ 2.00 B/s",
+      await screen.findByText(
+        (_, element) => element?.textContent === "↑ 1.00 B/s · ↓ 2.00 B/s",
       ),
     ).toBeInTheDocument();
   });
@@ -399,7 +481,8 @@ describe("traffic-go web ui", () => {
   it("offers an on-demand deep scan path from the usage explain panel", async () => {
     const user = userEvent.setup();
     const base = createMockApiClient();
-    const explainCalls: Array<{ dataSource?: string; allowScan?: boolean }> = [];
+    const explainCalls: Array<{ dataSource?: string; allowScan?: boolean }> =
+      [];
     const client: TrafficApiClient = {
       ...base,
       async getUsageExplain(row, options) {
@@ -411,12 +494,59 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/usage", <UsagePage />, client);
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
-    const rows = await screen.findAllByRole("row");
-    await user.click(rows[1]);
-    expect(await screen.findByRole("button", { name: "尝试深度扫描日志" })).toBeInTheDocument();
+    await user.click(
+      (await screen.findAllByRole("row", { name: "展开详情" }))[0],
+    );
+    expect(
+      await screen.findByRole("button", { name: "尝试深度扫描日志" }),
+    ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "尝试深度扫描日志" }));
 
     expect(explainCalls.some((call) => call.allowScan === true)).toBe(true);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "尝试深度扫描日志" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("automatically retries a busy deep scan after Retry-After", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    let scanCalls = 0;
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsageExplain(row, options, requestOptions) {
+        if (!options?.allowScan) {
+          return base.getUsageExplain(row, options, requestOptions);
+        }
+        scanCalls += 1;
+        if (scanCalls === 1) {
+          throw new ApiError(
+            429,
+            "scan_rate_limited",
+            "scan busy",
+            undefined,
+            0.001,
+          );
+        }
+        return base.getUsageExplain(row, options, requestOptions);
+      },
+    };
+
+    renderWithProviders("/usage", <UsagePage />, client);
+    await user.click(
+      (await screen.findAllByRole("row", { name: "展开详情" }))[0],
+    );
+    await user.click(
+      await screen.findByRole("button", { name: "尝试深度扫描日志" }),
+    );
+
+    await waitFor(() => expect(scanCalls).toBe(2));
+    expect(screen.queryByText(/深度扫描失败/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "尝试深度扫描日志" }),
+    ).not.toBeInTheDocument();
   });
 
   it("clears minute-only filters when the backend downgrades usage to hourly data", async () => {
@@ -459,19 +589,31 @@ describe("traffic-go web ui", () => {
   });
 
   it("shows usage request errors instead of an empty state", async () => {
+    const user = userEvent.setup();
     const base = createMockApiClient();
+    let usageCalls = 0;
     const client: TrafficApiClient = {
       ...base,
       async getUsage() {
-        throw new ApiError(500, "boom", "usage request failed");
+        usageCalls += 1;
+        throw new ApiError(
+          500,
+          "boom",
+          "usage request failed",
+          "req-visible-42",
+        );
       },
     };
 
     renderWithProviders("/usage", <UsagePage />, client);
 
     expect(await screen.findByText("明细加载失败")).toBeInTheDocument();
-    expect(screen.getByText("usage request failed")).toBeInTheDocument();
+    expect(screen.getByText(/usage request failed/)).toHaveTextContent(
+      "请求 ID：req-visible-42",
+    );
     expect(screen.queryByText("暂无明细")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(usageCalls).toBeGreaterThanOrEqual(2));
   });
 
   it("resets usage pagination before issuing filtered queries", async () => {
@@ -488,7 +630,7 @@ describe("traffic-go web ui", () => {
 
     renderWithProviders("/usage", <UsagePage />, client);
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
-    expect(usageCalls.every((call) => call.includeTotal === true)).toBe(true);
+    expect(usageCalls.every((call) => call.includeTotal === false)).toBe(true);
 
     await user.click(await screen.findByRole("button", { name: "下一页" }));
     await waitFor(() => {
@@ -502,6 +644,194 @@ describe("traffic-go web ui", () => {
       expect(usageCalls.length).toBeGreaterThan(0);
     });
     expect(usageCalls.every((call) => call.page === 1)).toBe(true);
+  });
+
+  it("requests an exact usage total only after explicit opt-in", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const usageCalls: Array<Record<string, unknown>> = [];
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        usageCalls.push({ ...query });
+        const response = await base.getUsage(query, requestOptions);
+        return query.includeTotal
+          ? response
+          : {
+              ...response,
+              hasMore: true,
+              totalRowsExact: false,
+              totalRows: response.rows.length + 1,
+            };
+      },
+    };
+
+    renderWithProviders("/usage", <UsagePage />, client);
+    const exactTotal = await screen.findByRole("button", {
+      name: "计算精确总数",
+    });
+    expect(usageCalls.some((call) => call.includeTotal === true)).toBe(false);
+
+    await user.click(exactTotal);
+    await waitFor(() =>
+      expect(usageCalls.some((call) => call.includeTotal === true)).toBe(true),
+    );
+  });
+
+  it("does not expose placeholder rows after changing the usage scope", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getUsage(query, requestOptions) {
+        if (query.range === "7d") {
+          return pendingPromise();
+        }
+        const response = await base.getUsage(query, requestOptions);
+        return {
+          ...response,
+          rows: response.rows
+            .slice(0, 1)
+            .map((row) => ({ ...row, remoteIp: "198.51.100.200" })),
+        };
+      },
+    };
+
+    renderWithProviders("/usage?range=24h", <UsagePage />, client);
+    expect(
+      await screen.findByRole("button", { name: "198.51.100.200" }),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "7 天" }));
+    expect(await screen.findByText("明细加载中")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "198.51.100.200" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("row", { name: "展开详情" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not present a previous dashboard ranking as the new range", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getTopProcesses(range, options, requestOptions) {
+        if (range === "7d") return pendingPromise();
+        const response = await base.getTopProcesses(
+          range,
+          options,
+          requestOptions,
+        );
+        return {
+          ...response,
+          rows: response.rows
+            .slice(0, 1)
+            .map((row) => ({ ...row, comm: "old-dashboard-process" })),
+        };
+      },
+    };
+
+    renderWithProviders("/?range=24h", <DashboardPage />, client);
+    expect(
+      await screen.findByText("old-dashboard-process"),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "7 天" }));
+    expect(await screen.findByText("Top 进程加载中")).toBeInTheDocument();
+    expect(screen.queryByText("old-dashboard-process")).not.toBeInTheDocument();
+  });
+
+  it("does not leave previous process rows actionable during a range change", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getTopProcesses(range, options, requestOptions) {
+        if (range === "7d") return pendingPromise();
+        const response = await base.getTopProcesses(
+          range,
+          options,
+          requestOptions,
+        );
+        return {
+          ...response,
+          rows: response.rows
+            .slice(0, 1)
+            .map((row) => ({ ...row, comm: "old-process-row" })),
+        };
+      },
+    };
+
+    renderWithProviders("/processes?range=24h", <ProcessesPage />, client);
+    expect(
+      (await screen.findAllByText("old-process-row")).length,
+    ).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("tab", { name: "7 天" }));
+    expect(await screen.findByText("按 PID 聚合加载中")).toBeInTheDocument();
+    expect(screen.queryByText("old-process-row")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("row", { name: "查看趋势" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not leave previous remote rows actionable during a range change", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getTopRemotes(range, options, requestOptions) {
+        if (range === "7d") return pendingPromise();
+        const response = await base.getTopRemotes(
+          range,
+          options,
+          requestOptions,
+        );
+        return {
+          ...response,
+          rows: response.rows
+            .slice(0, 1)
+            .map((row) => ({ ...row, remoteIp: "198.51.100.201" })),
+        };
+      },
+    };
+
+    renderWithProviders("/remotes?range=24h", <RemotesPage />, client);
+    expect(await screen.findByText("198.51.100.201")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "7 天" }));
+    expect(await screen.findByText("对端聚合加载中")).toBeInTheDocument();
+    expect(screen.queryByText("198.51.100.201")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("row", { name: "查看明细" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not present previous forward rows under new filters", async () => {
+    const user = userEvent.setup();
+    const base = createMockApiClient();
+    const client: TrafficApiClient = {
+      ...base,
+      async getForwardUsage(query, requestOptions) {
+        if (query.range === "7d") return pendingPromise();
+        const response = await base.getForwardUsage(query, requestOptions);
+        return {
+          ...response,
+          rows: response.rows
+            .slice(0, 1)
+            .map((row) => ({ ...row, origSrc: "198.51.100.202" })),
+        };
+      },
+    };
+
+    renderWithProviders("/forward?range=24h", <ForwardPage />, client);
+    expect(await screen.findByText("198.51.100.202")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "7 天" }));
+    expect(await screen.findByText("转发流量加载中")).toBeInTheDocument();
+    expect(screen.queryByText("198.51.100.202")).not.toBeInTheDocument();
   });
 
   it("defaults monthly usage windows to total traffic sorting", async () => {
@@ -588,7 +918,9 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/usage", <UsagePage />, client);
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
 
-    const protoHeader = await screen.findByRole("columnheader", { name: /协议/ });
+    const protoHeader = await screen.findByRole("columnheader", {
+      name: /协议/,
+    });
     await user.click(within(protoHeader).getByRole("button", { name: /协议/ }));
 
     await waitFor(() => {
@@ -596,27 +928,33 @@ describe("traffic-go web ui", () => {
     });
   });
 
-  it("mounts the app shell with navigation", () => {
+  it("mounts the app shell with navigation", async () => {
     renderWithProviders("/", <App />);
     expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Usage" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Forward" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "History" })).toBeInTheDocument();
+    expect(await screen.findByText("流量总览")).toBeInTheDocument();
   });
 
   it("keeps explicit usage windows in app metadata", async () => {
     renderWithProviders("/usage?start=1767225600&end=1769904000", <App />);
 
     await waitFor(() => {
-      expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute(
+      expect(
+        document.head.querySelector('link[rel="canonical"]'),
+      ).toHaveAttribute(
         "href",
         `${window.location.origin}/usage?start=1767225600&end=1769904000`,
       );
     });
-    expect(document.head.querySelector('meta[property="og:url"]')).toHaveAttribute(
+    expect(
+      document.head.querySelector('meta[property="og:url"]'),
+    ).toHaveAttribute(
       "content",
       `${window.location.origin}/usage?start=1767225600&end=1769904000`,
     );
+    expect(await screen.findByText("流量明细")).toBeInTheDocument();
   });
 
   it("shows monthly history and links retained months to detail", async () => {
@@ -625,10 +963,9 @@ describe("traffic-go web ui", () => {
     expect(await screen.findByText("月度归档")).toBeInTheDocument();
     expect(await screen.findByText("历史总流量")).toBeInTheDocument();
     expect(screen.getByText("已归档 · 仅汇总")).toBeInTheDocument();
-    expect(screen.getAllByRole("link", { name: "查看明细" })[0]).toHaveAttribute(
-      "href",
-      "/usage?range=this_month",
-    );
+    expect(
+      screen.getAllByRole("link", { name: "查看明细" })[0],
+    ).toHaveAttribute("href", "/usage?range=this_month");
     expect(screen.getByText("仅月度汇总")).toBeInTheDocument();
   });
 
@@ -682,18 +1019,29 @@ describe("traffic-go web ui", () => {
       },
     };
 
-    renderWithProviders("/usage?start=1767225600&end=1769904000", <UsagePage />, client);
+    renderWithProviders(
+      "/usage?start=1767225600&end=1769904000",
+      <UsagePage />,
+      client,
+    );
     expect(await screen.findByText("2026年1月 明细")).toBeInTheDocument();
 
     await user.type(screen.getByLabelText("对端 IP"), "198.51.100.44");
 
     await waitFor(() => {
-      expect(usageCalls.some((call) => call.remoteIp === "198.51.100.44")).toBe(true);
+      expect(usageCalls.some((call) => call.remoteIp === "198.51.100.44")).toBe(
+        true,
+      );
     });
     expect(
       usageCalls
         .filter((call) => call.remoteIp === "198.51.100.44")
-        .every((call) => call.start === 1767225600 && call.end === 1769904000 && call.range === undefined),
+        .every(
+          (call) =>
+            call.start === 1767225600 &&
+            call.end === 1769904000 &&
+            call.range === undefined,
+        ),
     ).toBe(true);
   });
 
@@ -702,10 +1050,10 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/usage", <UsagePage />);
     // Wait for table to load
     expect(await screen.findByText("流量明细")).toBeInTheDocument();
-    // Find the first data row (not header) and click it
-    const rows = await screen.findAllByRole("row");
-    // rows[0] = thead row, rows[1] = first data row
-    await user.click(rows[1]);
+    // Use the first row's explicit operation instead of making the whole row interactive.
+    await user.click(
+      (await screen.findAllByRole("row", { name: "展开详情" }))[0],
+    );
     // Expanded panel should show these labels
     // '对端端口' also appears as a column header, so use getAllByText
     expect(screen.getAllByText("对端端口").length).toBeGreaterThanOrEqual(2);
@@ -765,19 +1113,24 @@ describe("traffic-go web ui", () => {
     renderWithProviders("/usage", <UsagePage />, client);
     expect(await screen.findByText("本机回环")).toBeInTheDocument();
 
-    const rows = await screen.findAllByRole("row");
-    await user.click(rows[1]);
+    await user.click(
+      (await screen.findAllByRole("row", { name: "展开详情" }))[0],
+    );
 
     expect(await screen.findByText("回环链路候选")).toBeInTheDocument();
-    expect(screen.getByText("112.0.38.89 → 本机回环:18080")).toBeInTheDocument();
+    expect(
+      screen.getByText("112.0.38.89 → 本机回环:18080"),
+    ).toBeInTheDocument();
   });
 
   it("shows loopback remotes by default and can exclude them", async () => {
     const user = userEvent.setup();
     const base = createMockApiClient();
+    const summaryFlags: boolean[] = [];
     const client: TrafficApiClient = {
       ...base,
       async getTopRemotes(range, options) {
+        summaryFlags.push(!!options?.summary);
         return {
           dataSource: "usage_1m",
           page: 1,
@@ -799,6 +1152,7 @@ describe("traffic-go web ui", () => {
 
     renderWithProviders("/remotes", <RemotesPage />, client);
     expect(await screen.findByText("127.0.0.1")).toBeInTheDocument();
+    expect(summaryFlags).toContain(false);
 
     await user.click(screen.getByRole("button", { name: "排除本机回环" }));
     expect(await screen.findByText("203.0.113.24")).toBeInTheDocument();
@@ -809,31 +1163,52 @@ describe("traffic-go web ui", () => {
     expect(await screen.findByText("进程聚合")).toBeInTheDocument();
     expect(await screen.findByText("按 PID 聚合")).toBeInTheDocument();
     expect(await screen.findByText("按进程名聚合")).toBeInTheDocument();
-    expect(screen.queryByRole("columnheader", { name: "EXE" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("columnheader", { name: "EXE" }),
+    ).not.toBeInTheDocument();
   });
 
-  it("requests both PID and process-name summaries for natural month process windows", async () => {
+  it("requests both process groupings and lets the server select retained granularity", async () => {
     const base = createMockApiClient();
-    const processCalls: ProcessGroupBy[] = [];
+    const processCalls: Array<{ groupBy: ProcessGroupBy; summary: boolean }> =
+      [];
     const client: TrafficApiClient = {
       ...base,
       async getTopProcesses(range, options) {
-        processCalls.push(options?.groupBy ?? 'pid');
+        processCalls.push({
+          groupBy: options?.groupBy ?? "pid",
+          summary: !!options?.summary,
+        });
         return base.getTopProcesses(range, options);
       },
     };
 
-    renderWithProviders("/processes?range=last_month", <ProcessesPage />, client);
+    renderWithProviders(
+      "/processes?range=last_month",
+      <ProcessesPage />,
+      client,
+    );
     expect(await screen.findByText("进程聚合")).toBeInTheDocument();
     expect((await screen.findAllByText("ss-server")).length).toBeGreaterThan(0);
     await waitFor(() => {
-      expect(processCalls).toEqual(expect.arrayContaining(["pid", "comm"]));
+      expect(processCalls).toEqual(
+        expect.arrayContaining([
+          { groupBy: "pid", summary: false },
+          { groupBy: "comm", summary: false },
+        ]),
+      );
     });
   });
 
   it("hides PID process rows when natural month windows use daily aggregates", async () => {
-    renderWithProviders("/processes?range=this_month", <ProcessesPage />, createAggregatedClient("usage_1d"));
-    expect(await screen.findByText("当前窗口不提供 PID 维度")).toBeInTheDocument();
+    renderWithProviders(
+      "/processes?range=this_month",
+      <ProcessesPage />,
+      createAggregatedClient("usage_1d"),
+    );
+    expect(
+      await screen.findByText("当前窗口不提供 PID 维度"),
+    ).toBeInTheDocument();
     expect(screen.getByText("usage_1d")).toBeInTheDocument();
   });
 
@@ -842,7 +1217,9 @@ describe("traffic-go web ui", () => {
     expect(await screen.findByText("进程聚合")).toBeInTheDocument();
     expect(await screen.findByText("流量趋势 · ss-server")).toBeInTheDocument();
     expect(container.querySelectorAll("tr.selected")).toHaveLength(1);
-    expect(container.querySelector("tr.selected")).toHaveTextContent("ss-server");
+    expect(container.querySelector("tr.selected")).toHaveTextContent(
+      "ss-server",
+    );
   });
 
   it("keeps comm-table selection inside the comm table when the selected row disappears after pagination", async () => {
@@ -854,8 +1231,28 @@ describe("traffic-go web ui", () => {
         if (options?.groupBy === "comm") {
           const rows =
             options.page === 2
-              ? [{ pid: null, comm: "comm-b", exe: null, bytesUp: 30, bytesDown: 70, flowCount: 2, totalBytes: 100 }]
-              : [{ pid: null, comm: "comm-a", exe: null, bytesUp: 50, bytesDown: 150, flowCount: 3, totalBytes: 200 }];
+              ? [
+                  {
+                    pid: null,
+                    comm: "comm-b",
+                    exe: null,
+                    bytesUp: 30,
+                    bytesDown: 70,
+                    flowCount: 2,
+                    totalBytes: 100,
+                  },
+                ]
+              : [
+                  {
+                    pid: null,
+                    comm: "comm-a",
+                    exe: null,
+                    bytesUp: 50,
+                    bytesDown: 150,
+                    flowCount: 3,
+                    totalBytes: 200,
+                  },
+                ];
           return {
             dataSource: "usage_1m",
             page: options?.page ?? 1,
@@ -870,7 +1267,17 @@ describe("traffic-go web ui", () => {
           page: 1,
           pageSize: 1,
           totalRows: 1,
-          rows: [{ pid: 11, comm: "pid-one", exe: "/usr/bin/pid-one", bytesUp: 120, bytesDown: 240, flowCount: 4, totalBytes: 360 }],
+          rows: [
+            {
+              pid: 11,
+              comm: "pid-one",
+              exe: "/usr/bin/pid-one",
+              bytesUp: 120,
+              bytesDown: 240,
+              flowCount: 4,
+              totalBytes: 360,
+            },
+          ],
         };
       },
       async getTimeSeries(_range, groupBy = "direction") {
@@ -878,16 +1285,50 @@ describe("traffic-go web ui", () => {
           dataSource: "usage_1m",
           bucket: "5m",
           groupBy,
-          points: [{ ts: 1710000000, up: 40, down: 60, flowCount: 3, label: "03/09 16:00" }],
+          points: [
+            {
+              ts: 1710000000,
+              up: 40,
+              down: 60,
+              flowCount: 3,
+              label: "03/09 16:00",
+            },
+          ],
           groups: [
-            { key: "in", points: [{ ts: 1710000000, up: 10, down: 20, flowCount: 1, label: "03/09 16:00" }] },
-            { key: "out", points: [{ ts: 1710000000, up: 30, down: 40, flowCount: 2, label: "03/09 16:00" }] },
+            {
+              key: "in",
+              points: [
+                {
+                  ts: 1710000000,
+                  up: 10,
+                  down: 20,
+                  flowCount: 1,
+                  label: "03/09 16:00",
+                },
+              ],
+            },
+            {
+              key: "out",
+              points: [
+                {
+                  ts: 1710000000,
+                  up: 30,
+                  down: 40,
+                  flowCount: 2,
+                  label: "03/09 16:00",
+                },
+              ],
+            },
           ],
         };
       },
     };
 
-    const { container } = renderWithProviders("/processes", <ProcessesPage />, client);
+    const { container } = renderWithProviders(
+      "/processes",
+      <ProcessesPage />,
+      client,
+    );
     expect(await screen.findByText("流量趋势 · pid-one")).toBeInTheDocument();
 
     const commSection = screen.getByText("按进程名聚合").closest("section");
@@ -895,10 +1336,16 @@ describe("traffic-go web ui", () => {
       throw new Error("expected comm section");
     }
 
-    await user.click(within(commSection).getByText("comm-a"));
+    const commARow = within(commSection).getByText("comm-a").closest("tr");
+    if (!commARow) {
+      throw new Error("expected comm-a row");
+    }
+    await user.click(commARow);
     expect(await screen.findByText("流量趋势 · comm-a")).toBeInTheDocument();
 
-    await user.click(within(commSection).getByRole("button", { name: "下一页" }));
+    await user.click(
+      within(commSection).getByRole("button", { name: "下一页" }),
+    );
 
     expect(await screen.findByText("流量趋势 · comm-b")).toBeInTheDocument();
     expect(container.querySelectorAll("tr.selected")).toHaveLength(1);
@@ -909,7 +1356,10 @@ describe("traffic-go web ui", () => {
     const base = createMockApiClient();
     const pendingClient: TrafficApiClient = {
       ...base,
-      getTopProcesses: () => pendingPromise<Awaited<ReturnType<TrafficApiClient["getTopProcesses"]>>>(),
+      getTopProcesses: () =>
+        pendingPromise<
+          Awaited<ReturnType<TrafficApiClient["getTopProcesses"]>>
+        >(),
     };
 
     renderWithProviders("/processes", <ProcessesPage />, pendingClient);
@@ -920,7 +1370,10 @@ describe("traffic-go web ui", () => {
     const base = createMockApiClient();
     const pendingClient: TrafficApiClient = {
       ...base,
-      getTopRemotes: () => pendingPromise<Awaited<ReturnType<TrafficApiClient["getTopRemotes"]>>>(),
+      getTopRemotes: () =>
+        pendingPromise<
+          Awaited<ReturnType<TrafficApiClient["getTopRemotes"]>>
+        >(),
     };
 
     renderWithProviders("/remotes", <RemotesPage />, pendingClient);
@@ -931,7 +1384,10 @@ describe("traffic-go web ui", () => {
     const base = createMockApiClient();
     const pendingClient: TrafficApiClient = {
       ...base,
-      getForwardUsage: () => pendingPromise<Awaited<ReturnType<TrafficApiClient["getForwardUsage"]>>>(),
+      getForwardUsage: () =>
+        pendingPromise<
+          Awaited<ReturnType<TrafficApiClient["getForwardUsage"]>>
+        >(),
     };
 
     renderWithProviders("/forward", <ForwardPage />, pendingClient);
@@ -960,7 +1416,9 @@ describe("traffic-go web ui", () => {
     const totalSort = await screen.findByRole("button", { name: /总量/ });
     await user.click(totalSort);
     await waitFor(() => {
-      expect(forwardCalls.some((call) => call.sortBy === "bytesTotal")).toBe(true);
+      expect(forwardCalls.some((call) => call.sortBy === "bytesTotal")).toBe(
+        true,
+      );
     });
   });
 });

@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +17,12 @@ import (
 
 const (
 	backgroundPrefetchMaxEvidenceRows = 512
+	shadowsocksJournalMaxLines        = 4096
+	shadowsocksJournalMaxBytes        = 4 << 20
+	shadowsocksJournalMaxLineBytes    = 64 << 10
 )
+
+var errShadowsocksJournalTruncated = errors.New("shadowsocks journal output truncated")
 
 func defaultShadowsocksJournalReader(ctx context.Context, start time.Time, end time.Time) ([]string, error) {
 	if end.Before(start) {
@@ -23,31 +31,47 @@ func defaultShadowsocksJournalReader(ctx context.Context, start time.Time, end t
 
 	lines := make([]string, 0, 256)
 	seen := make(map[string]struct{}, 256)
+	totalBytes := 0
 	for _, comm := range shadowsocksFamilyLookupKeys() {
+		remainingLines := shadowsocksJournalMaxLines - len(lines)
+		if remainingLines <= 0 || totalBytes >= shadowsocksJournalMaxBytes {
+			return lines, errShadowsocksJournalTruncated
+		}
 		args := []string{
 			"--since", fmt.Sprintf("@%d", start.Unix()),
 			"--until", fmt.Sprintf("@%d", end.Unix()),
 			"-o", "short-iso",
 			"--no-pager",
 			"-q",
+			"-n", strconv.Itoa(remainingLines),
 			"_COMM=" + comm,
 		}
 		cmd := exec.CommandContext(ctx, "journalctl", args...)
-		output, err := cmd.Output()
+		stdout, err := cmd.StdoutPipe()
 		if err != nil {
+			return nil, fmt.Errorf("prepare shadowsocks journal for %s: %w", comm, err)
+		}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Start(); err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
 			if errors.Is(err, exec.ErrNotFound) {
 				return nil, nil
 			}
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) && strings.TrimSpace(string(exitErr.Stderr)) == "" {
-				continue
-			}
 			return nil, fmt.Errorf("read shadowsocks journal for %s: %w", comm, err)
 		}
-		for _, line := range strings.Split(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n") {
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 64*1024), shadowsocksJournalMaxLineBytes)
+		truncated := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			totalBytes += len(line) + 1
+			if totalBytes > shadowsocksJournalMaxBytes || len(lines) >= shadowsocksJournalMaxLines {
+				truncated = true
+				break
+			}
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "" {
 				continue
@@ -57,6 +81,24 @@ func defaultShadowsocksJournalReader(ctx context.Context, start time.Time, end t
 			}
 			seen[trimmed] = struct{}{}
 			lines = append(lines, trimmed)
+		}
+		scanErr := scanner.Err()
+		if truncated || scanErr != nil {
+			_ = cmd.Process.Kill()
+		}
+		waitErr := cmd.Wait()
+		if ctx.Err() != nil {
+			return lines, ctx.Err()
+		}
+		if truncated || scanErr != nil {
+			return lines, errShadowsocksJournalTruncated
+		}
+		if waitErr != nil {
+			var exitErr *exec.ExitError
+			if errors.As(waitErr, &exitErr) && strings.TrimSpace(stderr.String()) == "" {
+				continue
+			}
+			return nil, fmt.Errorf("read shadowsocks journal for %s: %w", comm, waitErr)
 		}
 	}
 	return lines, nil
@@ -71,6 +113,28 @@ func (s *Server) loadShadowsocksJournalEvidence(
 	matcher evidenceMatcher,
 	scanBudget time.Duration,
 ) ([]model.LogEvidence, string, error) {
+	return s.loadShadowsocksJournalEvidenceWithParser(
+		ctx,
+		startTS,
+		endTS,
+		referenceTS,
+		limit,
+		matcher,
+		scanBudget,
+		parseSSEvidenceLine,
+	)
+}
+
+func (s *Server) loadShadowsocksJournalEvidenceWithParser(
+	ctx context.Context,
+	startTS int64,
+	endTS int64,
+	referenceTS int64,
+	limit int,
+	matcher evidenceMatcher,
+	scanBudget time.Duration,
+	parser evidence.Parser,
+) ([]model.LogEvidence, string, error) {
 	if s == nil || s.store == nil || s.readShadowsocksJournal == nil || !s.enableSSJournalFallback {
 		return nil, "", nil
 	}
@@ -81,28 +145,41 @@ func (s *Server) loadShadowsocksJournalEvidence(
 		referenceTS = endTS
 	}
 
-	scanCtx, cancel := context.WithCancel(ctx)
+	scanParent := explainScanContext(ctx)
+	scanCtx, cancel := context.WithCancel(scanParent)
 	if scanBudget > 0 {
-		scanCtx, cancel = context.WithTimeout(ctx, scanBudget)
+		scanCtx, cancel = context.WithTimeout(scanParent, scanBudget)
 	}
 	defer cancel()
 
 	lines, err := s.readShadowsocksJournal(scanCtx, time.Unix(startTS, 0).UTC(), time.Unix(endTS, 0).UTC())
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			return nil, formatShadowsocksJournalTimeoutNote(scanBudget), nil
-		}
+	journalTruncated := errors.Is(err, errShadowsocksJournalTruncated)
+	journalTimedOut := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+	if err != nil && !journalTruncated && !journalTimedOut {
 		return nil, "", err
 	}
 	if len(lines) == 0 {
+		if journalTimedOut {
+			return nil, formatShadowsocksJournalTimeoutNote(scanBudget), nil
+		}
+		if journalTruncated {
+			return nil, "systemd journal 输出达到安全上限，将在下一轮继续尝试。", nil
+		}
 		return nil, "", nil
 	}
 
+	parseCtx := scanCtx
+	if journalTimedOut {
+		// The I/O budget may expire after journalctl has already produced useful
+		// lines. Parse only those captured lines under the request context so they
+		// can be persisted without granting journalctl a fresh scan budget.
+		parseCtx = ctx
+	}
 	rows, err := evidence.ScanLines(
-		scanCtx,
+		parseCtx,
 		evidenceSourceSS,
 		lines,
-		parseSSEvidenceLine,
+		parser,
 		matcher,
 		startTS,
 		endTS,
@@ -110,15 +187,36 @@ func (s *Server) loadShadowsocksJournalEvidence(
 		limit,
 	)
 	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		if len(rows) > 0 {
+			if persistErr := evidence.PersistLogEvidenceBatches(ctx, s.store, rows); persistErr != nil {
+				return nil, "", fmt.Errorf("persist partial shadowsocks journal evidence: %w", persistErr)
+			}
+		}
 		return evidence.SortAndTrim(rows, referenceTS, limit), formatShadowsocksJournalTimeoutNote(scanBudget), nil
 	}
 	if err != nil {
 		return nil, "", err
 	}
+	if journalTimedOut {
+		if len(rows) > 0 {
+			if persistErr := evidence.PersistLogEvidenceBatches(ctx, s.store, rows); persistErr != nil {
+				return nil, "", fmt.Errorf("persist timed-out shadowsocks journal evidence: %w", persistErr)
+			}
+		}
+		return evidence.SortAndTrim(rows, referenceTS, limit), formatShadowsocksJournalTimeoutNote(scanBudget), nil
+	}
+	if journalTruncated {
+		if len(rows) > 0 {
+			if persistErr := evidence.PersistLogEvidenceBatches(ctx, s.store, rows); persistErr != nil {
+				return nil, "", fmt.Errorf("persist truncated shadowsocks journal evidence: %w", persistErr)
+			}
+		}
+		return evidence.SortAndTrim(rows, referenceTS, limit), "systemd journal 输出达到安全上限，已保留部分候选。", nil
+	}
 	if len(rows) == 0 {
 		return nil, "", nil
 	}
-	if err := s.store.UpsertLogEvidenceBatch(ctx, rows); err != nil {
+	if err := evidence.PersistLogEvidenceBatches(ctx, s.store, rows); err != nil {
 		return nil, "", fmt.Errorf("persist shadowsocks journal evidence: %w", err)
 	}
 	return evidence.SortAndTrim(rows, referenceTS, limit), "", nil
@@ -138,6 +236,9 @@ func (s *Server) lookupShadowsocksJournalEvidence(ctx context.Context, bucketTS 
 		return nil, "", err
 	}
 	if len(strictRows) > 0 {
+		if strictNote != "" {
+			return strictRows, strictNote, nil
+		}
 		return strictRows, "已回退到 systemd journal 匹配实时 SS 日志。", nil
 	}
 
@@ -154,6 +255,9 @@ func (s *Server) lookupShadowsocksJournalEvidence(ctx context.Context, bucketTS 
 		return nil, "", err
 	}
 	if len(fallbackRows) > 0 {
+		if fallbackNote != "" {
+			return fallbackRows, fallbackNote, nil
+		}
 		return fallbackRows, "已回退到 systemd journal 的 ±15 分钟窗口匹配 SS 日志。", nil
 	}
 	if fallbackNote != "" {

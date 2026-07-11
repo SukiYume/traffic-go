@@ -17,7 +17,55 @@ import (
 type lruEntry[K comparable, V any] struct {
 	key       K
 	value     V
+	weight    int64
 	expiresAt time.Time
+}
+
+type cacheBudget struct {
+	mu   sync.Mutex
+	max  int64
+	used int64
+}
+
+func newCacheBudget(max int64) *cacheBudget {
+	if max < 0 {
+		max = 0
+	}
+	return &cacheBudget{max: max}
+}
+
+func (b *cacheBudget) reserve(weight int64) bool {
+	if b == nil || weight <= 0 {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.max == 0 || weight > b.max-b.used {
+		return false
+	}
+	b.used += weight
+	return true
+}
+
+func (b *cacheBudget) release(weight int64) {
+	if b == nil || weight <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.used -= weight
+	if b.used < 0 {
+		b.used = 0
+	}
+	b.mu.Unlock()
+}
+
+func (b *cacheBudget) usage() int64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.used
 }
 
 type lruCache[K comparable, V any] struct {
@@ -26,9 +74,15 @@ type lruCache[K comparable, V any] struct {
 	now      func() time.Time
 	items    map[K]*list.Element
 	order    *list.List
+	budget   *cacheBudget
+	weigh    func(V) int64
 }
 
 func newLRUCache[K comparable, V any](capacity int) *lruCache[K, V] {
+	return newWeightedLRUCache[K, V](capacity, nil, nil)
+}
+
+func newWeightedLRUCache[K comparable, V any](capacity int, budget *cacheBudget, weigh func(V) int64) *lruCache[K, V] {
 	if capacity < 0 {
 		capacity = 0
 	}
@@ -37,6 +91,8 @@ func newLRUCache[K comparable, V any](capacity int) *lruCache[K, V] {
 		now:      time.Now,
 		items:    make(map[K]*list.Element),
 		order:    list.New(),
+		budget:   budget,
+		weigh:    weigh,
 	}
 }
 
@@ -70,14 +126,25 @@ func (c *lruCache[K, V]) Set(key K, value V, ttl time.Duration) {
 	if ttl > 0 {
 		expiresAt = c.now().Add(ttl)
 	}
+	weight := int64(0)
+	if c.weigh != nil {
+		weight = c.weigh(value)
+		if weight < 0 {
+			weight = 0
+		}
+	}
 	if elem, ok := c.items[key]; ok {
-		entry := elem.Value.(*lruEntry[K, V])
-		entry.value = value
-		entry.expiresAt = expiresAt
-		c.order.MoveToFront(elem)
+		c.removeLocked(elem)
+	}
+	reserved := c.budget.reserve(weight)
+	for !reserved && c.order.Len() > 0 {
+		c.removeLocked(c.order.Back())
+		reserved = c.budget.reserve(weight)
+	}
+	if !reserved {
 		return
 	}
-	entry := &lruEntry[K, V]{key: key, value: value, expiresAt: expiresAt}
+	entry := &lruEntry[K, V]{key: key, value: value, weight: weight, expiresAt: expiresAt}
 	elem := c.order.PushFront(entry)
 	c.items[key] = elem
 	if c.order.Len() > c.capacity {
@@ -101,14 +168,24 @@ func (c *lruCache[K, V]) removeLocked(elem *list.Element) {
 	entry := elem.Value.(*lruEntry[K, V])
 	c.order.Remove(elem)
 	delete(c.items, entry.key)
+	c.budget.release(entry.weight)
 }
 
 // cachedTop holds the full grouped result for a top-N endpoint (processes or
 // remotes) keyed by query window. The handler sorts and pages this slice in
 // memory so different sort_by/page combinations all reuse one cache entry.
 type cachedTop[T any] struct {
-	rows   []T
-	source string
+	rows     []T
+	source   string
+	tooLarge bool
+	weight   int64
+}
+
+func cachedTopWeight[T any](entry cachedTop[T]) int64 {
+	if entry.weight < 64 {
+		return 64
+	}
+	return entry.weight
 }
 
 // loadCachedCount returns the cached integer for key, or runs load (deduped
@@ -167,26 +244,22 @@ func quantizeWindow(rangeKey string, startUnix int64, endUnix int64) (int64, int
 	case "last_month", "two_months_ago":
 		return startUnix, endUnix, true
 	}
-	gran := windowGranularitySeconds(rangeKey, endUnix-startUnix)
-	q := func(v int64) int64 { return (v / gran) * gran }
-	return q(startUnix), q(endUnix), false
+	// Persisted usage is minute-grained and summary queries already widen edges
+	// to complete minutes. Use those same effective bounds so dashboard switches
+	// within one minute reuse the identical result instead of rescanning the DB.
+	return floorCacheUnix(startUnix, 60), ceilCacheUnix(endUnix, 60), false
 }
 
-func windowGranularitySeconds(rangeKey string, duration int64) int64 {
-	switch rangeKey {
-	case "1h", "24h":
-		return 60
-	case "7d":
-		return 300
+func floorCacheUnix(value int64, unit int64) int64 {
+	return (value / unit) * unit
+}
+
+func ceilCacheUnix(value int64, unit int64) int64 {
+	floor := floorCacheUnix(value, unit)
+	if floor == value {
+		return value
 	}
-	switch {
-	case duration <= 3600:
-		return 60
-	case duration <= 7*24*3600:
-		return 300
-	default:
-		return 3600
-	}
+	return floor + unit
 }
 
 func usageFilterFingerprint(q model.UsageQuery) string {

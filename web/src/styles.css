@@ -3,8 +3,9 @@
   --font-sans:
     "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
     "Noto Sans CJK SC", sans-serif;
-  --font-display: "Segoe UI", "PingFang SC", "Hiragino Sans GB",
-    "Microsoft YaHei UI", "Noto Sans CJK SC", sans-serif;
+  --font-display:
+    "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
+    "Noto Sans CJK SC", sans-serif;
 
   --bg-color: #030712;
   --panel-bg: rgba(17, 24, 39, 0.45);
@@ -272,10 +273,39 @@ button {
   border-bottom: 1px solid var(--panel-border);
 }
 
-.page-head > .range-select {
+.page-head > .range-select,
+.page-head > .page-head-actions {
   margin-left: auto;
   flex: 0 0 auto;
   max-width: 100%;
+}
+
+.route-loading {
+  min-height: 40vh;
+  display: grid;
+  place-items: center;
+  color: var(--text-dim);
+}
+
+.page-head-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.refresh-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.refresh-control-interval {
+  color: var(--text-muted);
 }
 
 .hero-copy {
@@ -842,6 +872,19 @@ button {
   border-bottom-color: rgba(56, 189, 248, 0.2);
 }
 
+.table tbody tr.table-row-interactive {
+  cursor: pointer;
+}
+
+.table tbody tr.table-row-interactive:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.table tbody tr.table-row-interactive:focus-visible td {
+  background: rgba(56, 189, 248, 0.08);
+}
+
 .table th.align-right,
 .table td.align-right {
   text-align: right;
@@ -1350,6 +1393,11 @@ button {
   max-width: 400px;
 }
 
+.empty-state-action {
+  display: flex;
+  justify-content: center;
+}
+
 .empty-inline {
   padding: 32px 24px;
   text-align: center;
@@ -1376,6 +1424,11 @@ button {
 .query-error-banner span {
   font-size: 13px;
   color: #fde68a;
+}
+
+.query-error-banner .chip {
+  align-self: flex-start;
+  border: 1px solid rgba(253, 230, 138, 0.28);
 }
 
 .ip-link {
@@ -1725,8 +1778,18 @@ button {
     padding-bottom: 16px;
   }
 
-  .page-head > .range-select {
+  .page-head > .range-select,
+  .page-head > .page-head-actions {
     margin-left: 0;
+  }
+
+  .page-head-actions {
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .refresh-control {
+    justify-content: flex-start;
   }
 
   .brand-lockup {
@@ -1841,6 +1904,17 @@ button {
 
   .table-wrap {
     max-height: 62vh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }
 

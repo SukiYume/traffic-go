@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -80,6 +81,7 @@ type usageExplainResponse struct {
 type usageExplainOptions struct {
 	allowFileScan     bool
 	deferChainPersist bool
+	requestID         string
 }
 
 type usageExplainChain struct {
@@ -170,21 +172,94 @@ type evidenceParser = evidence.Parser
 
 type evidenceQueryHints = evidence.QueryHints
 
+type explainScanContextKey struct{}
+
+func withExplainScanContext(ctx context.Context, scanCtx context.Context) context.Context {
+	return context.WithValue(ctx, explainScanContextKey{}, scanCtx)
+}
+
+func explainScanContext(ctx context.Context) context.Context {
+	if scanCtx, ok := ctx.Value(explainScanContextKey{}).(context.Context); ok && scanCtx != nil {
+		return scanCtx
+	}
+	return ctx
+}
+
 func (s *Server) handleUsageExplain(w http.ResponseWriter, r *http.Request) {
+	allowFileScan, err := parseOptionalBool(r.URL.Query(), "scan")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_usage_explain_query", err)
+		return
+	}
+	if allowFileScan && r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, envelope{"error": "method_not_allowed", "message": "method not allowed"})
+		return
+	}
+	if r.Method == http.MethodPost && !sameOriginRequest(r) {
+		writeJSON(w, http.StatusForbidden, envelope{"error": "forbidden", "message": "cross-origin scan requests are not allowed"})
+		return
+	}
+	if r.Method == http.MethodPost && r.Body != nil {
+		body, readErr := io.ReadAll(io.LimitReader(r.Body, 2))
+		if readErr != nil || len(body) != 0 {
+			writeJSON(w, http.StatusRequestEntityTooLarge, envelope{"error": "request_body_not_allowed", "message": "usage explain requests must have an empty body"})
+			return
+		}
+	}
 	query, err := parseUsageExplainQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_usage_explain_query", err)
 		return
 	}
-
-	allowFileScan := r.URL.Query().Has("scan") && parseBoolFlag(r.URL.Query().Get("scan"))
-	data, err := s.analyzeUsageExplain(r.Context(), query, allowFileScan)
+	if allowFileScan {
+		release, ok := s.beginInteractiveScan()
+		if !ok {
+			w.Header().Set("Retry-After", "2")
+			writeJSON(w, http.StatusTooManyRequests, envelope{"error": "scan_rate_limited", "message": "a log scan is already running"})
+			return
+		}
+		defer release()
+	}
+	// Safe methods must remain strictly read-only. An explicit POST is the
+	// caller's write intent; background prefetch uses the options form below and
+	// persists its batch separately.
+	persistChains := r.Method == http.MethodPost
+	data, err := s.analyzeUsageExplainWithOptions(r.Context(), query, usageExplainOptions{
+		allowFileScan:     allowFileScan,
+		deferChainPersist: !persistChains,
+		requestID:         strings.TrimSpace(w.Header().Get("X-Request-ID")),
+	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		s.writeInternalError(w, r, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, envelope{"data": data})
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
+func (s *Server) beginInteractiveScan() (func(), bool) {
+	select {
+	case s.scanGate <- struct{}{}:
+		return func() { <-s.scanGate }, true
+	default:
+		return func() {}, false
+	}
 }
 
 func parseUsageExplainQuery(r *http.Request) (usageExplainQuery, error) {
@@ -207,11 +282,20 @@ func parseUsageExplainQuery(r *http.Request) (usageExplainQuery, error) {
 	if query.Proto != "" && query.Proto != "tcp" && query.Proto != "udp" {
 		return query, fmt.Errorf("proto must be tcp or udp")
 	}
+	if !oneOf(query.DataSource, "", store.DataSourceMinute, store.DataSourceHour, store.DataSourceDay) {
+		return query, fmt.Errorf("invalid data_source")
+	}
+	if len(query.Comm) > 128 || len(query.Exe) > 4096 {
+		return query, fmt.Errorf("process filter is too long")
+	}
+	if err := validateOptionalIP(query.RemoteIP, "remote_ip"); err != nil {
+		return query, err
+	}
 
 	if value := strings.TrimSpace(r.URL.Query().Get("pid")); value != "" {
 		pid, err := strconv.Atoi(value)
-		if err != nil {
-			return query, fmt.Errorf("invalid pid: %w", err)
+		if err != nil || pid < 0 || pid > int(^uint32(0)>>1) {
+			return query, fmt.Errorf("invalid pid")
 		}
 		query.PID = &pid
 	}
@@ -220,8 +304,8 @@ func parseUsageExplainQuery(r *http.Request) (usageExplainQuery, error) {
 		if err != nil {
 			return query, fmt.Errorf("invalid local_port: %w", err)
 		}
-		if port < 0 {
-			return query, fmt.Errorf("invalid local_port: must be non-negative")
+		if port < 0 || port > 65535 {
+			return query, fmt.Errorf("invalid local_port")
 		}
 		if port > 0 {
 			query.LocalPort = &port
@@ -232,8 +316,8 @@ func parseUsageExplainQuery(r *http.Request) (usageExplainQuery, error) {
 		if err != nil {
 			return query, fmt.Errorf("invalid remote_port: %w", err)
 		}
-		if port < 0 {
-			return query, fmt.Errorf("invalid remote_port: must be non-negative")
+		if port < 0 || port > 65535 {
+			return query, fmt.Errorf("invalid remote_port")
 		}
 		if port > 0 {
 			query.RemotePort = &port
@@ -254,8 +338,14 @@ func parseInt64WithDefault(value string, fallback int64) int64 {
 	return parsed
 }
 
-func (s *Server) analyzeUsageExplain(ctx context.Context, query usageExplainQuery, allowFileScan bool) (usageExplainResponse, error) {
-	return s.analyzeUsageExplainWithOptions(ctx, query, usageExplainOptions{allowFileScan: allowFileScan})
+func (s *Server) logUsageExplainEnrichmentError(source, requestID string, err error) {
+	if s.logger == nil || err == nil {
+		return
+	}
+	if strings.TrimSpace(requestID) == "" {
+		requestID = "background"
+	}
+	s.logger.Printf("usage explain enrichment failed source=%s request_id=%s error=%s", source, requestID, err)
 }
 
 func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usageExplainQuery, options usageExplainOptions) (usageExplainResponse, error) {
@@ -327,6 +417,11 @@ func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usage
 	response.SourceIPs = topIPsByWeight(sourceIPWeights, 6)
 	response.TargetIPs = topIPsByWeight(targetIPWeights, 6)
 	response.RelatedPeers = summarizePeers(peerMap, maxRelatedPeers)
+	if allowFileScan {
+		sharedScanCtx, cancel := context.WithTimeout(ctx, explainLogScanBudget)
+		defer cancel()
+		ctx = withExplainScanContext(ctx, sharedScanCtx)
+	}
 
 	if isShadowsocksProcess(query.Comm, query.Exe) {
 		processName := processIdentityKey(query.Comm, query.Exe)
@@ -344,7 +439,8 @@ func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usage
 		if allowCachedEvidence {
 			s.addCurrentTupleNote(&response, query)
 			if err := s.enrichShadowsocksFromLogs(ctx, &response, query, bucketTS, logDirs, related, allowFileScan); err != nil {
-				appendNoteUnique(&response.Notes, fmt.Sprintf("SS 日志检索失败：%v", err))
+				s.logUsageExplainEnrichmentError("shadowsocks", options.requestID, err)
+				appendNoteUnique(&response.Notes, "SS 日志检索暂时不可用；已返回其余可用信息。")
 			}
 			if !ok {
 				appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志目录，当前仅回放已缓存证据，无法同步扫描文件。", processName))
@@ -365,7 +461,8 @@ func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usage
 		if allowCachedEvidence {
 			s.addCurrentTupleNote(&response, query)
 			if err := s.enrichNginxFromLogs(ctx, &response, query.RemoteIP, bucketTS, logDir, allowFileScan); err != nil {
-				appendNoteUnique(&response.Notes, fmt.Sprintf("Nginx 日志检索失败：%v", err))
+				s.logUsageExplainEnrichmentError("nginx", options.requestID, err)
+				appendNoteUnique(&response.Notes, "Nginx 日志检索暂时不可用；已返回其余可用信息。")
 			}
 			if !ok {
 				appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志目录，当前仅回放已缓存证据，无法同步扫描文件。", processName))
@@ -384,7 +481,8 @@ func (s *Server) analyzeUsageExplainWithOptions(ctx context.Context, query usage
 			if allowCachedEvidence {
 				s.addCurrentTupleNote(&response, query)
 				if err := s.enrichGenericProcessFromLogs(ctx, &response, query, bucketTS, related, processName, logDir, allowFileScan); err != nil {
-					appendNoteUnique(&response.Notes, fmt.Sprintf("%s 日志检索失败：%v", processName, err))
+					s.logUsageExplainEnrichmentError("process", options.requestID, err)
+					appendNoteUnique(&response.Notes, "进程日志检索暂时不可用；已返回其余可用信息。")
 				}
 				if !ok {
 					appendNoteUnique(&response.Notes, fmt.Sprintf("进程 %s 未配置日志目录，当前仅回放已缓存证据，无法同步扫描文件。", processName))
@@ -887,6 +985,8 @@ func (s *Server) lookupOrScanEvidence(
 		MaxScanFilesFallback: maxScanFilesFallback,
 		MaxScanLinesPerFile:  maxScanLinesPerFile,
 		CacheOnly:            !allowFileScan,
+		ScanContext:          explainScanContext(ctx),
+		PersistContext:       ctx,
 	})
 }
 
@@ -1090,16 +1190,18 @@ func (s *Server) scanEvidenceDirWindow(
 	parser evidenceParser,
 	hitNote string,
 ) ([]model.LogEvidence, string, error) {
-	files, err := evidence.ListLogFiles(logDir, fileNameMatcher, startTS, endTS, maxScanFiles)
+	scanCtx, cancel := context.WithTimeout(explainScanContext(ctx), explainLogScanBudget)
+	defer cancel()
+	files, err := evidence.ListLogFilesContext(scanCtx, logDir, fileNameMatcher, startTS, endTS, maxScanFiles)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, "日志深度扫描超时，已跳过文件扫描。", nil
+		}
 		return nil, "", err
 	}
 	if len(files) == 0 {
 		return nil, "", nil
 	}
-
-	scanCtx, cancel := context.WithTimeout(ctx, explainLogScanBudget)
-	defer cancel()
 
 	rows, err := evidence.ScanFiles(
 		scanCtx,

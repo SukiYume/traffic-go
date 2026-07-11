@@ -96,6 +96,7 @@ ON CONFLICT(fingerprint) DO UPDATE SET
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.invalidateMonthlyCache()
 	return nil
 }
 

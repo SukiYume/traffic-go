@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-build-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.5
+          cache: true
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm --prefix web ci
+
+      - name: Test and audit frontend
+        run: |
+          npm --prefix web run test
+          npm --prefix web audit --audit-level=low
+
+      - name: Build and embed frontend
+        run: |
+          npm --prefix web run build
+          test -s web/dist/index.html
+          find internal/embed/dist -mindepth 1 -maxdepth 1 ! -name placeholder.txt -exec rm -rf -- {} +
+          cp -R web/dist/. internal/embed/dist/
+          test -f internal/embed/dist/placeholder.txt
+
+      - name: Test backend with race detector
+        run: go test -race -count=1 ./...
+
+      - name: Vet backend
+        run: go vet ./...
+
+      - name: Static analysis
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: Check known Go vulnerabilities
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
+        with:
+          go-version-input: 1.26.5
+          go-package: ./...
+          repo-checkout: false
+
+      - name: Build Linux binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: amd64
+        run: >-
+          go build -trimpath
+          -ldflags "-s -w -X traffic-go/internal/buildinfo.Version=ci -X traffic-go/internal/buildinfo.Commit=${GITHUB_SHA} -X traffic-go/internal/buildinfo.BuildDate=ci"
+          -o /tmp/traffic-go ./cmd/traffic-go
+
+      - name: Verify CLI provenance surface
+        run: |
+          chmod +x /tmp/traffic-go
+          /tmp/traffic-go -version | grep -F "commit=${GITHUB_SHA}"
+
+      - name: Validate shell scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes shellcheck
+          shellcheck deploy/*.sh
+
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Exercise immutable release packaging
+        if: github.event_name == 'pull_request'
+        run: |
+          git tag --force v0.0.0-ci HEAD
+          VERSION=v0.0.0-ci bash deploy/package-release.sh
+          test -s release/v0.0.0-ci/traffic-go-v0.0.0-ci-linux-amd64.tar.gz

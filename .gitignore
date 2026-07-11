@@ -48,6 +48,7 @@ coverage.out
 /docs/
 
 # Frontend build and dependencies
+/node_modules/
 /web/node_modules/
 /web/dist/
 /web/.vite/

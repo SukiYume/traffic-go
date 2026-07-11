@@ -20,10 +20,6 @@ export function deriveAppBasePath(moduleUrl: string) {
 
 const APP_BASE_PATH = deriveAppBasePath(import.meta.url);
 
-export function appBasePath() {
-  return APP_BASE_PATH;
-}
-
 export function routerBasename() {
   return APP_BASE_PATH || undefined;
 }

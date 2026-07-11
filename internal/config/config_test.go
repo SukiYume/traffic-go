@@ -37,8 +37,8 @@ func TestLoadDefaultsZeroRetentionValues(t *testing.T) {
 	if len(cfg.ProcessLogDirs) != 0 {
 		t.Fatalf("expected no default process_log_dirs entries, got %v", cfg.ProcessLogDirs)
 	}
-	if cfg.ShadowsocksJournalFallback == nil || *cfg.ShadowsocksJournalFallback {
-		t.Fatalf("expected shadowsocks_journal_fallback disabled by default, got %+v", cfg.ShadowsocksJournalFallback)
+	if cfg.ShadowsocksJournalFallback {
+		t.Fatalf("expected shadowsocks_journal_fallback disabled by default")
 	}
 	if !cfg.Prefetch.Enabled {
 		t.Fatalf("expected prefetch enabled by default")
@@ -82,6 +82,20 @@ func TestLoadRetentionOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadEmptyFileUsesDefaults(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load empty config: %v", err)
+	}
+	if cfg.Listen != defaultListen || cfg.TickInterval != defaultTickInterval {
+		t.Fatalf("unexpected defaults: %+v", cfg)
+	}
+}
+
 func TestLoadProcessLogDirsOverride(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	content := []byte("process_log_dirs:\n  frps: /var/log/frps\n")
@@ -112,11 +126,8 @@ func TestLoadShadowsocksJournalFallbackOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.ShadowsocksJournalFallback == nil {
-		t.Fatalf("expected shadowsocks_journal_fallback to be set")
-	}
-	if !*cfg.ShadowsocksJournalFallback {
-		t.Fatalf("expected shadowsocks_journal_fallback override true, got false")
+	if !cfg.ShadowsocksJournalFallback {
+		t.Fatal("expected shadowsocks_journal_fallback override true")
 	}
 }
 
@@ -245,6 +256,25 @@ func TestValidateRequiresAuthForNonLoopbackListen(t *testing.T) {
 	}
 }
 
+func TestValidateTreatsWhitespaceOnlyAuthAsEmpty(t *testing.T) {
+	cfg := Default()
+	cfg.Auth.Username = "  \t"
+	cfg.Auth.Password = "\n "
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "both be set") {
+		t.Fatalf("expected whitespace-only credentials to be rejected even on loopback, got %v", err)
+	}
+
+	cfg.Listen = "0.0.0.0:18080"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "auth.username") {
+		t.Fatalf("expected whitespace-only credentials to be rejected, got %v", err)
+	}
+
+	cfg.Auth.Username = "admin"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "both be set") {
+		t.Fatalf("expected whitespace-only password to count as missing, got %v", err)
+	}
+}
+
 func TestValidateRequiresPositiveSocketIndexInterval(t *testing.T) {
 	cfg := Default()
 	cfg.SocketIndexInterval = -time.Second
@@ -289,6 +319,21 @@ func TestDeriveRestoresPrefetchDefaultsForZeroValues(t *testing.T) {
 	}
 }
 
+func TestDeriveDoesNotHideNegativeValues(t *testing.T) {
+	cfg := Default()
+	cfg.TickInterval = -time.Second
+	cfg.Retention.MinuteDays = -1
+	cfg.Prefetch.MaxScanFiles = -1
+
+	derived := Derive(cfg)
+	if derived.TickInterval != -time.Second || derived.Retention.MinuteDays != -1 || derived.Prefetch.MaxScanFiles != -1 {
+		t.Fatalf("derive hid negative values: %+v", derived)
+	}
+	if err := derived.Validate(); err == nil {
+		t.Fatal("expected validation to reject negative values")
+	}
+}
+
 func TestDefaultCacheValues(t *testing.T) {
 	cfg := Default()
 	if cfg.Cache.CountCacheSize != 256 {
@@ -329,5 +374,92 @@ func TestLoadCacheAllowsExplicitZeroSizes(t *testing.T) {
 	}
 	if cfg.Cache.SlidingTTL != 60*time.Second || cfg.Cache.ArchivedTTL != 3600*time.Second {
 		t.Fatalf("expected omitted cache ttls to use defaults, got %+v", cfg.Cache)
+	}
+}
+
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	tests := map[string]string{
+		"top-level": "tick_intervl: 2s\n",
+		"nested":    "retention:\n  minute_dayz: 7\n",
+		"cache":     "cache:\n  sliding_ttl_seconds: 60\n",
+	}
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "field") {
+				t.Fatalf("expected unknown field error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsNegativeValuesBeforeDefaults(t *testing.T) {
+	tests := map[string]string{
+		"tick interval":   "tick_interval: -1s\n",
+		"retention":       "retention:\n  minute_days: -1\n",
+		"prefetch budget": "prefetch:\n  scan_budget: -1ms\n",
+		"prefetch files":  "prefetch:\n  max_scan_files: -1\n",
+	}
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "negative") {
+				t.Fatalf("expected negative value error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsMultipleYAMLDocuments(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("listen: 127.0.0.1:8080\n---\nlisten: 127.0.0.1:9090\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
+		t.Fatalf("expected multiple document error, got %v", err)
+	}
+}
+
+func TestValidateListenAddress(t *testing.T) {
+	for _, listen := range []string{"127.0.0.1", "127.0.0.1:http", "127.0.0.1:+80", "127.0.0.1:0", "127.0.0.1%eth0:8080", "bad host:8080", "bad_host:8080", "[fe80::1%bad zone]:8080", "[::1", ""} {
+		t.Run(listen, func(t *testing.T) {
+			cfg := Default()
+			cfg.Listen = listen
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "listen") {
+				t.Fatalf("expected listen validation error for %q, got %v", listen, err)
+			}
+		})
+	}
+
+	cfg := Default()
+	cfg.Listen = "[::1]:18080"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected IPv6 loopback address to validate: %v", err)
+	}
+}
+
+func TestDeriveTrimsListenAddress(t *testing.T) {
+	cfg := Default()
+	cfg.Listen = " 127.0.0.1:18080 \t"
+	derived := Derive(cfg)
+	if derived.Listen != "127.0.0.1:18080" {
+		t.Fatalf("listen was not normalized: %q", derived.Listen)
+	}
+	if err := derived.Validate(); err != nil {
+		t.Fatalf("normalized listen should validate: %v", err)
+	}
+}
+
+func TestValidateRejectsControlCharactersInDBPath(t *testing.T) {
+	cfg := Default()
+	cfg.DBPath = "traffic.db\nlisten: 0.0.0.0:80"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "db_path") {
+		t.Fatalf("expected db_path validation error, got %v", err)
 	}
 }

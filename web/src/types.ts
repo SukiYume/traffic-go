@@ -1,24 +1,56 @@
-export type RangeKey = '1h' | '24h' | '7d' | 'this_month' | 'last_month' | 'two_months_ago';
-export type BucketKey = '1m' | '5m' | '1h' | '6h' | '1d';
-export type GroupBy = 'direction' | 'comm' | 'remote_ip';
-export type Direction = 'in' | 'out' | 'forward';
-export type Attribution = 'exact' | 'heuristic' | 'guess' | 'unknown';
+export type RangeKey =
+  "1h" | "24h" | "7d" | "this_month" | "last_month" | "two_months_ago";
+export type BucketKey = "1m" | "5m" | "1h" | "6h" | "1d";
+export type GroupBy = "direction" | "comm" | "remote_ip";
+export type Direction = "in" | "out" | "forward";
+type Attribution = "exact" | "heuristic" | "guess" | "unknown";
 export type DataSource =
-  | 'usage_1m'
-  | 'usage_1h'
-  | 'usage_1d'
-  | 'interface_1m'
-  | 'interface_1h'
-  | 'interface_1d'
-  | 'usage_1m_forward'
-  | 'usage_1h_forward'
-  | 'usage_1d_forward';
-export type SortOrder = 'asc' | 'desc';
-export type UsageSortKey = 'minuteTs' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount' | 'remoteIp' | 'direction' | 'proto' | 'localPort' | 'comm' | 'pid';
-export type ForwardSortKey = 'minuteTs' | 'bytesOrig' | 'bytesReply' | 'bytesTotal' | 'flowCount' | 'origSrc' | 'origDst';
-export type RemoteSortKey = 'remoteIp' | 'direction' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount';
-export type ProcessSortKey = 'comm' | 'pid' | 'bytesUp' | 'bytesDown' | 'bytesTotal' | 'flowCount';
-export type ProcessGroupBy = 'pid' | 'comm';
+  | "usage_1m"
+  | "usage_1h"
+  | "usage_1d"
+  | "interface_1m"
+  | "interface_1h"
+  | "interface_1d"
+  | "usage_1m_forward"
+  | "usage_1h_forward"
+  | "usage_1d_forward";
+export type SortOrder = "asc" | "desc";
+
+export interface SummaryCoverage {
+  approximate: boolean;
+  effectiveStart: number;
+  effectiveEnd: number;
+}
+export type UsageSortKey =
+  | "minuteTs"
+  | "bytesUp"
+  | "bytesDown"
+  | "bytesTotal"
+  | "flowCount"
+  | "remoteIp"
+  | "direction"
+  | "proto"
+  | "localPort"
+  | "comm"
+  | "pid";
+export type ForwardSortKey =
+  | "minuteTs"
+  | "bytesOrig"
+  | "bytesReply"
+  | "bytesTotal"
+  | "flowCount"
+  | "origSrc"
+  | "origDst";
+export type RemoteSortKey =
+  | "remoteIp"
+  | "direction"
+  | "bytesUp"
+  | "bytesDown"
+  | "bytesTotal"
+  | "flowCount";
+export type ProcessSortKey =
+  "comm" | "pid" | "bytesUp" | "bytesDown" | "bytesTotal" | "flowCount";
+export type ProcessGroupBy = "pid" | "comm";
 
 export interface OverviewStats {
   bytesUp: number;
@@ -28,6 +60,7 @@ export interface OverviewStats {
   flowCount?: number;
   dataSource: DataSource;
   range: RangeKey;
+  coverage?: SummaryCoverage;
 }
 
 export interface MonthlyUsageSummary {
@@ -71,12 +104,14 @@ export interface TimeSeriesResponse {
   groupBy: GroupBy;
   points: TimeSeriesPoint[];
   groups: TimeSeriesGroup[];
+  coverage?: SummaryCoverage;
 }
 
 export interface NetworkTimeSeriesResponse {
   dataSource: DataSource;
   bucket: BucketKey;
   points: TimeSeriesPoint[];
+  coverage?: SummaryCoverage;
 }
 
 export interface TimeSeriesFilters {
@@ -90,8 +125,8 @@ export interface TimeSeriesFilters {
 
 export interface UsageRow {
   minuteTs: number;
-  proto: 'tcp' | 'udp';
-  direction: Exclude<Direction, 'forward'>;
+  proto: "tcp" | "udp";
+  direction: Exclude<Direction, "forward">;
   pid: number | null;
   comm: string | null;
   exe: string | null;
@@ -108,7 +143,7 @@ export interface UsageRow {
 
 export interface ForwardUsageRow {
   minuteTs: number;
-  proto: 'tcp' | 'udp';
+  proto: "tcp" | "udp";
   origSrc: string;
   origDst: string;
   origSport: number;
@@ -120,7 +155,7 @@ export interface ForwardUsageRow {
   flowCount: number;
 }
 
-export interface TopRow {
+interface TopRow {
   label: string;
   value: number;
   bytesUp: number;
@@ -169,7 +204,7 @@ export interface ForwardUsageQuery {
   includeTotal?: boolean;
 }
 
-export interface PaginationMeta {
+interface PaginationMeta {
   page: number;
   pageSize: number;
   totalRows: number;
@@ -186,12 +221,13 @@ export interface UsageResponse {
   totalRows: number;
   hasMore?: boolean;
   totalRowsExact?: boolean;
+  coverage?: SummaryCoverage;
 }
 
-export type ExplainConfidence = 'low' | 'medium' | 'high';
+type ExplainConfidence = "low" | "medium" | "high";
 
-export interface UsageExplainPeer {
-  direction: Exclude<Direction, 'forward'>;
+interface UsageExplainPeer {
+  direction: Exclude<Direction, "forward">;
   remoteIp: string;
   remotePort: number | null;
   localPort: number | null;
@@ -199,7 +235,7 @@ export interface UsageExplainPeer {
   flowCount: number;
 }
 
-export interface UsageExplainChain {
+interface UsageExplainChain {
   chainId?: string | null;
   sourceIp: string | null;
   targetIp: string | null;
@@ -218,7 +254,7 @@ export interface UsageExplainChain {
   confidence: ExplainConfidence;
 }
 
-export interface UsageExplainNginxRequest {
+interface UsageExplainNginxRequest {
   time: number;
   method: string;
   host: string | null;
@@ -253,6 +289,7 @@ export interface ForwardUsageResponse {
   totalRows: number;
   hasMore?: boolean;
   totalRowsExact?: boolean;
+  coverage?: SummaryCoverage;
 }
 
 export interface ProcessSummaryRow {
@@ -268,10 +305,11 @@ export interface ProcessSummaryRow {
 export interface ProcessSummaryResponse extends PaginationMeta {
   dataSource: DataSource;
   rows: ProcessSummaryRow[];
+  coverage?: SummaryCoverage;
 }
 
 export interface RemoteSummaryRow {
-  direction: Exclude<Direction, 'forward'>;
+  direction: Exclude<Direction, "forward">;
   remoteIp: string | null;
   bytesUp: number;
   bytesDown: number;
@@ -282,11 +320,22 @@ export interface RemoteSummaryRow {
 export interface RemoteSummaryResponse extends PaginationMeta {
   dataSource: DataSource;
   rows: RemoteSummaryRow[];
+  coverage?: SummaryCoverage;
 }
 
 export interface TopResponse {
   dataSource: DataSource;
   rows: TopRow[];
+  coverage?: SummaryCoverage;
+}
+
+export interface DashboardResponse {
+  overview: OverviewStats;
+  timeseries: TimeSeriesResponse;
+  topProcesses: ProcessSummaryResponse;
+  topInboundRemotes: RemoteSummaryResponse;
+  topOutboundRemotes: RemoteSummaryResponse;
+  topPorts: TopResponse;
 }
 
 export interface ProcessesResponse {
@@ -298,15 +347,70 @@ export interface ApiRequestOptions {
 }
 
 export interface TrafficApiClient {
-  getOverview(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<OverviewStats>;
-  getMonthlyUsage(requestOptions?: ApiRequestOptions): Promise<MonthlyUsageResponse>;
-  getTimeSeries(range: RangeKey, groupBy?: GroupBy, filters?: TimeSeriesFilters, requestOptions?: ApiRequestOptions): Promise<TimeSeriesResponse>;
-  getNetworkTimeSeries(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<NetworkTimeSeriesResponse>;
-  getUsage(query: UsageQuery, requestOptions?: ApiRequestOptions): Promise<UsageResponse>;
-  getUsageExplain(row: UsageRow, options?: { dataSource?: DataSource; allowScan?: boolean }, requestOptions?: ApiRequestOptions): Promise<UsageExplain>;
-  getTopProcesses(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: ProcessSortKey; sortOrder?: SortOrder; groupBy?: ProcessGroupBy; includeTotal?: boolean; summary?: boolean }, requestOptions?: ApiRequestOptions): Promise<ProcessSummaryResponse>;
-  getTopRemotes(range: RangeKey, options?: { page?: number; pageSize?: number; sortBy?: RemoteSortKey; sortOrder?: SortOrder; direction?: Exclude<Direction, 'forward'>; includeLoopback?: boolean; includeTotal?: boolean; summary?: boolean }, requestOptions?: ApiRequestOptions): Promise<RemoteSummaryResponse>;
-  getTopPorts(range: RangeKey, requestOptions?: ApiRequestOptions): Promise<TopResponse>;
+  getDashboard?(
+    range: RangeKey,
+    requestOptions?: ApiRequestOptions,
+  ): Promise<DashboardResponse>;
+  getOverview(
+    range: RangeKey,
+    requestOptions?: ApiRequestOptions,
+  ): Promise<OverviewStats>;
+  getMonthlyUsage(
+    requestOptions?: ApiRequestOptions,
+  ): Promise<MonthlyUsageResponse>;
+  getTimeSeries(
+    range: RangeKey,
+    groupBy?: GroupBy,
+    filters?: TimeSeriesFilters,
+    requestOptions?: ApiRequestOptions,
+  ): Promise<TimeSeriesResponse>;
+  getNetworkTimeSeries(
+    range: RangeKey,
+    requestOptions?: ApiRequestOptions,
+  ): Promise<NetworkTimeSeriesResponse>;
+  getUsage(
+    query: UsageQuery,
+    requestOptions?: ApiRequestOptions,
+  ): Promise<UsageResponse>;
+  getUsageExplain(
+    row: UsageRow,
+    options?: { dataSource?: DataSource; allowScan?: boolean },
+    requestOptions?: ApiRequestOptions,
+  ): Promise<UsageExplain>;
+  getTopProcesses(
+    range: RangeKey,
+    options?: {
+      page?: number;
+      pageSize?: number;
+      sortBy?: ProcessSortKey;
+      sortOrder?: SortOrder;
+      groupBy?: ProcessGroupBy;
+      includeTotal?: boolean;
+      summary?: boolean;
+    },
+    requestOptions?: ApiRequestOptions,
+  ): Promise<ProcessSummaryResponse>;
+  getTopRemotes(
+    range: RangeKey,
+    options?: {
+      page?: number;
+      pageSize?: number;
+      sortBy?: RemoteSortKey;
+      sortOrder?: SortOrder;
+      direction?: Exclude<Direction, "forward">;
+      includeLoopback?: boolean;
+      includeTotal?: boolean;
+      summary?: boolean;
+    },
+    requestOptions?: ApiRequestOptions,
+  ): Promise<RemoteSummaryResponse>;
+  getTopPorts(
+    range: RangeKey,
+    requestOptions?: ApiRequestOptions,
+  ): Promise<TopResponse>;
   getProcesses(requestOptions?: ApiRequestOptions): Promise<ProcessesResponse>;
-  getForwardUsage(query: ForwardUsageQuery, requestOptions?: ApiRequestOptions): Promise<ForwardUsageResponse>;
+  getForwardUsage(
+    query: ForwardUsageQuery,
+    requestOptions?: ApiRequestOptions,
+  ): Promise<ForwardUsageResponse>;
 }

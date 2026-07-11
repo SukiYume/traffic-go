@@ -36,9 +36,13 @@ const (
 )
 
 var ErrDimensionUnavailable = errors.New("dimension_unavailable")
+var ErrRangeUnavailable = errors.New("range_unavailable")
 var ErrCursorSortUnsupported = errors.New("cursor pagination only supports time-desc sort")
 
-const storeShortCacheTTL = 30 * time.Second
+const (
+	storeShortCacheTTL    = 30 * time.Second
+	knownProcessRetention = 90 * 24 * time.Hour
+)
 
 type Store struct {
 	db        *sql.DB
@@ -135,8 +139,8 @@ func monthlyChainBoundaryUTC(now time.Time, retention config.Retention) time.Tim
 }
 
 func Open(cfg config.Config) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o755); err != nil && filepath.Dir(cfg.DBPath) != "." {
-		return nil, fmt.Errorf("create db directory: %w", err)
+	if err := ensurePrivateDBDirectory(cfg.DBPath); err != nil {
+		return nil, err
 	}
 
 	db, err := openSQLiteDB(cfg.DBPath, 1, false)
@@ -154,6 +158,10 @@ func Open(cfg config.Config) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := secureSQLiteFiles(cfg.DBPath); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	readDB, err := openSQLiteDB(cfg.DBPath, 4, true)
 	if err != nil {
@@ -161,7 +169,48 @@ func Open(cfg config.Config) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite read pool: %w", err)
 	}
 	store.readDB = readDB
+	if err := secureSQLiteFiles(cfg.DBPath); err != nil {
+		_ = readDB.Close()
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
+}
+
+func ensurePrivateDBDirectory(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	_, statErr := os.Stat(dir)
+	if statErr == nil {
+		return nil
+	}
+	if !os.IsNotExist(statErr) {
+		return fmt.Errorf("inspect db directory: %w", statErr)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create db directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("secure db directory: %w", err)
+	}
+	return nil
+}
+
+func secureSQLiteFiles(path string) error {
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(candidate); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("inspect sqlite file %q: %w", candidate, err)
+		}
+		if err := os.Chmod(candidate, 0o600); err != nil {
+			return fmt.Errorf("secure sqlite file %q: %w", candidate, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -348,8 +397,45 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, monthlyLateWriteTriggersSQL); err != nil {
+		return fmt.Errorf("apply monthly late-write triggers: %w", err)
+	}
 	return nil
 }
+
+const monthlyLateWriteTriggersSQL = `
+CREATE TRIGGER IF NOT EXISTS trg_log_evidence_monthly_late_insert
+AFTER INSERT ON log_evidence
+BEGIN
+    UPDATE usage_monthly
+    SET evidence_count = evidence_count + 1,
+        updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER))
+    WHERE month_ts = CAST(strftime('%s', datetime(NEW.event_ts, 'unixepoch', 'start of month')) AS INTEGER);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_log_evidence_monthly_late_move
+AFTER UPDATE OF event_ts ON log_evidence
+WHEN OLD.event_ts != NEW.event_ts
+BEGIN
+    UPDATE usage_monthly
+    SET evidence_count = MAX(0, evidence_count - 1),
+        updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER))
+    WHERE month_ts = CAST(strftime('%s', datetime(OLD.event_ts, 'unixepoch', 'start of month')) AS INTEGER);
+    UPDATE usage_monthly
+    SET evidence_count = evidence_count + 1,
+        updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER))
+    WHERE month_ts = CAST(strftime('%s', datetime(NEW.event_ts, 'unixepoch', 'start of month')) AS INTEGER);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_usage_chain_hourly_monthly_late_insert
+AFTER INSERT ON usage_chain_1h
+BEGIN
+    UPDATE usage_monthly
+    SET chain_count = chain_count + 1,
+        updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER))
+    WHERE month_ts = CAST(strftime('%s', datetime(NEW.hour_ts, 'unixepoch', 'start of month')) AS INTEGER);
+END;
+`
 
 func (s *Store) FlushMinute(
 	ctx context.Context,
@@ -357,6 +443,23 @@ func (s *Store) FlushMinute(
 	usage map[model.UsageKey]model.UsageDelta,
 	forward map[model.ForwardUsageKey]model.UsageDelta,
 ) error {
+	return s.FlushMinuteBatch(ctx, minuteTS, usage, forward, nil)
+}
+
+// FlushMinuteBatch commits every counter family for one collector bucket in a
+// single transaction. The collector keeps its in-memory bucket on error, so a
+// split transaction here would make a successful usage commit repeat when a
+// later interface commit failed and the bucket was retried.
+func (s *Store) FlushMinuteBatch(
+	ctx context.Context,
+	minuteTS int64,
+	usage map[model.UsageKey]model.UsageDelta,
+	forward map[model.ForwardUsageKey]model.UsageDelta,
+	interfaces map[string]model.InterfaceUsageDelta,
+) error {
+	monthlyUsage := make(map[int64]model.UsageDelta)
+	monthlyForward := make(map[int64]model.UsageDelta)
+	archiveUpdated := false
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin flush minute: %w", err)
@@ -364,6 +467,12 @@ func (s *Store) FlushMinute(
 	defer tx.Rollback()
 
 	if len(usage) > 0 {
+		type processIdentity struct {
+			pid  int
+			comm string
+			exe  string
+		}
+		knownProcesses := make(map[processIdentity]int64)
 		stmt, err := tx.PrepareContext(ctx, `
 INSERT INTO usage_1m (
     minute_ts, proto, direction, pid, comm, exe, local_port, remote_ip, remote_port,
@@ -415,10 +524,22 @@ ON CONFLICT(pid, comm, exe) DO UPDATE SET
 			); err != nil {
 				return fmt.Errorf("flush minute usage: %w", err)
 			}
+			monthTS := monthStartUTC(time.Unix(key.MinuteTS, 0)).Unix()
+			monthDelta := monthlyUsage[monthTS]
+			monthDelta.BytesUp += delta.BytesUp
+			monthDelta.BytesDown += delta.BytesDown
+			monthDelta.FlowCount += delta.FlowCount
+			monthlyUsage[monthTS] = monthDelta
 			if key.PID > 0 || strings.TrimSpace(key.Comm) != "" || strings.TrimSpace(key.Exe) != "" {
-				if _, err := processStmt.ExecContext(ctx, key.PID, key.Comm, key.Exe, key.MinuteTS); err != nil {
-					return fmt.Errorf("upsert known process: %w", err)
+				identity := processIdentity{pid: key.PID, comm: key.Comm, exe: key.Exe}
+				if seenTS, exists := knownProcesses[identity]; !exists || key.MinuteTS > seenTS {
+					knownProcesses[identity] = key.MinuteTS
 				}
+			}
+		}
+		for identity, seenTS := range knownProcesses {
+			if _, err := processStmt.ExecContext(ctx, identity.pid, identity.comm, identity.exe, seenTS); err != nil {
+				return fmt.Errorf("upsert known process: %w", err)
 			}
 		}
 	}
@@ -461,27 +582,51 @@ DO UPDATE SET
 			); err != nil {
 				return fmt.Errorf("flush forward minute usage: %w", err)
 			}
+			monthTS := monthStartUTC(time.Unix(key.MinuteTS, 0)).Unix()
+			monthDelta := monthlyForward[monthTS]
+			monthDelta.BytesUp += delta.BytesUp
+			monthDelta.BytesDown += delta.BytesDown
+			monthDelta.FlowCount += delta.FlowCount
+			monthlyForward[monthTS] = monthDelta
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return err
+	updatedAt := s.now().UTC().Unix()
+	for monthTS, delta := range monthlyUsage {
+		result, err := tx.ExecContext(ctx, `
+UPDATE usage_monthly
+SET bytes_up = bytes_up + ?,
+    bytes_down = bytes_down + ?,
+    flow_count = flow_count + ?,
+    updated_at = MAX(updated_at, ?)
+WHERE month_ts = ?
+`, delta.BytesUp, delta.BytesDown, delta.FlowCount, updatedAt, monthTS)
+		if err != nil {
+			return fmt.Errorf("refresh archived monthly usage: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+			archiveUpdated = true
+		}
 	}
-	s.invalidateProcessCache()
-	return nil
-}
+	for monthTS, delta := range monthlyForward {
+		result, err := tx.ExecContext(ctx, `
+UPDATE usage_monthly
+SET forward_bytes_orig = forward_bytes_orig + ?,
+    forward_bytes_reply = forward_bytes_reply + ?,
+    forward_flow_count = forward_flow_count + ?,
+    updated_at = MAX(updated_at, ?)
+WHERE month_ts = ?
+`, delta.BytesUp, delta.BytesDown, delta.FlowCount, updatedAt, monthTS)
+		if err != nil {
+			return fmt.Errorf("refresh archived monthly forward usage: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+			archiveUpdated = true
+		}
+	}
 
-func (s *Store) FlushInterfaceMinute(ctx context.Context, minuteTS int64, interfaces map[string]model.InterfaceUsageDelta) error {
-	if len(interfaces) == 0 {
-		return nil
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin flush interface minute: %w", err)
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.PrepareContext(ctx, `
+	if len(interfaces) > 0 {
+		stmt, err := tx.PrepareContext(ctx, `
 INSERT INTO interface_1m (
     minute_ts, interface, rx_bytes, tx_bytes
 ) VALUES (?, ?, ?, ?)
@@ -489,27 +634,66 @@ ON CONFLICT(minute_ts, interface)
 DO UPDATE SET
     rx_bytes = interface_1m.rx_bytes + excluded.rx_bytes,
     tx_bytes = interface_1m.tx_bytes + excluded.tx_bytes`)
-	if err != nil {
-		return fmt.Errorf("prepare interface minute flush: %w", err)
-	}
-	defer stmt.Close()
+		if err != nil {
+			return fmt.Errorf("prepare interface minute flush: %w", err)
+		}
+		defer stmt.Close()
 
-	for name, delta := range interfaces {
-		name = strings.TrimSpace(name)
-		if name == "" || (delta.RxBytes == 0 && delta.TxBytes == 0) {
-			continue
-		}
-		if _, err := stmt.ExecContext(ctx, minuteTS, name, delta.RxBytes, delta.TxBytes); err != nil {
-			return fmt.Errorf("flush interface minute usage: %w", err)
+		for name, delta := range interfaces {
+			name = strings.TrimSpace(name)
+			if name == "" || (delta.RxBytes == 0 && delta.TxBytes == 0) {
+				continue
+			}
+			if _, err := stmt.ExecContext(ctx, minuteTS, name, delta.RxBytes, delta.TxBytes); err != nil {
+				return fmt.Errorf("flush interface minute usage: %w", err)
+			}
 		}
 	}
+
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	s.invalidateProcessCache()
+	if archiveUpdated {
+		s.invalidateMonthlyCache()
 	}
 	return nil
 }
 
+func (s *Store) FlushInterfaceMinute(ctx context.Context, minuteTS int64, interfaces map[string]model.InterfaceUsageDelta) error {
+	return s.FlushMinuteBatch(ctx, minuteTS, nil, nil, interfaces)
+}
+
 func (s *Store) AggregateHour(ctx context.Context, hour time.Time) error {
+	return s.aggregateHour(ctx, hour, true)
+}
+
+// AggregateHourOnly refreshes the hour-level tables without rescanning the
+// entire UTC day. It is used during the short post-hour grace window, where
+// the just-finished hour may receive one last collector flush.
+func (s *Store) AggregateHourOnly(ctx context.Context, hour time.Time) error {
+	return s.aggregateHour(ctx, hour, false)
+}
+
+// AggregateHours refreshes an ordered catch-up set and recomputes each affected
+// UTC day once, after that day's final hour. All operations are idempotent; the
+// caller advances its durable cursor only after this method succeeds.
+func (s *Store) AggregateHours(ctx context.Context, hours []time.Time) error {
+	for index, hour := range hours {
+		hour = hour.UTC().Truncate(time.Hour)
+		includeDay := index == len(hours)-1 || !sameUTCDay(hour, hours[index+1])
+		if err := s.aggregateHour(ctx, hour, includeDay); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sameUTCDay(left, right time.Time) bool {
+	return left.UTC().Truncate(24 * time.Hour).Equal(right.UTC().Truncate(24 * time.Hour))
+}
+
+func (s *Store) aggregateHour(ctx context.Context, hour time.Time, includeDay bool) error {
 	hourTS := hour.Truncate(time.Hour).Unix()
 	nextHourTS := hour.Truncate(time.Hour).Add(time.Hour).Unix()
 	dayTS := (hourTS / 86400) * 86400
@@ -638,7 +822,8 @@ ON CONFLICT(hour_ts, interface) DO UPDATE SET
 		return fmt.Errorf("aggregate interface_1h: %w", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, `
+	if includeDay {
+		if _, err := tx.ExecContext(ctx, `
 INSERT INTO usage_1d (
     day_ts, proto, direction, comm, local_port, remote_ip,
     bytes_up, bytes_down, pkts_up, pkts_down, flow_count
@@ -655,10 +840,10 @@ ON CONFLICT(day_ts, proto, direction, comm, local_port, remote_ip) DO UPDATE SET
     pkts_down = excluded.pkts_down,
     flow_count = excluded.flow_count
 `, dayTS, dayTS, nextDayTS); err != nil {
-		return fmt.Errorf("aggregate usage_1d: %w", err)
-	}
+			return fmt.Errorf("aggregate usage_1d: %w", err)
+		}
 
-	if _, err := tx.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 INSERT INTO usage_1d_forward (
     day_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport,
     bytes_orig, bytes_reply, pkts_orig, pkts_reply, flow_count
@@ -675,10 +860,10 @@ ON CONFLICT(day_ts, proto, orig_src_ip, orig_dst_ip, orig_sport, orig_dport) DO 
     pkts_reply = excluded.pkts_reply,
     flow_count = excluded.flow_count
 `, dayTS, dayTS, nextDayTS); err != nil {
-		return fmt.Errorf("aggregate usage_1d_forward: %w", err)
-	}
+			return fmt.Errorf("aggregate usage_1d_forward: %w", err)
+		}
 
-	if _, err := tx.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 INSERT INTO interface_1d (
     day_ts, interface, rx_bytes, tx_bytes
 )
@@ -689,8 +874,9 @@ GROUP BY interface
 ON CONFLICT(day_ts, interface) DO UPDATE SET
     rx_bytes = excluded.rx_bytes,
     tx_bytes = excluded.tx_bytes
-`, dayTS, dayTS, nextDayTS); err != nil {
-		return fmt.Errorf("aggregate interface_1d: %w", err)
+	`, dayTS, dayTS, nextDayTS); err != nil {
+			return fmt.Errorf("aggregate interface_1d: %w", err)
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dirty_chain_hours WHERE hour_ts = ?`, hourTS); err != nil {
@@ -700,6 +886,7 @@ ON CONFLICT(day_ts, interface) DO UPDATE SET
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.invalidateMonthlyCache()
 	return nil
 }
 
@@ -710,6 +897,7 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	dayCutoff := dayRetentionStartUTC(now, s.retention).Unix()
 	evidenceCutoff := evidenceRetentionStartUTC(now, s.retention).Unix()
 	chainCutoff := chainRetentionStartUTC(now, s.retention).Unix()
+	knownProcessCutoff := now.Add(-knownProcessRetention).Unix()
 	closedMonthCutoff := monthStartUTC(now).Unix()
 	summaryCutoff := minInt64(maxInt64(minuteCutoff, hourCutoff, dayCutoff, evidenceCutoff, chainCutoff), closedMonthCutoff)
 
@@ -742,11 +930,23 @@ func (s *Store) Cleanup(ctx context.Context) error {
 		{`DELETE FROM usage_1h_forward WHERE hour_ts < ?`, hourCutoff},
 		{`DELETE FROM usage_1d WHERE day_ts < ?`, dayCutoff},
 		{`DELETE FROM usage_1d_forward WHERE day_ts < ?`, dayCutoff},
-		{`DELETE FROM usage_chain_1m WHERE minute_ts < ?`, chainCutoff},
+		{`DELETE FROM usage_chain_1m
+          WHERE minute_ts < ?
+            AND NOT EXISTS (
+                SELECT 1 FROM dirty_chain_hours dirty
+                WHERE dirty.hour_ts = (usage_chain_1m.minute_ts / 3600) * 3600
+            )`, chainCutoff},
 		{`DELETE FROM usage_chain_1h WHERE hour_ts < ?`, chainCutoff},
 		{`DELETE FROM log_evidence WHERE event_ts < ?`, evidenceCutoff},
-		{`DELETE FROM dirty_chain_hours WHERE hour_ts < ?`, chainCutoff},
+		{`DELETE FROM dirty_chain_hours
+          WHERE hour_ts < ?
+            AND NOT EXISTS (
+                SELECT 1 FROM usage_chain_1m minute
+                WHERE minute.minute_ts >= dirty_chain_hours.hour_ts
+                  AND minute.minute_ts < dirty_chain_hours.hour_ts + 3600
+            )`, chainCutoff},
 		{`DELETE FROM monthly_retained_counts WHERE month_ts < ?`, closedMonthCutoff},
+		{`DELETE FROM known_processes WHERE seen_ts < ?`, knownProcessCutoff},
 	}
 
 	for _, stmt := range statements {
@@ -758,7 +958,7 @@ func (s *Store) Cleanup(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.invalidateMonthlyCache()
+	s.invalidateCaches()
 	return nil
 }
 
@@ -947,13 +1147,24 @@ func (s *Store) summarizeClosedMonths(ctx context.Context, tx *sql.Tx, before in
 	updatedAt := now.UTC().Unix()
 	cte, args := monthlyDetailAggregateCTE(s.monthlyArchiveWindow(before, now))
 	query := cte + `
-INSERT OR IGNORE INTO usage_monthly (
+INSERT INTO usage_monthly (
     month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
     forward_flow_count, evidence_count, chain_count, updated_at
 )
 SELECT month_ts, bytes_up, bytes_down, flow_count, forward_bytes_orig, forward_bytes_reply,
        forward_flow_count, evidence_count, chain_count, ?
 FROM monthly_detail
+WHERE 1
+ON CONFLICT(month_ts) DO UPDATE SET
+    bytes_up = MAX(usage_monthly.bytes_up, excluded.bytes_up),
+    bytes_down = MAX(usage_monthly.bytes_down, excluded.bytes_down),
+    flow_count = MAX(usage_monthly.flow_count, excluded.flow_count),
+    forward_bytes_orig = MAX(usage_monthly.forward_bytes_orig, excluded.forward_bytes_orig),
+    forward_bytes_reply = MAX(usage_monthly.forward_bytes_reply, excluded.forward_bytes_reply),
+    forward_flow_count = MAX(usage_monthly.forward_flow_count, excluded.forward_flow_count),
+    evidence_count = MAX(usage_monthly.evidence_count, excluded.evidence_count),
+    chain_count = MAX(usage_monthly.chain_count, excluded.chain_count),
+    updated_at = MAX(usage_monthly.updated_at, excluded.updated_at)
 `
 	args = append(args, updatedAt)
 	_, err := tx.ExecContext(ctx, query, args...)
@@ -974,8 +1185,8 @@ func (s *Store) monthlyArchiveWindow(before int64, now time.Time) monthlyAggrega
 	}
 }
 
-func (s *Store) LastAggregatedHour(ctx context.Context) (time.Time, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'last_aggregated_hour'`)
+func (s *Store) lastMetaTime(ctx context.Context, key string) (time.Time, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key)
 	var value string
 	if err := row.Scan(&value); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -990,12 +1201,20 @@ func (s *Store) LastAggregatedHour(ctx context.Context) (time.Time, bool, error)
 	return time.Unix(unixValue, 0).UTC(), true, nil
 }
 
-func (s *Store) SetLastAggregatedHour(ctx context.Context, hour time.Time) error {
+func (s *Store) setMetaTime(ctx context.Context, key string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO meta (key, value) VALUES ('last_aggregated_hour', ?)
+INSERT INTO meta (key, value) VALUES (?, ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value
-`, strconv.FormatInt(hour.UTC().Truncate(time.Hour).Unix(), 10))
+`, key, strconv.FormatInt(at.UTC().Unix(), 10))
 	return err
+}
+
+func (s *Store) LastAggregatedHour(ctx context.Context) (time.Time, bool, error) {
+	return s.lastMetaTime(ctx, "last_aggregated_hour")
+}
+
+func (s *Store) SetLastAggregatedHour(ctx context.Context, hour time.Time) error {
+	return s.setMetaTime(ctx, "last_aggregated_hour", hour.Truncate(time.Hour))
 }
 
 func (s *Store) NextPendingAggregationHour(ctx context.Context, after *time.Time, before time.Time) (time.Time, bool, error) {
@@ -1047,28 +1266,38 @@ WHERE hour_ts < ?
 	return time.Unix(value.Int64, 0).UTC(), true, nil
 }
 
-func (s *Store) LastVacuum(ctx context.Context) (time.Time, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'last_vacuum_at'`)
-	var value string
-	if err := row.Scan(&value); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return time.Time{}, false, nil
-		}
-		return time.Time{}, false, err
-	}
-	unixValue, err := strconv.ParseInt(value, 10, 64)
+func (s *Store) DirtyChainHours(ctx context.Context, before time.Time) ([]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT hour_ts
+FROM dirty_chain_hours
+WHERE hour_ts < ?
+ORDER BY hour_ts ASC
+`, before.UTC().Truncate(time.Hour).Unix())
 	if err != nil {
-		return time.Time{}, false, err
+		return nil, err
 	}
-	return time.Unix(unixValue, 0).UTC(), true, nil
+	defer rows.Close()
+
+	hours := make([]time.Time, 0)
+	for rows.Next() {
+		var hourTS int64
+		if err := rows.Scan(&hourTS); err != nil {
+			return nil, err
+		}
+		hours = append(hours, time.Unix(hourTS, 0).UTC())
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return hours, nil
+}
+
+func (s *Store) LastVacuum(ctx context.Context) (time.Time, bool, error) {
+	return s.lastMetaTime(ctx, "last_vacuum_at")
 }
 
 func (s *Store) SetLastVacuum(ctx context.Context, at time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO meta (key, value) VALUES ('last_vacuum_at', ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value
-`, strconv.FormatInt(at.UTC().Unix(), 10))
-	return err
+	return s.setMetaTime(ctx, "last_vacuum_at", at)
 }
 
 func (s *Store) Vacuum(ctx context.Context) error {
@@ -1079,6 +1308,13 @@ func (s *Store) Vacuum(ctx context.Context) error {
 }
 
 func (s *Store) CheckpointWAL(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+		return fmt.Errorf("wal checkpoint passive: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) CheckpointWALTruncate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		return fmt.Errorf("wal checkpoint truncate: %w", err)
 	}
@@ -1097,16 +1333,23 @@ func (s *Store) ResolveUsageSource(start, end time.Time, requiresMinute bool) (s
 		return "", fmt.Errorf("end before start")
 	}
 	now := s.now()
-	if start.UTC().Before(minuteRetentionStartUTC(now, s.retention)) {
-		if requiresMinute {
+	startUTC := start.UTC()
+	if !startUTC.Before(minuteRetentionStartUTC(now, s.retention)) {
+		return DataSourceMinute, nil
+	}
+	if requiresMinute {
+		if !startUTC.Before(hourRetentionStartUTC(now, s.retention)) || !startUTC.Before(dayRetentionStartUTC(now, s.retention)) {
 			return "", ErrDimensionUnavailable
 		}
-		if start.UTC().Before(hourRetentionStartUTC(now, s.retention)) {
-			return DataSourceDay, nil
-		}
+		return "", ErrRangeUnavailable
+	}
+	if !startUTC.Before(hourRetentionStartUTC(now, s.retention)) {
 		return DataSourceHour, nil
 	}
-	return DataSourceMinute, nil
+	if !startUTC.Before(dayRetentionStartUTC(now, s.retention)) {
+		return DataSourceDay, nil
+	}
+	return "", ErrRangeUnavailable
 }
 
 func ForwardDataSource(source string) string {
